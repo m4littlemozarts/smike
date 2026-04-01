@@ -1,14 +1,23 @@
 # SMIKE
 
-A structured execution framework for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Decomposes complex specs into dependency-ordered plan graphs, then executes them through an automated plan-apply-judge loop with independent verification.
+It's like plan mode but for way bigger multisession plans that are annoying to do with Claude Code right now.
 
-Built for multi-session projects where you need traceability, not vibes.
+A structured execution framework for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Decomposes complex specs into dependency-ordered plan graphs, then executes them through a subagent driven loop with independent verification.
 
-## The Problem
+Feed `/smike:init` a well thought out spec doc with any other supporting info you want, it will work it into a multisession plan without dropping anything important.
 
-Claude Code is great at single-session tasks. But when you're building something that spans days — a new service, a major refactor, a greenfield feature — things fall apart. Context gets lost between sessions. Work drifts from the spec. There's no verification that what got built actually matches what was planned.
+`/smike:resume` will work through the full init plan. Its use of subagents and smart context engineering means you can chug through the whole thing in one long session without context rot. Most of the time it's completely automated.
 
-SMIKE fixes this by giving Claude a persistent execution loop with state that survives session boundaries.
+Built to keep multi-session projects on track without scope drift and annoying shit.
+
+## Quick Start
+
+1. Write a spec for what you want to build (markdown, as detailed as you want)
+2. `/smike:init my-spec.md` — decomposes into an executable plan graph
+3. `/smike:resume` — starts execution, picks up automatically every session
+4. `/smike:resume pause` — when you need to stop
+
+That's it. SMIKE handles the loop.
 
 ## How It Works
 
@@ -53,20 +62,20 @@ You write a spec
 
 ## Use Cases
 
-**Greenfield feature across multiple files and concerns**
+**Greenfield features across multiple files and concerns**
 Write a spec covering the data model, API, and UI. SMIKE breaks it into isolated plans with explicit file boundaries and dependency ordering, then executes them sequentially (or in parallel where safe).
 
-**Multi-day refactors**
-Big structural changes that can't be done in one shot. SMIKE tracks which pieces are done, what decisions were made along the way, and what still needs to happen — across as many sessions as it takes.
+**Big refactors**
+Structural changes that can't be done in one shot. SMIKE tracks which pieces are done, what decisions were made along the way, and what still needs to happen.
 
 **Anything where "just do it" leads to drift**
-If you've ever had Claude build something that technically works but doesn't match what you asked for, SMIKE's independent judge phase catches that. Verification and code review run in fresh context with no knowledge of the execution — they only check the plan's acceptance criteria against the actual code.
+If you've had Claude build something that technically works but doesn't match what you asked for, the independent judge phase catches that. Verification and code review run in fresh context with no knowledge of the execution. They only check the plan's acceptance criteria against the actual code.
 
 ## Architecture
 
 ### Agents
 
-SMIKE dispatches specialized subagents at each stage. They write full reports to disk and return only compact summaries — keeping the orchestrator's context lean.
+SMIKE dispatches specialized subagents at each stage. They write full reports to disk and return only compact summaries, keeping the orchestrator's context lean.
 
 | Agent | Stage | Role |
 |---|---|---|
@@ -103,7 +112,7 @@ The judge auto-selects its depth based on plan complexity:
 
 | Mode | When | What runs |
 |---|---|---|
-| **Light** | 1 task, simple verifies, clean execution | Inline checks only — no subagent |
+| **Light** | 1 task, simple verifies, clean execution | Inline checks only, no subagent |
 | **Medium** | 1-2 tasks, clean execution | Verification subagent, skip review |
 | **Full** | 3+ tasks, failures, or discoveries | Verification + review in parallel |
 
@@ -113,25 +122,23 @@ Plans in the same dependency group run in parallel (up to 3 concurrent subagents
 
 ## Install
 
-Copy the `commands/` directory and framework into your Claude Code config:
+Tell Claude to do it:
+
+```
+Clone https://github.com/m4littlemozarts/smike into ~/.claude/smike/ and set up the
+slash commands by copying the command files into ~/.claude/commands/smike/. Add .smike/
+to this project's .gitignore.
+```
+
+Or do it yourself:
 
 ```bash
 # Framework
-cp -R smike/ ~/.claude/smike/
+git clone https://github.com/m4littlemozarts/smike.git ~/.claude/smike
 
 # Commands (enables /smike:init, /smike:resume, /smike:judge)
 mkdir -p ~/.claude/commands/smike
-cp commands/* ~/.claude/commands/smike/
+cp ~/.claude/smike/commands/* ~/.claude/commands/smike/
 ```
 
 Add `.smike/` to your project's `.gitignore`.
-
-## Quick Start
-
-1. Write a spec for what you want to build (markdown file, as detailed as you want)
-2. `/smike:init my-spec.md` — watch it decompose into plans
-3. Review the plan graph in `.smike/PLAN-GRAPH.md`
-4. `/smike:resume` — starts execution, picks up automatically every session
-5. `/smike:resume pause` — when you need to stop
-
-That's it. SMIKE handles the loop.
