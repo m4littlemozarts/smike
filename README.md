@@ -14,10 +14,8 @@ Built to keep multi-session projects on track without scope drift and annoying s
 
 1. Write a spec for what you want to build (markdown, as detailed as you want)
 2. `/smike:init my-spec.md` — decomposes into an executable plan graph
-3. `/smike:resume` — starts execution, picks up automatically every session
-4. `/smike:resume pause` — when you need to stop
-
-That's it. SMIKE handles the loop.
+3. In a new session `/smike:resume my-spec` — starts execution, picks up automatically
+4. Let it cook. `/smike:pause` to pause if needed
 
 ## How It Works
 
@@ -57,8 +55,7 @@ You write a spec
 |---|---|
 | `/smike:init <spec> [refs...]` | Decompose a spec into an executable plan graph. Reads your spec + optional reference docs, runs multi-agent planning, writes all state to `.smike/`. Does not execute anything. |
 | `/smike:resume` | Entry point for every session. Reads state from disk, figures out exactly where you left off, suggests the one next action. |
-| `/smike:resume pause` | Freeze current progress. Creates a self-contained handoff file for the next session. |
-| `/smike:judge [plan-path]` | Manually trigger verification if a session was interrupted after execution. Usually auto-invoked. |
+| `/smike:pause` | Freeze current progress. Creates a self-contained handoff file for the next session. |
 
 ## Use Cases
 
@@ -125,9 +122,9 @@ Plans in the same dependency group run in parallel (up to 3 concurrent subagents
 Tell Claude to do it:
 
 ```
-Clone https://github.com/m4littlemozarts/smike into ~/.claude/smike/ and set up the
-slash commands by copying the command files into ~/.claude/commands/smike/. Add .smike/
-to this project's .gitignore.
+Clone https://github.com/m4littlemozarts/smike into ~/.claude/smike/ and copy the
+command files from the commands/ folder into ~/.claude/commands/smike/ so the slash
+commands work. Add .smike/ to this project's .gitignore.
 ```
 
 Or do it yourself:
@@ -136,7 +133,7 @@ Or do it yourself:
 # Framework
 git clone https://github.com/m4littlemozarts/smike.git ~/.claude/smike
 
-# Commands (enables /smike:init, /smike:resume, /smike:judge)
+# Commands (enables /smike:init, /smike:resume, /smike:pause)
 mkdir -p ~/.claude/commands/smike
 cp ~/.claude/smike/commands/* ~/.claude/commands/smike/
 ```
