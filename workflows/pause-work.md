@@ -132,7 +132,7 @@ PLAN ──▶ APPLY ──▶ JUDGE
 
 1. Read `.smike/{project_name}/STATE.md` for latest position
 2. Check loop position
-3. Run `/smike:resume {project_name}`
+3. Run `/smike {project_name}`
 
 ---
 
@@ -233,7 +233,7 @@ Current State:
   Loop: [PLAN/APPLY/JUDGE position]
 
 To resume later:
-  /smike:resume {project_name}
+  /smike {project_name}
 
 ════════════════════════════════════════
 ```

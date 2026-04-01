@@ -2,7 +2,7 @@
 Initialize SMIKE from user-provided spec and reference files. Reads all files, asks
 clarifying questions, dispatches the planning agent to decompose into an executable
 plan graph, creates all project state, and STOPS. Execution begins in a fresh session
-via `/smike:resume` to maximize context budget.
+via `/smike` in a fresh session to maximize context budget.
 
 Supports both fresh initialization and revision of existing plans.
 </purpose>
@@ -19,7 +19,7 @@ that calls AskUserQuestion.
 **AskUserQuestion fallback protocol** — use this EVERY time this workflow calls AskUserQuestion:
 
 AskUserQuestion may silently auto-complete with empty answers during skill/command
-invocations (e.g., `/smike:init`). The interactive picker never renders to the user.
+invocations (e.g., `/smike`). The interactive picker never renders to the user.
 
 Detection: after AskUserQuestion returns, check the result string for answer content.
 A successful response contains `"header"="answer"` patterns (e.g., `"Auth method"="Yes"`).
@@ -141,11 +141,21 @@ mkdir -p .smike/{project_name}/phases
 
 Read `~/.claude/smike/prompts/strategist-agent.md`.
 
+**Pre-dispatch: resolve migration baseline.**
+If the project has a migrations directory, determine the current highest migration number:
+```bash
+ls packages/worker/migrations/*.sql 2>/dev/null | sort | tail -1 | grep -oE '[0-9]+' | head -1
+# Or detect project-specific migration path from CLAUDE.md / project structure
+```
+Store as `migration_baseline`. If no migrations directory exists, set to 0.
+Pass this to the strategist so it can assign correct migration offsets.
+
 Fill placeholders:
 - {spec path}: spec_file_path
 - {reference file paths}: reference_file_paths
 - {prior context}: extra_context or "None"
 - {tdd_default}: "true" (default for new projects; user can change in config.md after init)
+- {migration_baseline}: the current highest migration number (e.g., "027")
 
 **Revision mode:** If `revision_mode == true`, also fill:
 - {previous_graph}: the previous ---STRATEGY--- output from `previous_graph`
@@ -190,9 +200,18 @@ After strategist returns, before any further processing:
    - Topological sort on the dependency graph must succeed (no cycles)
    - If cycle detected: fail with "Cycle detected: {plan_a} → {plan_b} → ... → {plan_a}"
 
-6. **File isolation:**
-   - No file path appears in 2+ plans within the same parallel group
-   - If overlap found: fail with "File '{path}' in plans {id_a} and {id_b} (both group {G})"
+6. **File isolation (two-pass):**
+   a. **Strategist file_map check:** No file path appears in 2+ plans within the same
+      parallel group. If overlap found: fail with "File '{path}' in plans {id_a} and
+      {id_b} (both group {G})"
+   b. **Detailed plan file_lists check (run after process_plans):** After detailers
+      write PLAN.md files, extract actual `<files>` sections from ALL plans in each
+      parallel group and cross-check. Detailers may add files not in the strategist's
+      file_map (adjacent imports, test helpers). If new overlaps found:
+      - Log: "Post-detail overlap: {file} in plans {id_a} and {id_b} (group {G})"
+      - If overlap is a shared import (read-only): dismiss — reading is safe.
+      - If overlap is a write target: either add intra-group dependency or ask user.
+      This second pass catches overlaps the strategist missed due to coarser file assignment.
 
 7. **Group structure:**
    - Group N plans only depend on plans in groups < N
@@ -680,6 +699,7 @@ PLAN.md files already on disk from process_plans. Write everything else:
    ## Project
    Name: {project_name}
    Spec: {spec file path}
+   spec_hash: {md5 hash of spec file}
 
    ## Position
    Phase: 01 — {phase name}
@@ -717,10 +737,18 @@ PLAN.md files already on disk from process_plans. Write everything else:
    tdd_default: true
    deploy: batch
    deploy_commands: []
+
+   ## Migration Tracking
+   migration_baseline: {migration_baseline from strategist dispatch}
    ```
 
    `deploy` values: `batch` (deploy once at phase transition — default), `per_plan` (deploy after each plan), `manual` (no auto-deploy, print reminder only).
    `deploy_commands`: list of shell commands to run, e.g. `["cd packages/worker && npx wrangler deploy"]`. Read from CLAUDE.md deploy instructions if present. Empty = no automated deploy, print reminder.
+   `migration_baseline`: highest existing migration number at init time. Execution agents
+   resolve actual migration numbers at runtime: `ls migrations/*.sql | sort | tail -1`
+   and use NEXT available number. The strategist assigns relative offsets (NEXT+0, NEXT+1)
+   in plan outlines so the detailer can reference "this plan creates migration NEXT+0"
+   without hardcoding a number that may drift if execution order changes.
 </step>
 
 <step name="present_strategy">
@@ -750,7 +778,7 @@ Project dir: .smike/{project_name}/
 ═══════════════════════════════════════
 
 Ready to execute. Start a fresh session and run:
-  /smike:resume {project_name}
+  /smike {project_name}
 ═══════════════════════════════════════
 ```
 </step>
@@ -763,7 +791,7 @@ context budget for the APPLY→JUDGE cycles.
 
 ```
 Ready to execute. Run in a fresh session:
-  /smike:resume {project_name}
+  /smike {project_name}
 ```
 
 Do NOT auto-continue to apply-phase. Do NOT offer to start. Just stop.
@@ -775,7 +803,7 @@ Do NOT auto-continue to apply-phase. Do NOT offer to start. Just stop.
 - .smike/{project_name}/ directory with all state files
 - PLAN-GRAPH.md with dependency graph
 - All PLAN.md files written to phases directory
-- User instructed to run `/smike:resume {project_name}` in fresh session
+- User instructed to run `/smike {project_name}` in fresh session
 </output>
 
 <error_handling>

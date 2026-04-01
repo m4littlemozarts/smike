@@ -22,7 +22,7 @@ No multiple options. Prevents decision fatigue.
 **AskUserQuestion fallback protocol** — use this EVERY time this workflow calls AskUserQuestion:
 
 AskUserQuestion may silently auto-complete with empty answers during skill/command
-invocations (e.g., `/smike:resume`). The interactive picker never renders to the user.
+invocations (e.g., `/smike`). The interactive picker never renders to the user.
 
 Detection: after AskUserQuestion returns, check the result string for answer content.
 A successful response contains `"header"="answer"` patterns (e.g., `"Project"="my-app"`).
@@ -70,7 +70,7 @@ resolve_project (multi-project selection) and report_and_route (checkpoint mode)
    - If not found: "No SMIKE project '{project_name}' found." List available projects. Exit.
 
 4. **If no project name provided:**
-   - **0 projects found:** "No SMIKE projects found. Run `/smike:init <spec-file>` first." Exit.
+   - **0 projects found:** "No SMIKE projects found. Run `/smike <spec-file>` first." Exit.
    - **1 project found:** auto-select it. Print: "Resuming project: {project_name}"
    - **2+ projects found:** AskUserQuestion:
      "Multiple SMIKE projects found. Which one?"
@@ -91,7 +91,7 @@ Based on STATE.md + plan graph, determine **exactly ONE** next action:
 
 | State | Single Next Action |
 |-------|-------------------|
-| No plans exist | `/smike:init [spec-file]` |
+| No plans exist | `/smike [spec-file]` |
 | Graph exists, next plan pending | Execute next plan (load apply-phase.md) |
 | Next plan has `pause_before: true` | Execute it (operator already resumed — pause was honored) |
 | Plan executed, not verified | `/smike:judge [plan-path]` |
@@ -156,7 +156,7 @@ When user confirms next action:
 <error_handling>
 **STATE.md corrupted or incomplete:**
 - Report what's missing
-- Suggest manual repair or `/smike:init`
+- Suggest manual repair or `/smike <spec-file>`
 
 **Conflicting information:**
 - Trust STATE.md over stale handoffs

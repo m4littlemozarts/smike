@@ -77,10 +77,32 @@ This applies to every step that touches STATE.md. Violation of this rule wastes 
 </rule>
 
 <step name="determine_judge_mode" priority="first">
-**Choose light, medium, or full judge based on plan size and execution result.**
+**Choose light, medium, full, or fast judge based on plan context and execution result.**
 
 Use the execution memo fields passed from APPLY (task_count, tdd_present,
-verify_cmd_count, result, has_discovery).
+verify_cmd_count, result, has_discovery, discovery_severity).
+
+**Discovery severity** (from execution memo):
+- `informational`: FYI notes — pre-existing test failures, known out-of-scope items,
+  working-tree changes committed alongside. Does NOT affect correctness of this plan.
+- `actionable`: New exports, type changes, file overlap, or decisions that affect
+  future plans or verification of this plan.
+Execution agents classify each discovery item. `has_discovery: true` + all items
+`informational` → treat as `has_discovery: false` for mode selection.
+
+**FAST mode** — ALL conditions met:
+- `auto_accept_plans: true` in config (autonomous session)
+- Plan has 1-2 tasks
+- Execution result is SUCCESS
+- No actionable discovery (has_discovery: false, or all discoveries informational)
+- No non-SUCCESS in prior plan's completion block (no accumulated concerns)
+
+FAST collapses JUDGE to inline verification only:
+- Run verification commands inline (Bash tool) — same as LIGHT
+- Run `git diff --stat {baseline}..HEAD` to confirm file changes match
+- Skip code review entirely
+- Proceed directly to verdict → append_completion → update_state
+- **Savings:** ~50% vs FULL baseline. No subagent dispatches.
 
 **LIGHT mode** — ALL conditions met:
 - Plan has exactly 1 task
@@ -89,12 +111,12 @@ verify_cmd_count, result, has_discovery).
 
 **MEDIUM mode** — ALL conditions met:
 - Plan has 1-2 tasks
-- Does NOT qualify for LIGHT (either 2 tasks, or 1 task with 4+ verify commands)
+- Does NOT qualify for LIGHT or FAST
 - Execution result is SUCCESS (from execution memo)
-- No discovery (has_discovery: false from execution memo)
+- No actionable discovery (has_discovery: false, or all discoveries informational)
 
 **FULL mode** — anything else (3+ tasks, partial execution,
-discovery present, non-SUCCESS with 2 tasks).
+actionable discovery, non-SUCCESS with 2 tasks).
 
 **LIGHT** skips both subagents entirely:
 - Run verification commands inline (Bash tool)
@@ -112,9 +134,14 @@ discovery present, non-SUCCESS with 2 tasks).
 **FULL** dispatches verification + review in parallel:
 - Continue to dispatch_verification_and_review → verdict → ...
 
-All steps from append_completion onward apply to ALL three modes.
+All steps from append_completion onward apply to ALL modes.
 
-**Savings:** LIGHT ~40%, MEDIUM ~20-25% vs FULL baseline.
+**Savings:** FAST ~50%, LIGHT ~40%, MEDIUM ~20-25% vs FULL baseline.
+
+**review_mode interaction:** `review_mode: risk-only` means review runs ONLY in FULL mode.
+Since FULL now requires `actionable` discovery (not just any discovery), informational
+notes no longer trigger unnecessary reviews. This fixes the practical issue where
+review ran on nearly every plan because `has_discovery` was almost always true.
 </step>
 
 <step name="structural_integrity_check">
@@ -171,6 +198,7 @@ additional context alongside verification and review results.
   - {execution memo}: the compact memo from APPLY's finalize step
   - {baseline commit}: git hash from before execution
   - {phase goal}: one line from ROADMAP.md
+  - {known_failures}: PRE-EXISTING entries from STATE.md Gotchas, or "None"
   - {log_path}: LOG.md path or "DISABLED"
   - {verdict_path}: computed above
 
@@ -181,6 +209,13 @@ Before dispatching, gather review context via mechanical extraction:
   ```bash
   sed -n '/^<objective>/,/^<\/objective>/p' "${plan_path}" | grep -A1 '^## Goal' | tail -1
   ```
+- Extract scope boundaries (for false-positive prevention):
+  ```bash
+  sed -n '/<boundaries>/,/<\/boundaries>/p' "${plan_path}"
+  ```
+  Pass the full boundaries block to the review subagent as `{scope_boundaries}`.
+  The review agent MUST check items against boundaries before flagging as scope
+  misses — files listed in "DO NOT CHANGE" or "NOT in scope" are not misses.
 - Extract phase goal from ROADMAP.md (one line)
 - Extract prior review items: check the PREVIOUS plan's completion block.
   Look for `**Review backlog:**` or `**Review:**` section:
@@ -202,6 +237,7 @@ Before dispatching, gather review context via mechanical extraction:
 - Fill placeholders:
   - {baseline_commit}: git hash
   - {plan_objective}: extracted above
+  - {scope_boundaries}: extracted above (plan's <boundaries> block)
   - {phase_goal}: extracted above
   - {prior_review_items}: extracted above
   - {prior_completion_summary}: extracted above
@@ -391,6 +427,29 @@ by checking the relevant source code FIRST. Do not write gotchas based on
 assumptions from the fix subagent's description — read the file to confirm.
 A wrong gotcha is worse than no gotcha (it causes bugs instead of preventing them).
 
+**Gotcha pruning rules:**
+When updating STATE.md, prune stale gotchas:
+- Gotchas that reference a specific plan ID → remove when that plan completes.
+  Example: "Plan 04 modifies ScheduleEditor (~1,364 lines)" → remove after Plan 04 passes.
+- Gotchas with `expires_after: plan-{id}` → remove when that plan completes.
+- Gotchas starting with `REVIEW:` → remove when the referenced file's owning plan completes
+  (check PLAN-GRAPH.md file_map).
+- Gotchas starting with `PRE-EXISTING:` → keep until phase transition (transition-phase
+  handles cleanup).
+- General invariant gotchas (no plan reference, no expiry) → keep indefinitely.
+
+**Pre-existing test failure tracking:**
+On first encounter of pre-existing test failures in a phase, add to Gotchas:
+```markdown
+- PRE-EXISTING: {test_file} — {N} failures ({brief description}). Unrelated to phase work.
+```
+Pass this line to all verification subagents in their prompt context so they can
+filter mechanically instead of investigating each time. Format in verification prompt:
+```
+Known pre-existing failures (exclude from regression analysis):
+- {test_file}: {N} failures — {description}
+```
+
 **Review backlog transcription:**
 If the review returned STILL OPEN items, add each to the Gotchas section as
 `REVIEW: [file:line] — [description]`. This ensures they flow into the next
@@ -403,7 +462,7 @@ plan-phase's `check_scope_gaps` step instead of silently dropping.
 If logging is enabled (check config), append to `.smike/{project_name}/phases/{phase}/{plan}-LOG.md`:
 ```markdown
 ### cycle_cost — {timestamp}
-- Judge: {LIGHT|MEDIUM|FULL} — Verdict: {PASS|CONCERNS|FAIL}
+- Judge: {FAST|LIGHT|MEDIUM|FULL} — Verdict: {PASS|CONCERNS|FAIL}
 - Subagents: {count dispatched} — Tokens: {sum of total_tokens from Agent results}
 ```
 
@@ -459,7 +518,7 @@ The flow branches: single plan → sequential (existing), 2+ plans → parallel 
    Completed through plan {current}. Progress: {completed}/{total}.
    Pausing before plan {next}: {pause_reason from frontmatter, or "operator requested"}
 
-   When ready: /smike:resume {project_name}
+   When ready: /smike {project_name}
    ════════════════════════════════════════
    ```
    Update STATE.md Resume to point to the paused plan. **STOP.** Do not continue.
@@ -496,21 +555,43 @@ The flow branches: single plan → sequential (existing), 2+ plans → parallel 
 ### B. Parallel group dispatch (2+ plans in the target group)
 
 The strategist verified no file overlap within a group during init.
-Parallel execution is safe — each plan touches different files.
+However, runtime verification is still needed — the init-time check uses
+plan outlines, not final file lists from detailed plans.
 
-4b. **Print status:**
+4b. **Build within-group DAG based on file overlap:**
+    Load metadata (file_lists) for all plans in the group. Then:
     ```
-    Group {G}: dispatching {N} plans in parallel [{plan-ids}]...
+    For each pair (A, B) in the group:
+      overlap = intersection(A.file_lists, B.file_lists)
+      if overlap is non-empty:
+        # The plan with the lower ID executes first
+        add edge: lower_id → higher_id
+        log: "Intra-group dependency: {A} → {B} (shared: {overlap files})"
+    ```
+    Result: a mini-DAG within the group. Plans with no inbound edges are
+    immediately dispatchable. Plans with inbound edges wait for predecessors.
+
+    **Example:** Group 1 has Plans 01, 02, 03, 04.
+    - Plans 01 and 02 share `types.ts` → edge: 01 → 02
+    - Plans 03 and 04 share nothing with anyone → immediately dispatchable
+    - Dispatch wave 1: Plans 01, 03, 04 (all independent)
+    - Dispatch wave 2: Plan 02 (after 01 completes)
+
+    If no overlaps found: all plans dispatch in a single wave (original behavior).
+
+5b. **Print status:**
+    ```
+    Group {G}: {N} plans, {W} wave(s) [{wave 1 plan-ids} | {wave 2 plan-ids} | ...]
     ```
 
-5b. **Load metadata for each plan:** Run load_plan bash extraction for each
+6b. **Load metadata for each plan:** Run load_plan bash extraction for each
     (same commands from apply-phase `load_plan` step). Store per-plan:
     plan_path, task_count, tdd_present, verify_cmd_count, file_lists, boundary_files.
 
-6b. **Preflight each plan:** Run preflight_check for each (same as apply-phase).
+7b. **Preflight each plan:** Run preflight_check for each (same as apply-phase).
     If any hard failure: exclude that plan, report to user, continue with others.
 
-7b. **Capture baseline:** `git rev-parse HEAD` — shared baseline for all plans.
+8b. **Capture baseline:** `git rev-parse HEAD` — shared baseline for all plans.
     Write to STATE.md:
     ```markdown
     ## Execution Baseline
@@ -518,21 +599,27 @@ Parallel execution is safe — each plan touches different files.
     Commit: {baseline}
     ```
 
-8b. **Dispatch parallel execution subagents:**
+9b. **Dispatch execution subagents per wave:**
     Read `~/.claude/smike/prompts/execution-agent.md` template once.
-    For each plan, fill placeholders (plan_path, log_path, report_path).
-    Dispatch ALL in a single message using parallel Agent tool calls:
-    - subagent_type: "general-purpose"
-    - isolation: "worktree"
-    - description: "Execute plan {id}: {title}"
-    - Each gets its own report_path: `.smike/{project_name}/phases/{phase}/{plan}-EXEC-REPORT.md`
 
-9b. **Collect and parse results:** When all subagents return:
-    - Extract ---EXEC-SUMMARY--- from each
-    - Group by result: SUCCESS plans, non-SUCCESS plans
-    - Collect worktree paths and branch names from Agent tool results
+    **For each wave in the within-group DAG:**
+    a. For each plan in this wave, fill placeholders (plan_path, log_path, report_path).
+    b. Dispatch ALL plans in this wave using parallel Agent tool calls:
+       - subagent_type: "general-purpose"
+       - isolation: "worktree"
+       - description: "Execute plan {id}: {title}"
+       - Each gets its own report_path
+    c. Collect results, merge worktree branches (in plan-ID order)
+    d. If any plan in this wave has non-SUCCESS: triage before next wave
 
-10b. **Merge worktree branches** into current branch (in plan-ID order):
+    **Single-wave groups (no intra-group overlaps):** Same as original parallel dispatch.
+
+10b. **Collect and parse results per wave:** When wave subagents return:
+     - Extract ---EXEC-SUMMARY--- from each
+     - Group by result: SUCCESS plans, non-SUCCESS plans
+     - Collect worktree paths and branch names from Agent tool results
+
+11b. **Merge worktree branches** into current branch (in plan-ID order):
      ```bash
      git merge {worktree_branch} -m "merge: plan {id} (group {G} parallel)"
      git worktree remove {worktree_path} 2>/dev/null
@@ -541,31 +628,49 @@ Parallel execution is safe — each plan touches different files.
      Clean merges are guaranteed by file isolation. If any merge fails:
      STOP, report overlap violation to user.
 
-11b. **Triage non-SUCCESS plans:** For plans with PARTIAL/BLOCKED/NEEDS_DECISION,
+     **Post-merge build gate (for worktree executions only):**
+     After ALL worktree branches in a wave are merged, run a single build check:
+     ```bash
+     # TypeScript projects:
+     npx tsc --noEmit 2>&1 | tail -20
+     # Or project-specific build command from CLAUDE.md
+     ```
+     This catches cross-plan type errors that individual worktrees couldn't detect.
+     If build fails: identify which plan's files caused the error, report to user.
+     Individual worktree exec reports should NOT be penalized for sibling build failures.
+
+12b. **Triage non-SUCCESS plans:** For plans with PARTIAL/BLOCKED/NEEDS_DECISION,
      handle each sequentially using apply-phase `triage_issues` logic.
      Fix attempts operate on the merged branch (not worktrees).
 
-12b. **JUDGE all plans:**
-     For each plan, run the judge sequence inline:
-     a. determine_judge_mode (from per-plan execution memo)
-     b. structural_integrity_check (mechanical — baseline..HEAD, filter to plan's files)
-     c. If FULL/MEDIUM verification needed:
-        **Batch optimization:** dispatch ALL verification subagents across ALL plans
-        in parallel (one per plan). Same for review subagents if FULL mode.
-        This converts N sequential JUDGE cycles into 1 parallel verification batch.
-     d. Parse verdicts, run verdict logic per plan
-     e. append_completion per plan
-     f. Mark complete in PLAN-GRAPH.md
+12b. **JUDGE all plans (batched):**
+     a. determine_judge_mode for each plan (from per-plan execution memo)
+     b. structural_integrity_check for all plans in one pass:
+        `git diff --name-only {baseline}..HEAD` once, then partition files by plan's
+        file_lists. Flag per-plan boundary/scope violations.
+     c. **Batch verification dispatch:** Group all plans by judge mode:
+        - FAST/LIGHT plans: verify inline, all at once (run their verify commands)
+        - MEDIUM/FULL plans: dispatch ALL verification subagents in parallel
+          (one per plan, single message with parallel Agent calls)
+        - FULL plans additionally: dispatch ALL review subagents in parallel
+          (same single message if possible, otherwise second batch)
+        This converts N sequential JUDGE cycles into 1-2 parallel batches.
+     d. Parse all verdicts, run verdict logic per plan
+     e. append_completion per plan (can be done in a single pass)
+     f. **Batch bookkeeping:** Mark ALL plans complete in PLAN-GRAPH.md with a
+        single Edit (update all Status cells at once). Batch all discovery
+        propagations into one pass.
 
-13b. **State update:** Single BATCH_STATE_UPDATES Write for all plans.
-     Remove `## Execution Baseline` section.
+13b. **Single state update for all plans:** One BATCH_STATE_UPDATES Write covering
+     all completed plans. Remove `## Execution Baseline` section. Update progress.
+     Prune any gotchas that expired with these plans.
 
-14b. **Status:**
+15b. **Status:**
      ```
-     Group {G}: {N} plans parallel — {success_count} SUCCESS. Progress: {completed}/{total}.
+     Group {G}: {N} plans ({W} waves) — {success_count} SUCCESS. Progress: {completed}/{total}.
      ```
 
-15b. **Route:** check_phase_completion for next group or execute_transition.
+16b. **Route:** check_phase_completion for next group or execute_transition.
 
 ---
 
@@ -592,7 +697,7 @@ Transition handles: ROADMAP update, git commit, scope audit, routing.
 </process>
 
 <output>
-- Verification: inline (LIGHT), verification subagent only (MEDIUM), or verification + review (FULL)
+- Verification: inline (FAST/LIGHT), verification subagent only (MEDIUM), or verification + review (FULL)
 - Full reports on disk (*-VERDICT.md, *-REVIEW.md); orchestrator uses compact summaries
 - Completion block appended to PLAN.md (with review findings when available)
 - STATE.md updated (single write per cycle)

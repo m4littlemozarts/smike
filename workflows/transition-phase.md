@@ -62,7 +62,7 @@ Gaps (not built, not explicitly deferred):
 **Wait for user decision on each gap.** This is a mandatory stop.
 
 Use AskUserQuestion for each gap with options:
-- "Add remediation plan" — Add to STATE.md Gotchas as `SCOPE GAP: [description]`. Next `/smike:init` MUST address scope gaps before Phase N+1's own work.
+- "Add remediation plan" — Add to STATE.md Gotchas as `SCOPE GAP: [description]`. Next `/smike` init MUST address scope gaps before Phase N+1's own work.
 - "Defer to backlog" — Add to STATE.md Deferred section.
 - "Mark as not needed" — Update ROADMAP phase scope to reflect reality.
 
@@ -92,7 +92,7 @@ Plan: Not started
 Last: [today] — Phase [N] complete, transitioned to Phase [N+1]
 
 ## Resume
-Next: /smike:init for Phase [N+1]
+Next: /smike with Phase [N+1] spec
 ```
 
 If scope gaps were added: include them in Gotchas section.
@@ -151,7 +151,7 @@ If misaligned, fix before routing.
 **Route A (more phases):**
 All plans for this phase are complete. If more phases exist in ROADMAP, tell user:
 ```
-Phase {N} complete. Run /smike:init with a new spec for Phase {N+1}.
+Phase {N} complete. Run /smike with a new spec for Phase {N+1}.
 Project: {project_name}
 ```
 STOP. New phases require a new spec and fresh decomposition.

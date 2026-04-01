@@ -2,18 +2,18 @@
 
 It's like plan mode but for way bigger multisession plans that are annoying to do with Claude Code right now.
 
-Feed `/smike:init` a well thought out spec doc with any other supporting info you want, it will work it into a multisession plan without dropping anything important.
+Feed `/smike` a well thought out spec doc with any other supporting info you want, it will work it into a multisession plan without dropping anything important.
 
-`/smike:resume` will work through the full init plan. Its use of subagents and smart context engineering means you can chug through the whole thing in one long session without context rot. Most of the time it's completely automated.
+In the next session, `/smike` again with the same spec (or project name) picks up where you left off. Its use of subagents and smart context engineering means you can chug through the whole thing in one long session without context rot. Most of the time it's completely automated.
 
 Built to keep multi-session projects on track without scope drift and annoying shit.
 
 ## Quick Start
 
 1. Write a spec for what you want to build (markdown, as detailed as you want)
-2. `/smike:init my-spec.md` — decomposes into an executable plan graph
-3. In a new session `/smike:resume my-spec` — starts execution, picks up automatically
-4. Let it cook. `/smike:pause` to pause if needed
+2. `/smike my-spec.md` — decomposes into an executable plan graph
+3. In a new session `/smike my-spec.md` — detects existing project, resumes execution
+4. Let it cook. `/smike` (no args) to pause if needed
 
 ## How It Works
 
@@ -21,16 +21,16 @@ Built to keep multi-session projects on track without scope drift and annoying s
 You write a spec
         │
         ▼
-  /smike:init ─── Strategist decomposes into phases + plans
-        │         Detailers flesh out each plan (parallel)
-        │         Checker validates cross-plan contracts
-        │         Scope auditor confirms full spec coverage
+  /smike spec.md ── Strategist decomposes into phases + plans
+        │            Detailers flesh out each plan (parallel)
+        │            Checker validates cross-plan contracts
+        │            Scope auditor confirms full spec coverage
         │
         ▼
   .smike/ state written to disk (plans, graph, roadmap)
         │
         ▼
-  /smike:resume ── Picks up where you left off, every session
+  /smike spec.md ── Detects existing project, picks up where you left off
         │
         ▼
   ┌─────────────────────────────────────────────────┐
@@ -45,15 +45,21 @@ You write a spec
   │   Last plan ──► TRANSITION                       │
   │                 Scope audit, deploy, next phase   │
   └─────────────────────────────────────────────────┘
+        │
+  /smike ── (no args mid-session) Pause and create handoff
 ```
 
-## Commands
+## Single Command
 
-| Command | What it does |
+`/smike` figures out what to do from context:
+
+| Invocation | What happens |
 |---|---|
-| `/smike:init <spec> [refs...]` | Decompose a spec into an executable plan graph. Reads your spec + optional reference docs, runs multi-agent planning, writes all state to `.smike/`. Does not execute anything. |
-| `/smike:resume` | Entry point for every session. Reads state from disk, figures out exactly where you left off, suggests the one next action. |
-| `/smike:pause` | Freeze current progress. Creates a self-contained handoff file for the next session. |
+| `/smike spec.md [refs...]` | **Init** if new spec, **Resume** if already initialized (spec hash compared) |
+| `/smike project-name` | **Resume** existing project by name |
+| `/smike` (no args) | **Pause** if mid-session, show status if not |
+
+If the spec file changed since init, SMIKE asks whether to re-initialize or continue with the existing plan.
 
 ## Use Cases
 
@@ -87,7 +93,7 @@ SMIKE dispatches specialized subagents at each stage. They write full reports to
 
 ```
 .smike/
-  STATE.md        ← Current position, decisions, gotchas
+  STATE.md        ← Current position, decisions, gotchas (includes spec_hash)
   PROJECT.md      ← What we're building + hard constraints
   ROADMAP.md      ← Phase progress tracker
   PLAN-GRAPH.md   ← Dependency-ordered execution graph
@@ -120,9 +126,9 @@ Plans in the same dependency group run in parallel (up to 3 concurrent subagents
 Tell Claude to do it:
 
 ```
-Clone https://github.com/m4littlemozarts/smike into ~/.claude/smike/ and copy the
-command files from the commands/ folder into ~/.claude/commands/smike/ so the slash
-commands work. Add .smike/ to this project's .gitignore.
+Clone https://github.com/m4littlemozarts/smike into ~/.claude/smike/ and copy
+smike.md from commands/ to ~/.claude/commands/smike.md so the /smike slash
+command works. Add .smike/ to this project's .gitignore.
 ```
 
 Or do it yourself:
@@ -131,9 +137,8 @@ Or do it yourself:
 # Framework
 git clone https://github.com/m4littlemozarts/smike.git ~/.claude/smike
 
-# Commands (enables /smike:init, /smike:resume, /smike:pause)
-mkdir -p ~/.claude/commands/smike
-cp ~/.claude/smike/commands/* ~/.claude/commands/smike/
+# Command (enables /smike)
+cp ~/.claude/smike/commands/smike.md ~/.claude/commands/smike.md
 ```
 
 Add `.smike/` to your project's `.gitignore`.

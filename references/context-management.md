@@ -232,13 +232,13 @@ The orchestrator runs continuously unless explicitly stopped:
 |-----------|-------------|
 | `pause_before: true` in plan frontmatter | Set during init — "I want to do manual work before this plan" |
 | `.smike/{project_name}/STOP` file | Runtime kill switch — create this file to stop after current cycle |
-| `/smike:pause` | Manual pause with handoff creation |
+| `/smike` (no args) | Manual pause with handoff creation |
 
 No automatic pauses based on context estimates. The operator decides when to stop.
 
 ## Session Handoffs
 
-When the operator manually pauses (via STOP file or /smike:pause):
+When the operator manually pauses (via STOP file or `/smike`):
 
 ### STATE.md Session Continuity
 Always updated. Minimal but sufficient for quick resume:
@@ -251,7 +251,7 @@ Next action: Execute group 1
 ```
 
 ### HANDOFF.md Document
-For longer breaks. Created by `/smike:pause`:
+For longer breaks. Created by `/smike` (no args):
 
 - Self-contained entry point (assumes no prior context)
 - What was accomplished this session
