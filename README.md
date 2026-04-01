@@ -2,8 +2,6 @@
 
 It's like plan mode but for way bigger multisession plans that are annoying to do with Claude Code right now.
 
-A structured execution framework for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Decomposes complex specs into dependency-ordered plan graphs, then executes them through a subagent driven loop with independent verification.
-
 Feed `/smike:init` a well thought out spec doc with any other supporting info you want, it will work it into a multisession plan without dropping anything important.
 
 `/smike:resume` will work through the full init plan. Its use of subagents and smart context engineering means you can chug through the whole thing in one long session without context rot. Most of the time it's completely automated.
