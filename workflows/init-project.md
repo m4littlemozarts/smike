@@ -263,9 +263,11 @@ for plans marked as MODIFIED or NEW in the ---CHANGES--- block. Plans marked as 
 carry forward their existing PLAN.md files unchanged.
 
 For EACH plan outline being detailed:
-- Compute plan_path: `.smike/{project_name}/phases/{phase}/{plan}-PLAN.md`
+- Compute detailer_path: `.smike/{project_name}/phases/{phase}/{plan}-PLAN.xml`
+  (`.xml` extension primes the detailer subagent to produce XML — eliminates format drift)
+- Final plan_path (after rename): `.smike/{project_name}/phases/{phase}/{plan}-PLAN.md`
 - Fill placeholders:
-  - {plan_path}: the computed plan_path (detailer writes PLAN.md directly to this path)
+  - {plan_path}: the computed detailer_path (the `.xml` path — detailer writes here)
   - {plan_outline}: the specific plan's outline (id, title, goal, files, tasks, ac_sketch, tdd, depends_on)
   - {spec path}: spec_file_path
   - {reference file paths}: reference_file_paths
@@ -283,8 +285,9 @@ For EACH plan outline being detailed:
 
 **Dispatch ALL detailers in parallel** using multiple Agent tool calls in a single message.
 Each detailer has fresh context and reads only its assigned files.
-**Detailers write PLAN.md to disk themselves** (via {plan_path}) and return only a
+**Detailers write PLAN.xml to disk themselves** (via {plan_path}) and return only a
 compact ---SUMMARY--- block. The orchestrator never receives full plan text.
+Orchestrator renames `.xml` → `.md` in the process_plans step before any downstream use.
 
 **Why parallel is safe:** Each detailer owns different files (strategist enforced this).
 No file overlap = no conflicts. Each produces one independent PLAN.md written to its
@@ -294,8 +297,13 @@ own unique path.
 <step name="process_plans">
 When ALL detailers return:
 
-**Detailers already wrote PLAN.md files to disk.** The orchestrator receives only
-compact ---SUMMARY--- blocks. Do NOT read full plan content into orchestrator memory.
+**Detailers wrote PLAN.xml files to disk.** Rename to final `.md` before processing:
+```bash
+for xml in .smike/{project_name}/phases/**/*-PLAN.xml; do
+  [ -f "$xml" ] && mv "$xml" "${xml%.xml}.md"
+done
+```
+All downstream references use `.md` paths. Do NOT read full plan content into orchestrator memory.
 
 1. Parse each detailer's ---SUMMARY--- / ---END-SUMMARY--- block and store the summary:
    ```
