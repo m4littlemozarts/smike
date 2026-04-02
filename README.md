@@ -49,17 +49,17 @@ You write a spec
   /smike ── (no args mid-session) Pause and create handoff
 ```
 
-## Single Command
+## One Command
 
-`/smike` figures out what to do from context:
+`/smike` figures out what you want from context:
 
-| Invocation | What happens |
+| You type | What happens |
 |---|---|
-| `/smike spec.md [refs...]` | **Init** if new spec, **Resume** if already initialized (spec hash compared) |
-| `/smike project-name` | **Resume** existing project by name |
-| `/smike` (no args) | **Pause** if mid-session, show status if not |
+| `/smike spec.md [refs...]` | **Init** if new, **Resume** if already initialized |
+| `/smike project-name` | **Resume** that project |
+| `/smike` (no args) | **Pause** if mid-session, status if not |
 
-If the spec file changed since init, SMIKE asks whether to re-initialize or continue with the existing plan.
+It hashes your spec file at init. If you `/smike` with a spec that changed since last time, it asks whether to re-plan or keep going.
 
 ## Use Cases
 
