@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://family-tech-platform.local/smike/state.schema.json",
+  "title": "SMIKE Codex State",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "profile",
+    "project",
+    "created_at",
+    "updated_at",
+    "current_plan",
+    "lifecycle",
+    "workflow",
+    "history"
+  ],
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "lifecycleStatus": {
+      "type": "string",
+      "enum": [
+        "planning",
+        "ready",
+        "running",
+        "in_progress",
+        "awaiting_runtime_dispatch",
+        "planning_blocked",
+        "blocked",
+        "failed",
+        "complete"
+      ]
+    },
+    "workflowPlanStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "complete",
+        "failed"
+      ]
+    },
+    "dependencyRef": {
+      "type": "string",
+      "pattern": "^(?:[^:\\s]+|[^:\\s]+:[^:\\s]+)$"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      }
+    },
+    "workflowPlan": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "plan_id",
+        "plan_json",
+        "depends_on"
+      ],
+      "properties": {
+        "plan_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "plan_json": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "plan_md": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dependencyRef"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/workflowPlanStatus"
+        },
+        "contract_changed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "propagatedDiscovery": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "source_plan_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "target_plan_ids": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "discoveries": {
+          "$ref": "#/$defs/stringArray"
+        }
+      }
+    },
+    "dispatchFreshness": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "fresh",
+            "stale",
+            "missing",
+            "unchanged"
+          ]
+        },
+        "checked_at": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "reason": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "runtimeDispatchEntry": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "dispatch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "plan_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "strategist",
+            "detailer",
+            "checker",
+            "auditor",
+            "executor",
+            "judge",
+            "reviewer",
+            "fixer"
+          ]
+        },
+        "group": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "current": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "spawned",
+            "completed",
+            "stale",
+            "failed"
+          ]
+        },
+        "freshness": {
+          "$ref": "#/$defs/dispatchFreshness"
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "profile": {
+      "const": "codex"
+    },
+    "project": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "created_at": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "updated_at": {
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "current_plan": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "status",
+        "cycle_count",
+        "last_started_at",
+        "last_completed_at",
+        "last_result",
+        "next_action"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/lifecycleStatus"
+        },
+        "cycle_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_started_at": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "last_completed_at": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "last_result": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "pass",
+            "fail",
+            null
+          ]
+        },
+        "next_action": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "stop_reason": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "next_command": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "auto_continue",
+        "stop_on_failure",
+        "max_phases_per_run",
+        "plans"
+      ],
+      "properties": {
+        "auto_continue": {
+          "type": "boolean"
+        },
+        "stop_on_failure": {
+          "type": "boolean"
+        },
+        "max_phases_per_run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "plans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowPlan"
+          }
+        }
+      }
+    },
+    "history": {
+      "type": "array"
+    },
+    "gotchas": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stringArray"
+        },
+        {
+          "maxItems": 50
+        }
+      ]
+    },
+    "propagated_discoveries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/propagatedDiscovery"
+      }
+    },
+    "orchestration": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "stage": {
+          "type": "string",
+          "enum": [
+            "planning",
+            "execution"
+          ]
+        },
+        "active_role": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "strategist",
+            "detailer",
+            "checker",
+            "auditor",
+            "executor",
+            "judge",
+            "reviewer",
+            "fixer",
+            null
+          ]
+        },
+        "last_role": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "strategist",
+            "detailer",
+            "checker",
+            "auditor",
+            "executor",
+            "judge",
+            "reviewer",
+            "fixer",
+            null
+          ]
+        },
+        "next_role": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "strategist",
+            "detailer",
+            "checker",
+            "auditor",
+            "executor",
+            "judge",
+            "reviewer",
+            "fixer",
+            null
+          ]
+        },
+        "discovery_propagation": {
+          "type": "boolean"
+        },
+        "role_history": {
+          "type": "array"
+        },
+        "runtime_dispatches": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "by_id": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/runtimeDispatchEntry"
+              }
+            }
+          }
+        },
+        "capsules": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "$schema": "../../scripts/smike/schemas/state.schema.json",
+  "schema_version": "2.1.0",
+  "profile": "codex",
+  "project": "replace-with-project-name",
+  "created_at": "1970-01-01T00:00:00.000Z",
+  "updated_at": "1970-01-01T00:00:00.000Z",
+  "current_plan": {
+    "plan_id": "replace-with-plan-id",
+    "plan_json": ".smike/<project>/PLAN.json",
+    "plan_md": ".smike/<project>/PLAN.md",
+    "depends_on": []
+  },
+  "lifecycle": {
+    "status": "ready",
+    "cycle_count": 0,
+    "last_started_at": null,
+    "last_completed_at": null,
+    "last_result": null,
+    "next_action": "Run `npm run smike:cycle -- <project>`"
+  },
+  "workflow": {
+    "auto_continue": true,
+    "stop_on_failure": true,
+    "max_phases_per_run": 10,
+    "plans": []
+  },
+  "history": [],
+  "gotchas": [],
+  "propagated_discoveries": [],
+  "orchestration": {
+    "stage": "execution",
+    "active_role": null,
+    "last_role": null,
+    "next_role": "executor",
+    "discovery_propagation": true,
+    "role_history": [],
+    "runtime_dispatches": {
+      "by_id": {}
+    },
+    "capsules": {
+      "latest_by_role": {},
+      "by_plan": {}
+    }
+  }
+}

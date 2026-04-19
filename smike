@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLI="$ROOT/scripts/smike/cli.mjs"
+
+if [[ ! -f "$CLI" ]]; then
+  echo "smike-framework: missing CLI entrypoint at $CLI" >&2
+  exit 1
+fi
+
+exec node "$CLI" "$@"

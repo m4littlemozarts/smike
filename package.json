@@ -1,0 +1,11 @@
+{
+  "name": "smike-framework",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "smike-framework": "./smike"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

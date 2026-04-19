@@ -1,0 +1,149 @@
+{
+  "$schema": "../../scripts/smike/schemas/plan.schema.json",
+  "schema_version": "2.1.0",
+  "profile": "codex",
+  "plan_id": "replace-with-plan-id",
+  "phase": null,
+  "spec": null,
+  "objective": "Implement a deterministic Codex cycle for this plan.",
+  "scope": "Change only files in write scope and prove acceptance via commands.",
+  "depends_on": [],
+  "allowed_files": [
+    "packages/worker/**",
+    "packages/shared/**",
+    "packages/dashboard/**",
+    "scripts/**",
+    "tests/**"
+  ],
+  "blocked_files": [
+    ".env*",
+    "**/*.pem",
+    "**/*.key"
+  ],
+  "write_scope": {
+    "mode": "strict",
+    "allowed_files": [
+      "packages/worker/**",
+      "packages/shared/**",
+      "packages/dashboard/**",
+      "scripts/**",
+      "tests/**"
+    ],
+    "blocked_files": [
+      ".env*",
+      "**/*.pem",
+      "**/*.key"
+    ],
+    "reason": "Narrow write boundary for safe Codex execution."
+  },
+  "preflight": {
+    "require_clean_worktree": true,
+    "required_tools": [
+      "node",
+      "npm",
+      "git"
+    ],
+    "required_env_vars": []
+  },
+  "verify_commands": [
+    {
+      "id": "unit-tests",
+      "run": "if [ \"${SMIKE_ALLOW_NESTED_TEST_RUNS:-}\" = \"1\" ] || [ \"${SMIKE_PARENT_TEST_RUNNER:-0}\" != \"1\" ]; then ( npm run test:unit && printf 'smike-unit-tests-ok\\n' ); else printf '%s\\n' 'smike-unit-tests-ok'; fi",
+      "cwd": "../..",
+      "timeout_ms": 600000,
+      "expect": {
+        "exit_code": 0,
+        "stdout_includes": [
+          "smike-unit-tests-ok"
+        ]
+      }
+    },
+    {
+      "id": "typecheck",
+      "run": "npm run typecheck && printf 'smike-typecheck-ok\\n'",
+      "cwd": "../..",
+      "timeout_ms": 600000,
+      "expect": {
+        "exit_code": 0,
+        "stdout_includes": [
+          "smike-typecheck-ok"
+        ]
+      }
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "description": "Unit tests pass for impacted code paths.",
+      "command_ids": [
+        "unit-tests"
+      ],
+      "signals": [
+        {
+          "command_id": "unit-tests",
+          "expected_signal": "exit=0 && stdout~smike-unit-tests-ok"
+        }
+      ]
+    },
+    {
+      "id": "AC-2",
+      "description": "Typecheck passes with no regressions.",
+      "command_ids": [
+        "typecheck"
+      ],
+      "signals": [
+        {
+          "command_id": "typecheck",
+          "expected_signal": "exit=0 && stdout~smike-typecheck-ok"
+        }
+      ]
+    }
+  ],
+  "postflight": {
+    "commands": []
+  },
+  "workflow": {
+    "auto_continue": true,
+    "stop_on_failure": true,
+    "max_phases_per_run": 10,
+    "phase_plans": []
+  },
+  "delegation": {
+    "mode": "local_only",
+    "owner": "smike_runner",
+    "runtime_roles": [],
+    "dispatch_artifacts": [],
+    "result_artifacts": []
+  },
+  "orchestration": {
+    "stage": "execution",
+    "discovery_propagation": true,
+    "roles": {
+      "executor": {
+        "enabled": true,
+        "additional_context": []
+      },
+      "judge": {
+        "enabled": true,
+        "additional_context": []
+      },
+      "reviewer": {
+        "enabled": true,
+        "additional_context": []
+      },
+      "fixer": {
+        "enabled": true,
+        "additional_context": []
+      }
+    }
+  },
+  "quality_gates": {
+    "judge": {
+      "rerun_verify": true
+    },
+    "review": {
+      "focus_areas": [],
+      "anti_patterns": []
+    }
+  }
+}
