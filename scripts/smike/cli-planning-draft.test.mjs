@@ -4,11 +4,22 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { acquireCliTestLock, releaseCliTestLock } from './test-cli-lock.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..');
 const tempSpecDir = path.join(repoRoot, '.smike-test-tmp');
+let cliTestLock = null;
+
+test.beforeEach(() => {
+  cliTestLock = acquireCliTestLock(repoRoot);
+});
+
+test.afterEach(() => {
+  releaseCliTestLock(cliTestLock);
+  cliTestLock = null;
+});
 
 function slugifyProjectName(input) {
   const base = path.basename(input, path.extname(input));

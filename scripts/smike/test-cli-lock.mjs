@@ -1,0 +1,43 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+const SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepMs(ms) {
+  Atomics.wait(SLEEP_BUFFER, 0, 0, ms);
+}
+
+export function acquireCliTestLock(repoRoot, options = {}) {
+  const {
+    timeoutMs = 30_000,
+    pollMs = 25,
+  } = options;
+  const lockDir = path.join(repoRoot, '.smike-test-tmp');
+  const lockPath = path.join(lockDir, '.cli-test.lock');
+  fs.mkdirSync(lockDir, { recursive: true });
+
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeFileSync(fd, `${process.pid}\n`, 'utf8');
+      return { fd, lockPath };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') {
+        throw error;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for CLI test lock: ${lockPath}`);
+      }
+      sleepMs(pollMs);
+    }
+  }
+}
+
+export function releaseCliTestLock(lock) {
+  if (!lock) {
+    return;
+  }
+  fs.closeSync(lock.fd);
+  fs.rmSync(lock.lockPath, { force: true });
+}
