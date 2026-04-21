@@ -2,7 +2,7 @@
 
 A spec handed to `./smike <spec.md> [context.md ...]` is parsed by `cli.mjs` → `buildPlanningBundle` (heading-exact). This guide lists every input the parser reads so your spec ingests cleanly on the first pass.
 
-If a spec is good, `./smike` produces a complete planning bundle (`PLAN.json`, `ROADMAP.md`, `STRATEGY.md`, phase plans, checker + auditor, runtime delegation) with lint `result: pass`. If a spec is weak, you either get lint findings or — worse — a silent fallback to a single generic phase.
+`./smike <spec...>` now bootstraps new projects in a draft planning state first. Draft bootstrap writes the planning bundle skeleton but skips checker/auditor gating until `./smike cycle <project>` can promote the bundle with concrete summaries and proof commands. Once promoted, the normal planning bundle includes `PLAN.json`, `ROADMAP.md`, `STRATEGY.md`, phase plans, checker + auditor, and runtime delegation.
 
 ---
 
@@ -59,9 +59,14 @@ Each is extracted as a list and forwarded into the planning bundle:
 | Heading (exact) | Destination | Notes |
 |---|---|---|
 | `## What The Planner Must Read First` | `primary_refs` | numbered list of repo paths |
+| `## Required Planning Posture` | `primary_refs` | any repo paths mentioned in backticks are hoisted into the strategist truth-source set |
 | `## Critical Constraints` | `constraints` | strategist reads these into `STRATEGY.md` |
 | `## Explicit Non-Goals` | `non_goals` | the checker uses these to flag scope drift |
 | `## Scope Out` | `non_goals` | accepted legacy alias |
+| `## Integration Requirements` | `integration_requirements` + `planning_decisions` | bullets are captured; bullets under `The plan must decide:` are split into a separate decision list |
+| `## Risk Hotspots` | `risk_hotspots` | broad/high-risk bundles should usually reflect these in phase-level verification |
+| `## Recommended First Executable Phase` | `recommended_first_phase_items` | still not a substitute for `Required Planning Output Shape`, but the checker now compares Plan 01 against these bullets when present |
+| `## Explicit Deferrals` | `explicit_deferrals` | rendered separately from non-goals so deferrals are visible as deliberate follow-on work |
 | `## Protected / High-Collision Areas` | `protected_areas` | narrows inferred write scope; auto-enables full planning analysis |
 | `## Known Current Drift Seeds` | `drift_seeds` | investigation hints (especially useful in research mode) |
 
@@ -92,6 +97,8 @@ Inside `## Required Planning Output Shape`, each phase is one line (`parsePhaseB
 `permissions`, `verification`, `migration` are treated as high-risk and force checker + auditor even on small bundles.
 
 Fallback: if neither blueprint lines nor `Priority N:` headings exist, SMIKE emits a single generic `Implementation` phase. This is almost never what you want — include at least two blueprint lines so the planner actually decomposes the work.
+
+The planning checker also blocks broad implementation bundles when every code-bearing phase still has fallback scope text (`Implement ...`) or when all such phases rely only on generic reusable verification (`typecheck`, `unit-tests`, etc.). If your first phase has a special contract in `## Recommended First Executable Phase`, Plan 01 must materially reflect it.
 
 ---
 
@@ -166,7 +173,8 @@ Before running `./smike <spec.md>`, answer each:
 3. Does each `Plan NN:` line have a `category` or a `write_scope`? Without one, the planner falls back to generic globs.
 4. Are `depends:` edges correct, or are you relying on auto-chain when phases are actually parallelizable?
 5. Are protected/high-collision areas real (active in-flight work, dirty-worktree risk) or just vague caution? Vague caution makes the strategist too conservative.
-6. For review mode: is your finding schema dictated, or will you get back unstructured prose?
+6. If you wrote `## Recommended First Executable Phase`, does Plan 01 obviously satisfy most of those bullets, or are you asking the checker to bless a mismatch?
+7. For review mode: is your finding schema dictated, or will you get back unstructured prose?
 
 If any answer is "not really," fix the spec. Bad specs either lint-fail fast or — worse — lint-pass and silently produce a weak plan.
 

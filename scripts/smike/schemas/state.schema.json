@@ -29,11 +29,13 @@
     "lifecycleStatus": {
       "type": "string",
       "enum": [
+        "planning_draft",
         "planning",
         "ready",
         "running",
         "in_progress",
         "awaiting_runtime_dispatch",
+        "awaiting_fresh_session",
         "planning_blocked",
         "blocked",
         "failed",
@@ -169,6 +171,44 @@
         },
         "freshness": {
           "$ref": "#/$defs/dispatchFreshness"
+        },
+        "completion_requirements": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "require_artifact_change": {
+              "type": "boolean"
+            },
+            "artifact_requirements": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "path": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "json",
+                      "text",
+                      "file"
+                    ]
+                  },
+                  "must_exist": {
+                    "type": "boolean"
+                  },
+                  "must_be_nonempty": {
+                    "type": "boolean"
+                  },
+                  "must_parse_json": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -366,6 +406,16 @@
               }
             }
           }
+        },
+        "current_actionable_dispatch": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "current_actionable_capsule": {
+          "$ref": "#/$defs/nullableString"
         },
         "capsules": {
           "type": "object"

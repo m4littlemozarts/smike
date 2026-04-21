@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-export function createDispatchHelpers({ safeSlug, normalizePathList }) {
+export function createDispatchHelpers({ safeSlug, normalizePathList, normalizeDispatchCompletionRequirements }) {
   function dispatchIdFor(planId, role) {
     return `${safeSlug(planId)}-${safeSlug(role)}`;
   }
@@ -70,6 +70,11 @@ export function createDispatchHelpers({ safeSlug, normalizePathList }) {
       agent_type_hint: dispatch.agent_type_hint,
       reasoning_effort_hint: dispatch.reasoning_effort_hint,
       artifact_change_required: dispatch.artifact_change_required === true,
+      completion_requirements: normalizeDispatchCompletionRequirements(
+        dispatch.completion_requirements,
+        dispatch.result_artifacts,
+        dispatch.artifact_change_required,
+      ),
     })).digest('hex');
   }
 

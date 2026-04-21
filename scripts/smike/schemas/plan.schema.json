@@ -281,7 +281,7 @@
       "properties": {
         "mode": {
           "type": "string",
-          "enum": ["local_only", "runtime_subagents"]
+          "enum": ["local_only", "runtime_subagents", "auto"]
         },
         "owner": {
           "type": "string",

@@ -38,6 +38,8 @@
     "runtime_dispatches": {
       "by_id": {}
     },
+    "current_actionable_dispatch": null,
+    "current_actionable_capsule": null,
     "capsules": {
       "latest_by_role": {},
       "by_plan": {}

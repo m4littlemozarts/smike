@@ -31,7 +31,7 @@ Reference command IDs from `PLAN.json`.
 - The local runner writes capsules and validates contracts. It does not spawn real subagents itself.
 
 ## Delegation
-- `delegation.mode`: use `runtime_subagents` when the outer runtime should spawn real agents from the capsule briefs, or `local_only` when the runner is enough.
+- `delegation.mode`: use `runtime_subagents` when the outer runtime should spawn real agents from the capsule briefs, `local_only` when the runner is enough, or `auto` when SMIKE should promote broad execution phases to runtime-owned executor dispatches only when the extra orchestration is justified.
 - `delegation.owner`: `runtime_orchestrator` when real subagent spawning belongs to the host runtime; `smike_runner` when no runtime delegation is expected.
 - `delegation.dispatch_artifacts`: keep this to the minimal runtime handoff files the orchestrator should read first.
 - `delegation.result_artifacts`: list the concrete outputs that must exist before a research or delegated phase can pass.

@@ -7,7 +7,16 @@ import { fileURLToPath } from 'node:url';
 import { createDispatchHelpers } from './lib/dispatch.mjs';
 import { createBuildPlanningAuditorRecord } from './lib/auditor.mjs';
 import { createBuildPlanningCheckerRecord } from './lib/checker.mjs';
+import {
+  buildPlanningDraftPromotionCheck,
+  planningAnalysisIsExecutionReady,
+} from './lib/planning-readiness.mjs';
 import { createBuildReviewRecord } from './lib/review.mjs';
+import {
+  collectCompletionRequirementFailures,
+  normalizeDispatchCompletionRequirements,
+  verifiedArtifactPathsFromCompletionArtifacts,
+} from './lib/runtime-artifact-surface.mjs';
 import { createValidationHelpers } from './lib/validation.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -38,6 +47,9 @@ const SMIKE_PARENT_TEST_RUNNER_ENV = 'SMIKE_PARENT_TEST_RUNNER';
 const SMIKE_ALLOW_NESTED_TEST_RUNS_ENV = 'SMIKE_ALLOW_NESTED_TEST_RUNS';
 const SMIKE_ALLOW_TEST_ACTIVE_PROJECT_ENV = 'SMIKE_ALLOW_TEST_ACTIVE_PROJECT';
 const SMIKE_NESTED_TEST_SKIP_STDOUT = 'smike-nested-test-run-skipped';
+const FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON = 'fresh-session-for-implementation';
+const AWAITING_FRESH_SESSION_LIFECYCLE_STATUS = 'awaiting_fresh_session';
+const PLANNING_DRAFT_LIFECYCLE_STATUS = 'planning_draft';
 const TEST_RUNNER_ENV_HINTS = [
   'VITEST',
   'VITEST_POOL_ID',
@@ -47,15 +59,26 @@ const TEST_RUNNER_ENV_HINTS = [
   'NODE_TEST_CONTEXT',
   'TAP',
 ];
+const DEFAULT_SMIKE_FEEDBACK_PATH =
+  REPO_ROOT === FRAMEWORK_ROOT
+    ? path.join(REPO_ROOT, 'docs', 'smike-feedback.md')
+    : path.join(REPO_ROOT, 'memories', 'smike-feedback.md');
 const SMIKE_FEEDBACK_PATH = process.env.SMIKE_FEEDBACK_PATH
   ? path.resolve(process.env.SMIKE_FEEDBACK_PATH)
-  : path.join(REPO_ROOT, 'memories', 'smike-feedback.md');
+  : DEFAULT_SMIKE_FEEDBACK_PATH;
+const SMIKE_FEEDBACK_SYNC_MODE = (() => {
+  const raw = typeof process.env.SMIKE_FEEDBACK_SYNC_MODE === 'string'
+    ? process.env.SMIKE_FEEDBACK_SYNC_MODE.trim().toLowerCase()
+    : '';
+  return raw === 'planning_complete' ? 'planning_complete' : 'full';
+})();
+const KNOWN_PHASE_REFRESH_MODES = new Set(['lightweight', 'auto_detailer_on_drift', 'always_detailer']);
 const RUNTIME_GUIDE_PATH = process.env.SMIKE_RUNTIME_GUIDE_PATH
   ? path.resolve(process.env.SMIKE_RUNTIME_GUIDE_PATH)
   : path.join(FRAMEWORK_ROOT, 'scripts', 'smike', 'RUNTIME_ORCHESTRATOR.md');
 const DEFAULT_FEEDBACK_NOTES_PROMPT =
   '- Add durable workflow follow-ups here when a SMIKE run reveals something worth keeping in repo memory.';
-const RESERVED_COMMANDS = new Set(['cycle', 'validate', 'generate', 'activate', 'resume', 'status', 'dispatch', 'archive', 'restore', 'gc']);
+const RESERVED_COMMANDS = new Set(['advance', 'cycle', 'recheck', 'doctor', 'validate', 'generate', 'activate', 'resume', 'status', 'dispatch', 'archive', 'restore', 'gc']);
 const DEFAULT_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SHELL_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const MANAGED_CHILD_REAP_GRACE_MS = 500;
@@ -192,7 +215,7 @@ const ROLE_DEFINITIONS = {
   },
 };
 const KNOWN_ROLES = Object.keys(ROLE_DEFINITIONS);
-const KNOWN_DELEGATION_MODES = new Set(['local_only', 'runtime_subagents']);
+const KNOWN_DELEGATION_MODES = new Set(['local_only', 'runtime_subagents', 'auto']);
 const KNOWN_DELEGATION_OWNERS = new Set(['smike_runner', 'runtime_orchestrator']);
 const KNOWN_RUNTIME_DISPATCH_STATUSES = new Set(['queued', 'spawned', 'completed', 'stale', 'failed']);
 const KNOWN_RUNTIME_DISPATCH_FRESHNESS = new Set(['pending', 'fresh', 'stale', 'missing', 'unchanged']);
@@ -217,14 +240,19 @@ function usage() {
   smike
   smike <spec.md|spec-slug> [context.md ...]
   smike <project>
+  smike advance [project]
   smike cycle <project> [--no-auto-continue] [--max-phases=<n>]
+  smike recheck <project>
+  smike doctor [project]
   smike dispatch <project> <spawned|completed|failed|retry> <dispatch-id> [--reason=<text>]
+  smike dispatch <project> complete-group <current|group-number>
   smike archive <project> [--mode=compact|full] [--force]
   smike restore <project>
   smike gc
   smike validate <project>
   smike generate <project>
   smike activate <project>
+  smike resume [project]
   smike status
 
 Project directory must be: .smike/<project>
@@ -913,6 +941,18 @@ function inferPlanStage(project, plan) {
   return 'execution';
 }
 
+function isPlanningLifecycleStatus(status) {
+  return status === 'planning' || status === PLANNING_DRAFT_LIFECYCLE_STATUS;
+}
+
+function isPlanningDraftLifecycleStatus(status) {
+  return status === PLANNING_DRAFT_LIFECYCLE_STATUS;
+}
+
+function isPlanningDraftState(state) {
+  return isPlanningDraftLifecycleStatus(state?.lifecycle?.status) || state?.planning?.status === 'draft';
+}
+
 function defaultEnabledForRole(stage, role) {
   const definition = ROLE_DEFINITIONS[role];
   return Boolean(definition && definition.stage === stage && definition.enabled_by_default);
@@ -994,6 +1034,31 @@ function normalizeDelegationConfig(plan = {}) {
   };
 }
 
+function defaultAutoRuntimeRoles(plan = {}) {
+  const preferred = normalizeStringArray(plan?.delegation?.runtime_roles || [])
+    .filter((role) => role === 'executor');
+  return preferred.length > 0 ? preferred : ['executor'];
+}
+
+function normalizePhaseRefreshMode(plan = {}) {
+  const rawFlags =
+    plan?.feature_flags && typeof plan.feature_flags === 'object' && !Array.isArray(plan.feature_flags)
+      ? plan.feature_flags
+      : {};
+  const rawMode = typeof rawFlags.phase_refresh_mode === 'string'
+    ? rawFlags.phase_refresh_mode.trim()
+    : '';
+  if (KNOWN_PHASE_REFRESH_MODES.has(rawMode)) {
+    return rawMode;
+  }
+
+  if (inferPlanStage('', plan) === 'execution' && normalizeStringArray(plan?.depends_on).length > 0) {
+    return 'auto_detailer_on_drift';
+  }
+
+  return 'lightweight';
+}
+
 function createDispatchFreshness(status = 'pending', reason = null, checkedAt = null) {
   const normalizedStatus = KNOWN_RUNTIME_DISPATCH_FRESHNESS.has(status) ? status : 'pending';
   return {
@@ -1047,6 +1112,11 @@ function ensureRuntimeDispatchState(orchestration) {
     rawEntry.capsule_json = typeof rawEntry.capsule_json === 'string' ? normalizeRel(rawEntry.capsule_json) : '';
     rawEntry.result_artifacts = normalizePathList(rawEntry.result_artifacts || []);
     rawEntry.artifact_change_required = rawEntry.artifact_change_required === true;
+    rawEntry.completion_requirements = normalizeDispatchCompletionRequirements(
+      rawEntry.completion_requirements,
+      rawEntry.result_artifacts,
+      rawEntry.artifact_change_required,
+    );
     rawEntry.agent_type_hint = typeof rawEntry.agent_type_hint === 'string' ? rawEntry.agent_type_hint : 'default';
     rawEntry.reasoning_effort_hint = typeof rawEntry.reasoning_effort_hint === 'string' ? rawEntry.reasoning_effort_hint : 'medium';
     rawEntry.instruction = typeof rawEntry.instruction === 'string' ? rawEntry.instruction : '';
@@ -1104,6 +1174,23 @@ function ensureOrchestrationState(state) {
   if (!capsules.by_plan || typeof capsules.by_plan !== 'object' || Array.isArray(capsules.by_plan)) {
     capsules.by_plan = {};
   }
+  if (
+    orchestration.current_actionable_dispatch !== null
+    && (
+      !orchestration.current_actionable_dispatch
+      || typeof orchestration.current_actionable_dispatch !== 'object'
+      || Array.isArray(orchestration.current_actionable_dispatch)
+    )
+  ) {
+    orchestration.current_actionable_dispatch = null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(orchestration, 'current_actionable_dispatch')) {
+    orchestration.current_actionable_dispatch = null;
+  }
+  orchestration.current_actionable_capsule = typeof orchestration.current_actionable_capsule === 'string'
+    && orchestration.current_actionable_capsule.trim()
+    ? orchestration.current_actionable_capsule.trim()
+    : null;
   ensureRuntimeDispatchState(orchestration);
 
   return orchestration;
@@ -1190,6 +1277,34 @@ function artifactSnapshotEquivalent(left, right) {
 
 function artifactChangeRequiredForRole(role) {
   return role === 'strategist' || role === 'detailer' || role === 'executor' || role === 'fixer';
+}
+
+function buildDispatchCompletionRequirements(resultArtifacts = [], artifactChangeRequired = false) {
+  return normalizeDispatchCompletionRequirements(null, resultArtifacts, artifactChangeRequired);
+}
+
+function buildCompletionChecksFromRequirements(requirements) {
+  const normalized = normalizeDispatchCompletionRequirements(requirements);
+  const artifactPaths = normalized.artifact_requirements.map((entry) => entry.path);
+  const checks = [
+    artifactPaths.length > 0
+      ? `Write the declared result artifacts on disk: ${artifactPaths.join(', ')}.`
+      : 'Write the role-specific result artifacts declared by the dispatch contract.',
+  ];
+  const hasJson = normalized.artifact_requirements.some((entry) => entry.must_parse_json);
+  const hasText = normalized.artifact_requirements.some((entry) => entry.kind === 'text');
+  if (hasJson) {
+    checks.push('JSON result artifacts must parse successfully and contain non-empty semantic content.');
+  }
+  if (hasText) {
+    checks.push('Text result artifacts must contain non-blank content.');
+  }
+  checks.push(
+    normalized.require_artifact_change
+      ? 'Materially change at least one declared result artifact before marking the dispatch complete.'
+      : 'Leave a valid result artifact even when the role only reports pass/fail or findings.',
+  );
+  return uniqueStrings(checks);
 }
 
 function appendRuntimeDispatchTransition(entry, status, reason = null, at = nowIso()) {
@@ -1562,6 +1677,7 @@ function getProjectPaths(project) {
   const projectDir = path.join(SMIKE_ROOT, project);
   return {
     projectDir,
+    inputsDir: path.join(projectDir, 'inputs'),
     capsulesDir: path.join(projectDir, 'capsules'),
     runtimeDelegationJsonPath: path.join(projectDir, 'RUNTIME-DELEGATION.json'),
     runtimeDelegationMdPath: path.join(projectDir, 'RUNTIME-DELEGATION.md'),
@@ -1583,8 +1699,10 @@ function getProjectPaths(project) {
     planningAuditorMdPath: path.join(projectDir, 'AUDITOR.md'),
     planningAuditJsonPath: path.join(projectDir, 'AUDIT.json'),
     planningAuditMdPath: path.join(projectDir, 'AUDIT.md'),
+    planningHandoffMdPath: path.join(projectDir, 'PLANNING-HANDOFF.md'),
     resumeCapsuleJsonPath: path.join(projectDir, 'RESUME-CAPSULE.json'),
     resumeCapsuleMdPath: path.join(projectDir, 'RESUME-CAPSULE.md'),
+    implementationHandoffJsonPath: path.join(projectDir, 'IMPLEMENTATION-HANDOFF.json'),
     planGraphJsonPath: path.join(projectDir, 'PLAN-GRAPH.json'),
     planGraphMdPath: path.join(projectDir, 'PLAN-GRAPH.md'),
     indexJsonPath: path.join(projectDir, 'INDEX.json'),
@@ -1714,6 +1832,116 @@ function snapshotArchiveInputs(specRel, contextFiles, archivePaths) {
   };
 }
 
+function listPlanningInputs(specRel, contextFiles) {
+  return uniqueStrings([specRel, ...normalizePathList(contextFiles)]).filter(Boolean);
+}
+
+function getProjectInputSnapshotRel(project, inputRel) {
+  return normalizeRel(path.posix.join('.smike', project, 'inputs', normalizeRel(inputRel)));
+}
+
+function collectProjectPlanningInputStatus(project, paths, specRel, contextFiles) {
+  const inputs = listPlanningInputs(specRel, contextFiles);
+  const items = inputs.map((inputRel) => {
+    const normalized = normalizeRel(inputRel);
+    const sourcePath = path.resolve(REPO_ROOT, normalized);
+    const snapshotRel = getProjectInputSnapshotRel(project, normalized);
+    const snapshotPath = path.resolve(REPO_ROOT, snapshotRel);
+    const sourceExists = isPathInside(REPO_ROOT, sourcePath)
+      && fs.existsSync(sourcePath)
+      && fs.statSync(sourcePath).isFile();
+    const snapshotExists = isPathInside(REPO_ROOT, snapshotPath)
+      && fs.existsSync(snapshotPath)
+      && fs.statSync(snapshotPath).isFile();
+    return {
+      source_rel: normalized,
+      snapshot_rel: snapshotRel,
+      source_exists: sourceExists,
+      snapshot_exists: snapshotExists,
+      role: normalized === normalizeRel(specRel || '') ? 'spec' : 'context',
+    };
+  });
+  return {
+    root: normalizeRel(path.relative(REPO_ROOT, paths.inputsDir)),
+    inputs: items,
+    missing_source_paths: items.filter((item) => !item.source_exists).map((item) => item.source_rel),
+    recoverable_paths: items.filter((item) => !item.source_exists && item.snapshot_exists).map((item) => item.source_rel),
+    unrecoverable_paths: items.filter((item) => !item.source_exists && !item.snapshot_exists).map((item) => item.source_rel),
+  };
+}
+
+function snapshotProjectInputs(project, paths, specRel, contextFiles) {
+  ensureDir(paths.inputsDir);
+  const inputs = listPlanningInputs(specRel, contextFiles);
+  for (const inputRel of inputs) {
+    const normalized = normalizeRel(inputRel);
+    const sourcePath = path.resolve(REPO_ROOT, normalized);
+    if (!isPathInside(REPO_ROOT, sourcePath) || !fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+      continue;
+    }
+    const snapshotPath = path.resolve(REPO_ROOT, getProjectInputSnapshotRel(project, normalized));
+    ensureDir(path.dirname(snapshotPath));
+    fs.copyFileSync(sourcePath, snapshotPath);
+  }
+  return collectProjectPlanningInputStatus(project, paths, specRel, contextFiles);
+}
+
+function restoreProjectPlanningInputsFromSnapshot(project, paths, specRel, contextFiles) {
+  const before = collectProjectPlanningInputStatus(project, paths, specRel, contextFiles);
+  const restored = [];
+  for (const item of before.inputs) {
+    if (item.source_exists || !item.snapshot_exists) {
+      continue;
+    }
+    const sourcePath = path.resolve(REPO_ROOT, item.source_rel);
+    const snapshotPath = path.resolve(REPO_ROOT, item.snapshot_rel);
+    ensureDir(path.dirname(sourcePath));
+    fs.copyFileSync(snapshotPath, sourcePath);
+    restored.push(item.source_rel);
+  }
+  return {
+    restored,
+    status: collectProjectPlanningInputStatus(project, paths, specRel, contextFiles),
+  };
+}
+
+function buildPlanningInputFailureMessage(project, inputStatus, surface) {
+  const lines = [
+    `${surface} for ${project} is missing readable planning inputs:`,
+    ...inputStatus.inputs
+      .filter((item) => !item.source_exists)
+      .map((item) => `- ${item.source_rel}${item.snapshot_exists ? ` (snapshot available at ${item.snapshot_rel})` : ' (no snapshot available)'}`),
+  ];
+  if (inputStatus.recoverable_paths.length > 0) {
+    lines.push(`Recoverable from snapshots under .smike/${project}/inputs/. Run \`./smike doctor ${project}\` if you want a dedicated diagnosis.`);
+  } else {
+    lines.push(`No usable local snapshot exists under .smike/${project}/inputs/. Restore the missing files or recreate the project inputs.`);
+  }
+  return lines.join('\n');
+}
+
+function ensurePlanningInputsReadable(project, paths, specRel, contextFiles, surface) {
+  if (!specRel || !String(specRel).trim()) {
+    fail(`${surface} for ${project} is missing a recorded spec path. Run \`./smike doctor ${project}\`.`);
+  }
+
+  const recovery = restoreProjectPlanningInputsFromSnapshot(project, paths, specRel, contextFiles);
+  if (recovery.status.missing_source_paths.length > 0) {
+    fail(buildPlanningInputFailureMessage(project, recovery.status, surface));
+  }
+  return recovery;
+}
+
+function printPlanningInputRecovery(project, recovery) {
+  if (!Array.isArray(recovery?.restored) || recovery.restored.length === 0) {
+    return;
+  }
+  console.log(`smike: restored planning inputs for ${project} from .smike/${project}/inputs`);
+  for (const restoredPath of recovery.restored) {
+    console.log(`restored_input: ${restoredPath}`);
+  }
+}
+
 function buildArchiveManifest(project, archiveMode, state, rootPlan, projectMeta, copiedRuntimeFiles, inputSnapshot) {
   const latest = ensureArray(state?.history).at(-1) || null;
   return {
@@ -1791,6 +2019,13 @@ function getResearchResultPaths(project, phaseId) {
   const phaseDir = `.smike/${project}/phases/${phaseId}`;
   return {
     jsonRel: `${phaseDir}/${phaseId}-FINDINGS.json`,
+  };
+}
+
+function getRuntimeExecutionResultPaths(project, phaseId, role) {
+  const phaseDir = `.smike/${project}/phases/${phaseId}`;
+  return {
+    jsonRel: `${phaseDir}/${phaseId}-${role}-runtime.json`,
   };
 }
 
@@ -2197,10 +2432,34 @@ function isEphemeralFeedbackProject(project, rootPlan) {
 function resolveDurableFeedbackPhase(project, state) {
   const lifecycleStatus = state?.lifecycle?.status || null;
   const planningStatus = state?.planning?.status || null;
+  const pauseReason = state?.workflow?.pause_reason || null;
   const history = ensureArray(state?.history);
   const latest = history.at(-1) || null;
   const planningRootPlanId = `${project}-plan`;
   const onlyPlanningHistory = history.length > 0 && history.every((entry) => entry?.plan_id === planningRootPlanId);
+  const planningBoundaryComplete =
+    planningStatus === 'complete'
+    && (
+      onlyPlanningHistory
+      || lifecycleStatus === 'ready'
+      || lifecycleStatus === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS
+      || pauseReason === FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON
+    );
+
+  if (SMIKE_FEEDBACK_SYNC_MODE === 'planning_complete') {
+    if (!planningBoundaryComplete) {
+      return null;
+    }
+    return {
+      phase: 'planning',
+      key: [
+        'planning',
+        planningStatus,
+        state?.planning?.last_plan_hash || '',
+        state?.planning?.completed_at || state?.lifecycle?.last_completed_at || latest?.completed_at || '',
+      ].join(':'),
+    };
+  }
 
   if (lifecycleStatus === 'planning_blocked' || planningStatus === 'blocked') {
     return {
@@ -2214,7 +2473,19 @@ function resolveDurableFeedbackPhase(project, state) {
     };
   }
 
-  if (planningStatus === 'complete' && (lifecycleStatus === 'ready' || onlyPlanningHistory)) {
+  if (isPlanningDraftLifecycleStatus(lifecycleStatus) || planningStatus === 'draft') {
+    return {
+      phase: 'planning',
+      key: [
+        'planning',
+        'draft',
+        state?.planning?.last_plan_hash || '',
+        state?.updated_at || '',
+      ].join(':'),
+    };
+  }
+
+  if (planningBoundaryComplete) {
     return {
       phase: 'planning',
       key: [
@@ -2954,6 +3225,27 @@ function readOptionalJson(filePath) {
   }
 }
 
+function parseMarkdownBulletSection(filePath, heading) {
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+  const text = fs.readFileSync(filePath, 'utf8');
+  const escapedHeading = escapeRegex(String(heading || '').trim());
+  if (!escapedHeading) {
+    return [];
+  }
+  const match = text.match(new RegExp(`^## ${escapedHeading}\\r?\\n([\\s\\S]*?)(?=^## |\\Z)`, 'm'));
+  if (!match) {
+    return [];
+  }
+  return match[1]
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^-\s+/.test(line))
+    .map((line) => line.replace(/^-\s+/, '').trim())
+    .filter(Boolean);
+}
+
 function loadPlanningAnalysis(paths) {
   const checker = readOptionalJson(paths.planningCheckerJsonPath);
   const auditor = readOptionalJson(paths.planningAuditorJsonPath) || readOptionalJson(paths.planningAuditJsonPath);
@@ -2978,6 +3270,94 @@ function loadPlanningAnalysis(paths) {
   };
 }
 
+function getExistingMtimeMs(filePath) {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function getPlanningPhasePlanPaths(paths, bundle = null) {
+  if (bundle && Array.isArray(bundle.phase_blueprints)) {
+    return bundle.phase_blueprints
+      .map((phase) => path.join(paths.projectDir, 'phases', phase.id, `${phase.id}-PLAN.json`))
+      .filter((filePath) => fs.existsSync(filePath));
+  }
+
+  const phasesDir = path.join(paths.projectDir, 'phases');
+  if (!fs.existsSync(phasesDir)) {
+    return [];
+  }
+
+  return walkRelativeFiles(phasesDir)
+    .filter((relativePath) => /-PLAN\.json$/.test(relativePath))
+    .map((relativePath) => path.join(phasesDir, relativePath))
+    .filter((filePath) => fs.existsSync(filePath));
+}
+
+function getPlanningSourceArtifactPaths(paths, bundle = null) {
+  return [
+    paths.planJsonPath,
+    paths.planMdPath,
+    paths.strategyPath,
+    paths.roadmapPath,
+    ...getPlanningPhasePlanPaths(paths, bundle),
+  ].filter((filePath) => fs.existsSync(filePath));
+}
+
+function getPlanningVerificationArtifactPaths(paths) {
+  return [
+    paths.planningCheckerJsonPath,
+    paths.planningAuditorJsonPath,
+    paths.verdictReportPath,
+    paths.reviewReportPath,
+  ].filter((filePath) => fs.existsSync(filePath));
+}
+
+function getPlanningArtifactFreshness(paths, bundle = null) {
+  const sourcePaths = getPlanningSourceArtifactPaths(paths, bundle);
+  const verificationPaths = getPlanningVerificationArtifactPaths(paths);
+  if (sourcePaths.length === 0) {
+    return {
+      stale: false,
+      reason: null,
+      source_paths: [],
+      verification_paths: verificationPaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
+      stale_outputs: [],
+    };
+  }
+
+  const latestSource = sourcePaths
+    .map((filePath) => ({ filePath, mtimeMs: getExistingMtimeMs(filePath) || 0 }))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)[0];
+
+  if (verificationPaths.length === 0) {
+    return {
+      stale: true,
+      reason: 'planning verification artifacts are missing',
+      source_paths: sourcePaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
+      verification_paths: [],
+      stale_outputs: [],
+    };
+  }
+
+  const staleOutputs = verificationPaths.filter((filePath) => {
+    const mtimeMs = getExistingMtimeMs(filePath);
+    return typeof mtimeMs !== 'number' || mtimeMs < latestSource.mtimeMs;
+  });
+
+  return {
+    stale: staleOutputs.length > 0,
+    reason: staleOutputs.length > 0
+      ? `planning sources changed after verification (${staleOutputs.map((filePath) => path.basename(filePath)).join(', ')})`
+      : null,
+    source_paths: sourcePaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
+    verification_paths: verificationPaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
+    stale_outputs: staleOutputs.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
+  };
+}
+
 function buildPlanningBlockedNextAction(project, paths, planningAnalysis) {
   const findingSummary = planningAnalysis.blocking_findings
     .slice(0, 4)
@@ -2989,15 +3369,65 @@ function buildPlanningBlockedNextAction(project, paths, planningAnalysis) {
     planningAnalysis.auditor ? `.smike/${project}/AUDITOR.json` : null,
   ].filter(Boolean);
   const docText = docs.length > 0 ? docs.join(' and ') : `.smike/${project}/PLAN.md`;
-  return `Resolve planning findings in ${docText}, then rerun \`./smike cycle ${project}\`.${suffix}`;
+  return `Resolve planning findings in ${docText}, then rerun \`${buildRecheckCommand(project)}\`.${suffix}`;
 }
 
 function buildCycleCommand(project) {
   return `./smike cycle ${project}`;
 }
 
+function buildAdvanceCommand(project = null) {
+  const normalized = typeof project === 'string' ? project.trim() : '';
+  return normalized ? `./smike advance ${normalized}` : './smike advance';
+}
+
+function buildRecheckCommand(project) {
+  return `./smike recheck ${project}`;
+}
+
+function buildResumeCommand(project = null) {
+  const normalized = typeof project === 'string' ? project.trim() : '';
+  return normalized ? `./smike resume ${normalized}` : './smike resume';
+}
+
 function buildRetryDispatchCommand(project, dispatchId = '<dispatch-id>') {
   return `./smike dispatch ${project} retry ${dispatchId}`;
+}
+
+function buildCompleteDispatchGroupCommand(project, group = 'current') {
+  return `./smike dispatch ${project} complete-group ${group}`;
+}
+
+function isFreshSessionImplementationPauseReason(value) {
+  return typeof value === 'string' && value.trim() === FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON;
+}
+
+function applyFreshSessionImplementationGate(state) {
+  if (!state.workflow || typeof state.workflow !== 'object') {
+    state.workflow = {};
+  }
+  state.workflow.auto_continue = false;
+  state.workflow.pause_reason = FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON;
+}
+
+function clearFreshSessionImplementationGate(state) {
+  if (!isFreshSessionImplementationPauseReason(state?.workflow?.pause_reason)) {
+    return false;
+  }
+  if (!state.workflow || typeof state.workflow !== 'object') {
+    state.workflow = {};
+  }
+  state.workflow.auto_continue = true;
+  state.workflow.pause_reason = null;
+  return true;
+}
+
+function carryForwardFreshSessionImplementationGate(state, previousWorkflow) {
+  if (!isFreshSessionImplementationPauseReason(previousWorkflow?.pause_reason)) {
+    return false;
+  }
+  applyFreshSessionImplementationGate(state);
+  return true;
 }
 
 function setLifecycleStopReason(state, stopReason = null) {
@@ -3026,25 +3456,68 @@ function getLifecycleNextCommand(state) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function runtimeDispatchPlanFilterFromActionable(actionable) {
+  return Array.isArray(actionable?.plan_ids) && actionable.plan_ids.length > 0
+    ? actionable.plan_ids
+    : actionable?.plan_id || null;
+}
+
 function buildAwaitingRuntimeDispatchState(project, runtimeDispatchPending) {
-  const pendingPlansText = runtimeDispatchPending.plan_ids.length > 1
-    ? runtimeDispatchPending.plan_ids.join(', ')
-    : runtimeDispatchPending.plan_id;
+  const pendingPlansText = describePendingRuntimePlans(runtimeDispatchPending);
   const readyIds = runtimeDispatchPending.ready_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none';
-  const firstReadyDispatchId = runtimeDispatchPending.ready_dispatches[0]?.dispatch_id || '<dispatch-id>';
   return {
     status: 'awaiting_runtime_dispatch',
     stop_reason: 'awaiting_runtime_dispatch',
     next_action:
       `Run runtime dispatch group ${runtimeDispatchPending.group || 1} from .smike/${project}/RUNTIME-DELEGATION.json `
       + `for ${pendingPlansText}: ${readyIds}. Mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
-      + `then rerun \`${buildCycleCommand(project)}\`.`,
-    next_command: `./smike dispatch ${project} spawned ${firstReadyDispatchId}`,
+      + `then rerun \`${buildAdvanceCommand(project)}\`.`,
+    next_command: buildAdvanceCommand(project),
+  };
+}
+
+function buildReadyRuntimeDispatchFollowOnState(project, runtimeDispatchPending) {
+  const pendingPlansText = describePendingRuntimePlans(runtimeDispatchPending);
+  const readyIds = runtimeDispatchPending.ready_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none';
+  return {
+    status: 'in_progress',
+    stop_reason: null,
+    next_action:
+      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} from .smike/${project}/RUNTIME-DELEGATION.json `
+      + `for ${pendingPlansText}: ${readyIds}. Mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
+      + 'then follow the updated `next_command`.',
+    next_command: buildAdvanceCommand(project),
+  };
+}
+
+function buildAwaitingFreshSessionState(project, readyWorkflowPlans, runtimeDispatchPending = null) {
+  const actionableDispatchId = runtimeDispatchPending?.ready_dispatches?.[0]?.dispatch_id
+    || runtimeDispatchPending?.active_dispatches?.[0]?.dispatch_id
+    || runtimeDispatchPending?.failed_dispatches?.[0]?.dispatch_id
+    || null;
+  const actionableDispatchText = actionableDispatchId
+    ? ` Current actionable dispatch: ${actionableDispatchId}.`
+    : '';
+  return {
+    status: AWAITING_FRESH_SESSION_LIFECYCLE_STATUS,
+    stop_reason: AWAITING_FRESH_SESSION_LIFECYCLE_STATUS,
+    next_action:
+      `Planning complete. Start a fresh session with \`${buildAdvanceCommand(project)}\` before executing implementation work.`
+      + actionableDispatchText
+      + ` ${describeReadyWorkflowPlans(readyWorkflowPlans)}`,
+    next_command: buildAdvanceCommand(project),
   };
 }
 
 function enterAwaitingRuntimeDispatch(state, project, runtimeDispatchPending) {
   const lifecycle = buildAwaitingRuntimeDispatchState(project, runtimeDispatchPending);
+  state.lifecycle.status = lifecycle.status;
+  setLifecycleStopReason(state, lifecycle.stop_reason);
+  setLifecycleNextStep(state, lifecycle.next_action, lifecycle.next_command);
+}
+
+function enterAwaitingFreshSession(state, project, readyWorkflowPlans, runtimeDispatchPending = null) {
+  const lifecycle = buildAwaitingFreshSessionState(project, readyWorkflowPlans, runtimeDispatchPending);
   state.lifecycle.status = lifecycle.status;
   setLifecycleStopReason(state, lifecycle.stop_reason);
   setLifecycleNextStep(state, lifecycle.next_action, lifecycle.next_command);
@@ -3078,14 +3551,83 @@ function describePendingRuntimePlans(runtimeDispatchPending) {
     : runtimeDispatchPending.plan_id;
 }
 
-function applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPending) {
+function summarizeRuntimeDispatchContext(runtimeContext) {
+  const actionablePlanIds = Array.isArray(runtimeContext?.actionable?.plan_ids) && runtimeContext.actionable.plan_ids.length > 0
+    ? runtimeContext.actionable.plan_ids.join(', ')
+    : 'none';
+  return {
+    plan_ids: actionablePlanIds,
+    group: currentRuntimeDispatchGroup(runtimeContext) || 'none',
+    completable_group: currentCompletableRuntimeDispatchGroup(runtimeContext),
+    ready_ids: runtimeContext.ready_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
+    active_ids: runtimeContext.active_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
+    failed_ids: runtimeContext.failed_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
+  };
+}
+
+function buildRuntimeDispatchSummaryLines(runtimeContext) {
+  if (!runtimeContext || runtimeContext.dispatches.length === 0) {
+    return [];
+  }
+
+  const summary = summarizeRuntimeDispatchContext(runtimeContext);
+  const staleEntries = runtimeContext.dispatches.filter(
+    (entry) => entry.status === 'stale' || entry.freshness?.status === 'stale',
+  );
+  return [
+    `dispatch_plan_ids: ${summary.plan_ids}`,
+    `dispatch_group: ${summary.group}`,
+    `dispatch_completable_group: ${summary.completable_group}`,
+    `dispatch_ready: ${summary.ready_ids}`,
+    `dispatch_active: ${summary.active_ids}`,
+    `dispatch_failed: ${summary.failed_ids}`,
+    ...staleEntries.slice(0, 4).map((entry) => `dispatch_stale: ${entry.dispatch_id} (${entry.freshness?.reason || 'stale dispatch contract'})`),
+  ];
+}
+
+function printDispatchFollowOn(project, state) {
+  console.log(`next: ${state.lifecycle?.next_action || 'unknown'}`);
+  const nextCommand = getLifecycleNextCommand(state);
+  if (nextCommand) {
+    console.log(`next_command: ${nextCommand}`);
+  }
+  if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
+    console.log('runtime_requirement: host runtime must execute next_command before treating this project state as complete.');
+  } else if (state.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
+    console.log('fresh_session_requirement: start a fresh session through next_command before executing implementation work.');
+  }
+
+  const paths = getProjectPaths(project);
+  if (!fs.existsSync(paths.planJsonPath)) {
+    return;
+  }
+
+  const rootPlan = readJson(paths.planJsonPath);
+  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+  for (const line of buildRuntimeDispatchSummaryLines(runtimeContext)) {
+    console.log(line);
+  }
+  if (runtimeContext.active_dispatches.length > 1) {
+    const group = currentRuntimeDispatchGroup(runtimeContext) || 'current';
+    console.log(`dispatch_completion_hint: complete state writes serially, or use \`${buildCompleteDispatchGroupCommand(project, group)}\`.`);
+  }
+}
+
+function applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPending, options = {}) {
   if (!runtimeDispatchPending) {
     return false;
   }
 
   const pendingPlansText = describePendingRuntimePlans(runtimeDispatchPending);
   if (runtimeDispatchPending.ready_dispatches.length > 0) {
-    enterAwaitingRuntimeDispatch(state, project, runtimeDispatchPending);
+    if (options.readyLifecycle === 'in_progress') {
+      const lifecycle = buildReadyRuntimeDispatchFollowOnState(project, runtimeDispatchPending);
+      state.lifecycle.status = lifecycle.status;
+      setLifecycleStopReason(state, lifecycle.stop_reason);
+      setLifecycleNextStep(state, lifecycle.next_action, lifecycle.next_command);
+    } else {
+      enterAwaitingRuntimeDispatch(state, project, runtimeDispatchPending);
+    }
     return true;
   }
 
@@ -3134,7 +3676,9 @@ function maybeRecordHandoffFailure(project, state) {
     return false;
   }
 
-  const dispatchId = extractSpawnDispatchId(getLifecycleNextCommand(state));
+  const dispatchId = extractSpawnDispatchId(getLifecycleNextCommand(state))
+    || state?.orchestration?.current_actionable_dispatch?.dispatch_id
+    || null;
   if (!dispatchId) {
     return false;
   }
@@ -3168,8 +3712,20 @@ function maybeRecordHandoffFailure(project, state) {
   return true;
 }
 
-function collectDependencyDiscoveries(state, dependencyIds) {
+function collectDependencyDiscoveries(state, dependencyIds, targetPlanId = null) {
   const discoveries = [...ensureArray(state?.gotchas)];
+  const target = typeof targetPlanId === 'string' && targetPlanId.trim() ? targetPlanId.trim() : null;
+
+  if (target) {
+    for (const record of ensureArray(state?.propagated_discoveries)) {
+      if (!ensureArray(record?.target_plan_ids).includes(target)) {
+        continue;
+      }
+      for (const discovery of ensureArray(record?.discoveries)) {
+        discoveries.push(`refresh: ${discovery}`);
+      }
+    }
+  }
 
   for (const depId of normalizeStringArray(dependencyIds)) {
     const latest = [...ensureArray(state?.history)]
@@ -3191,6 +3747,208 @@ function collectDependencyDiscoveries(state, dependencyIds) {
   return uniqueStrings(discoveries).slice(0, 16);
 }
 
+function summarizeWriteScopeAreas(plan = {}) {
+  const allowed = uniqueStrings([
+    ...ensureArray(plan?.allowed_files),
+    ...ensureArray(plan?.write_scope?.allowed_files),
+  ]).filter((entry) => entry && !entry.startsWith('.smike/'));
+
+  return uniqueStrings(
+    allowed.map((entry) => {
+      const normalized = normalizeRel(entry).replace(/^\.\//, '');
+      const parts = normalized.split('/').filter(Boolean);
+      if (parts[0] === 'packages' && parts[1]) {
+        return `packages/${parts[1]}`;
+      }
+      if (parts[0] === 'apps' && parts[1]) {
+        return `apps/${parts[1]}`;
+      }
+      if (parts[0] === 'tests' && parts[1]) {
+        return `tests/${parts[1]}`;
+      }
+      return parts[0] || '(root)';
+    }),
+  );
+}
+
+function collectAutoDelegationSignals(state, contract) {
+  const plan = contract?.plan || {};
+  const planId = plan?.plan_id || null;
+  const writeScopeAllowed = uniqueStrings([
+    ...ensureArray(plan?.allowed_files),
+    ...ensureArray(plan?.write_scope?.allowed_files),
+  ]).filter((entry) => entry && !entry.startsWith('.smike/'));
+  const writeScopeAreas = summarizeWriteScopeAreas(plan);
+  const verifyCount = ensureArray(plan?.verify_commands).length;
+  const dependencyCount = normalizeStringArray(plan?.depends_on).length;
+  const acceptanceCount = ensureArray(plan?.acceptance_criteria).length;
+  const priorFailureCount = ensureArray(state?.history)
+    .filter((entry) => entry?.plan_id === planId && entry?.result === 'fail')
+    .length;
+  const refreshSignals = collectPhaseRefreshSignals(state, contract);
+  const signals = [];
+
+  if (writeScopeAreas.length >= 2) {
+    signals.push(`write scope spans ${writeScopeAreas.length} areas (${writeScopeAreas.join(', ')})`);
+  }
+  if (writeScopeAllowed.length >= 5) {
+    signals.push(`write scope lists ${writeScopeAllowed.length} allowed surfaces`);
+  }
+  if (verifyCount >= 3) {
+    signals.push(`verification surface includes ${verifyCount} commands`);
+  }
+  if (dependencyCount >= 2) {
+    signals.push(`phase depends on ${dependencyCount} upstream phases`);
+  }
+  if (acceptanceCount >= 4) {
+    signals.push(`acceptance contract includes ${acceptanceCount} criteria`);
+  }
+  if (priorFailureCount > 0) {
+    signals.push(`phase has ${priorFailureCount} prior failed execution cycle${priorFailureCount === 1 ? '' : 's'}`);
+  }
+  if (refreshSignals.length > 0) {
+    signals.push('upstream drift signals already exist for this phase');
+  }
+
+  return uniqueStrings(signals).slice(0, 12);
+}
+
+function shouldAutoPromoteDelegation(state, contract) {
+  const declaredDelegation = normalizeDelegationConfig(contract?.plan);
+  if (declaredDelegation.mode !== 'auto') {
+    return false;
+  }
+  if (inferPlanStage('', contract?.plan || {}) !== 'execution') {
+    return false;
+  }
+  return collectAutoDelegationSignals(state, contract).length >= 2;
+}
+
+function resolveExecutionDelegation(project, state, contract) {
+  const declaredDelegation = normalizeDelegationConfig(contract?.plan);
+  const stage = inferPlanStage(project, contract?.plan || {});
+  const defaultRuntimeArtifacts = contract?.plan?.plan_id
+    ? [getRuntimeExecutionResultPaths(project, contract.plan.plan_id, 'executor').jsonRel]
+    : [];
+  if (stage !== 'execution') {
+    return declaredDelegation;
+  }
+
+  if (declaredDelegation.mode === 'auto') {
+    if (!shouldAutoPromoteDelegation(state, contract)) {
+      return {
+        ...declaredDelegation,
+        declared_mode: 'auto',
+        mode: 'local_only',
+        owner: 'smike_runner',
+        runtime_roles: [],
+        auto_promoted: false,
+        auto_signals: collectAutoDelegationSignals(state, contract),
+      };
+    }
+
+    return {
+      ...declaredDelegation,
+      declared_mode: 'auto',
+      mode: 'runtime_subagents',
+      owner: 'runtime_orchestrator',
+      runtime_roles: defaultAutoRuntimeRoles(contract?.plan),
+      result_artifacts: declaredDelegation.result_artifacts.length > 0
+        ? declaredDelegation.result_artifacts
+        : defaultRuntimeArtifacts,
+      auto_promoted: true,
+      auto_signals: collectAutoDelegationSignals(state, contract),
+    };
+  }
+
+  if (declaredDelegation.mode === 'runtime_subagents' && declaredDelegation.owner === 'runtime_orchestrator') {
+    return {
+      ...declaredDelegation,
+      result_artifacts: declaredDelegation.result_artifacts.length > 0
+        ? declaredDelegation.result_artifacts
+        : defaultRuntimeArtifacts,
+      declared_mode: declaredDelegation.mode,
+      auto_promoted: false,
+      auto_signals: [],
+    };
+  }
+
+  return declaredDelegation;
+}
+
+function latestRoleGeneratedAt(state, planId, role) {
+  const entry = [...ensureArray(state?.orchestration?.role_history)]
+    .reverse()
+    .find((item) => item?.plan_id === planId && item?.role === role && typeof item?.generated_at === 'string');
+  return entry?.generated_at || null;
+}
+
+function collectPhaseRefreshSignals(state, contract) {
+  const planId = contract?.plan?.plan_id || null;
+  const dependencyIds = normalizeStringArray(contract?.plan?.depends_on);
+  const lastDetailerAt = latestRoleGeneratedAt(state, planId, 'detailer');
+  const signals = [];
+
+  if (!planId || dependencyIds.length === 0) {
+    return signals;
+  }
+
+  if (!lastDetailerAt) {
+    signals.push('no prior detailer capsule exists for this phase');
+  }
+
+  for (const dependencyId of dependencyIds) {
+    const latestDependencyRun = [...ensureArray(state?.history)]
+      .reverse()
+      .find((entry) => entry?.plan_id === dependencyId && typeof entry?.completed_at === 'string');
+    if (
+      latestDependencyRun?.completed_at
+      && (!lastDetailerAt || Date.parse(latestDependencyRun.completed_at) > Date.parse(lastDetailerAt))
+    ) {
+      signals.push(`${dependencyId} completed after the phase plan was last detailed`);
+    }
+  }
+
+  for (const record of ensureArray(state?.propagated_discoveries)) {
+    if (!ensureArray(record?.target_plan_ids).includes(planId)) {
+      continue;
+    }
+    if (
+      typeof record?.generated_at === 'string'
+      && (!lastDetailerAt || Date.parse(record.generated_at) > Date.parse(lastDetailerAt))
+    ) {
+      for (const discovery of ensureArray(record?.discoveries)) {
+        signals.push(`propagated discovery: ${discovery}`);
+      }
+    }
+  }
+
+  return uniqueStrings(signals).slice(0, 12);
+}
+
+function shouldAutoDetailerRefresh(state, contract) {
+  const mode = normalizePhaseRefreshMode(contract?.plan);
+  if (mode === 'lightweight') {
+    return false;
+  }
+
+  const stage = inferPlanStage('', contract?.plan || {});
+  if (stage !== 'execution') {
+    return false;
+  }
+
+  const dependencyIds = normalizeStringArray(contract?.plan?.depends_on);
+  if (dependencyIds.length === 0) {
+    return false;
+  }
+
+  if (mode === 'always_detailer') {
+    return true;
+  }
+
+  return collectPhaseRefreshSignals(state, contract).length > 0;
+}
+
 function buildRoleCapsule({
   project,
   planId,
@@ -3206,8 +3964,16 @@ function buildRoleCapsule({
   boundaries,
   outputs,
   evidence,
+  contextSnapshot,
+  resultArtifacts,
+  artifactChangeRequired,
   nextAction,
 }) {
+  const normalizedResultArtifacts = normalizePathList(resultArtifacts || []);
+  const completionRequirements = buildDispatchCompletionRequirements(
+    normalizedResultArtifacts,
+    artifactChangeRequired === true,
+  );
   return {
     schema_version: '1.0.0',
     generated_at: nowIso(),
@@ -3221,6 +3987,7 @@ function buildRoleCapsule({
       independent: roleConfig.independent,
     },
     objective,
+    context_snapshot: contextSnapshot || {},
     inputs: {
       primary_paths: normalizePathList(primaryPaths || []),
       additional_paths: normalizePathList(additionalPaths || []),
@@ -3232,6 +3999,12 @@ function buildRoleCapsule({
       blocked_files: normalizePathList(boundaries?.blocked_files || []),
       reason: boundaries?.reason || null,
     },
+    dispatch: {
+      result_artifacts: normalizedResultArtifacts,
+      artifact_change_required: artifactChangeRequired === true,
+      completion_requirements: completionRequirements,
+      completion_checks: buildCompletionChecksFromRequirements(completionRequirements),
+    },
     outputs: {
       expected_artifacts: normalizeStringArray(outputs?.expected_artifacts || roleConfig.expected_outputs || []),
       success_conditions: normalizeStringArray(outputs?.success_conditions || []),
@@ -3242,12 +4015,134 @@ function buildRoleCapsule({
   };
 }
 
-function buildExecutorCapsule(project, contract, state, cycleNumber) {
+function buildPlanningRoleResultArtifacts(project, role, planId) {
+  if (role === 'strategist') {
+    return [
+      `.smike/${project}/STRATEGY.md`,
+      `.smike/${project}/ROADMAP.md`,
+    ];
+  }
+  if (role === 'detailer') {
+    return [`.smike/${project}/phases/${planId}/${planId}-PLAN.json`];
+  }
+  if (role === 'checker') {
+    return [`.smike/${project}/CHECKER.json`];
+  }
+  if (role === 'auditor') {
+    return [`.smike/${project}/AUDITOR.json`];
+  }
+  return [];
+}
+
+function buildPlanningStrategistContextSnapshot(bundle) {
+  return {
+    mode: bundle.mode,
+    title: bundle.title,
+    objective: bundle.objective,
+    deliverables: normalizeStringArray(bundle.deliverables || []),
+    constraints: normalizeStringArray(bundle.constraints || []),
+    integration_requirements: normalizeStringArray(bundle.integration_requirements || []),
+    risk_hotspots: normalizeStringArray(bundle.risk_hotspots || []),
+    primary_refs: normalizePathList(bundle.primary_refs || []),
+    phase_blueprints: ensureArray(bundle.phase_blueprints).map((phase) => ({
+      id: phase.id,
+      title: phase.title,
+      summary: phase.summary,
+      depends_on: normalizeStringArray(phase.depends_on || []),
+      allowed_files: normalizePathList(phase.allowed_files || []),
+      write_scope_allowed_files: normalizePathList(phase.write_scope_allowed_files || []),
+    })),
+  };
+}
+
+function buildPlanningDetailerContextSnapshot(bundle, phase) {
+  return {
+    mode: bundle.mode,
+    title: bundle.title,
+    root_objective: bundle.objective,
+    primary_refs: normalizePathList(bundle.primary_refs || []),
+    phase_blueprint: {
+      id: phase.id,
+      title: phase.title,
+      summary: phase.summary,
+      category: phase.category,
+      depends_on: normalizeStringArray(phase.depends_on || []),
+      allowed_files: normalizePathList(phase.allowed_files || []),
+      blocked_files: normalizePathList(phase.blocked_files || []),
+      write_scope_allowed_files: normalizePathList(phase.write_scope_allowed_files || []),
+      write_scope_reason: phase.write_scope_reason || null,
+      verification_ids: normalizeStringArray(
+        ensureArray(phase.verify_commands).map((command) => command?.id),
+      ),
+    },
+  };
+}
+
+function buildExecutionDetailerRefreshCapsule(project, contract, state, cycleNumber) {
+  const orchestrationConfig = resolveOrchestrationConfig(project, contract.plan);
+  const dependencyIds = normalizeStringArray(contract.plan.depends_on);
+  const refreshSignals = collectPhaseRefreshSignals(state, contract);
+
+  return buildRoleCapsule({
+    project,
+    planId: contract.plan.plan_id,
+    cycle: cycleNumber,
+    stage: 'execution',
+    role: 'detailer',
+    objective: `Refresh the phase contract for ${contract.plan.plan_id} against upstream execution evidence before implementation continues.`,
+    roleConfig: ROLE_DEFINITIONS.detailer,
+    primaryPaths: [
+      `.smike/${project}/STATE.md`,
+      contract.plan_json_rel,
+      contract.plan_md_rel,
+      ...collectDependencyCapsulePaths(state, dependencyIds, ['judge', 'reviewer']),
+    ],
+    additionalPaths: [
+      `.smike/${project}/STRATEGY.md`,
+      `.smike/${project}/ROADMAP.md`,
+      `.smike/${project}/PROJECT.md`,
+      contract.plan.spec,
+      ...collectCapsulePathsForPlan(state, contract.plan.plan_id, ['detailer']),
+    ],
+    readOrder: [
+      'Read STATE.md and the current phase contract first.',
+      'Read dependency judge/reviewer capsules and propagated discoveries before changing the phase plan.',
+      'Refresh only this phase contract; do not widen into a whole-project replanning pass.',
+    ],
+    questions: [
+      'What assumptions in this phase changed because upstream phases finished or discovered new constraints?',
+      'How should this phase contract narrow or reorder itself before execution starts?',
+      'What stays explicitly deferred to later phases even after this refresh?',
+    ],
+    boundaries: {
+      allowed_files: [contract.plan_json_rel],
+      blocked_files: contract.plan.blocked_files,
+      reason: 'Execution-time detailer refresh may only rewrite the current phase PLAN.json.',
+    },
+    outputs: {
+      expected_artifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
+      success_conditions: [
+        'The refreshed phase plan reflects upstream dependency evidence before execution starts.',
+        'The refresh remains phase-local and does not silently widen into a new planning loop.',
+      ],
+    },
+    resultArtifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
+    artifactChangeRequired: true,
+    evidence: {
+      depends_on: dependencyIds,
+      dependency_discoveries: collectDependencyDiscoveries(state, dependencyIds, contract.plan.plan_id),
+      refresh_signals: refreshSignals,
+    },
+    nextAction: 'Hand the refreshed phase contract to the executor.',
+  });
+}
+
+function buildExecutorCapsule(project, contract, state, cycleNumber, delegationOverride = null) {
   const orchestrationConfig = resolveOrchestrationConfig(project, contract.plan);
   const roleConfig = orchestrationConfig.roles.executor;
-  const delegation = normalizeDelegationConfig(contract.plan);
+  const delegation = delegationOverride || normalizeDelegationConfig(contract.plan);
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
-  const dependencyDiscoveries = collectDependencyDiscoveries(state, dependencyIds);
+  const dependencyDiscoveries = collectDependencyDiscoveries(state, dependencyIds, contract.plan.plan_id);
   const downstreamPlanIds = findDownstreamPlanIds(state.workflow?.plans, contract.plan.plan_id);
 
   return buildRoleCapsule({
@@ -3274,12 +4169,13 @@ function buildExecutorCapsule(project, contract, state, cycleNumber) {
     readOrder: [
       'Start with STATE.md and the current plan contract so execution is grounded on disk, not prior memory.',
       'Read the same-plan detailer capsule before expanding to raw source files.',
-      'If dependencies exist, read only their judge/reviewer capsules first, then inspect code in the declared write scope.',
+      'If dependencies exist, treat this as a phase refresh: read only their judge/reviewer capsules and propagated discoveries first, then inspect code in the declared write scope.',
       'Touch broader source only when the plan or dependency discoveries force it.',
     ],
     questions: [
       'What is the smallest code change set that satisfies the objective and acceptance criteria?',
       'Which dependency discoveries or prior findings must be preserved while making this change?',
+      'Has any upstream result changed the practical shape of this phase enough to require narrowing or re-sequencing before edits start?',
       'What verification commands and behavioral checks will leave enough evidence for JUDGE?',
     ],
     boundaries: {
@@ -3291,15 +4187,22 @@ function buildExecutorCapsule(project, contract, state, cycleNumber) {
       expected_artifacts: delegation.result_artifacts,
       success_conditions: [
         'Implementation stays within write scope and leaves a clear verification surface for JUDGE.',
+        'Executor refreshes against upstream dependency evidence before editing instead of relying only on the original planning snapshot.',
         'Execution summary is honest about partial work, baseline failures, and any discoveries worth propagating.',
       ],
     },
+    resultArtifacts: delegation.result_artifacts,
+    artifactChangeRequired: true,
     evidence: {
       depends_on: dependencyIds,
       downstream_plan_ids: downstreamPlanIds,
       verify_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
       acceptance_criteria: ensureArray(contract.plan.acceptance_criteria).map((ac) => ac.id),
       dependency_discoveries: dependencyDiscoveries,
+      phase_refresh: {
+        mode: dependencyIds.length > 0 ? 'dependency_aware_executor_refresh' : 'not_needed',
+        dependency_plan_ids: dependencyIds,
+      },
       write_scope: contract.plan.write_scope,
     },
     nextAction: 'Hand changed files, verification results, and any discoveries to JUDGE.',
@@ -3355,6 +4258,10 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
         'Any failures or weak evidence are concrete enough to route directly into a narrow fix.',
       ],
     },
+    resultArtifacts: [
+      path.relative(REPO_ROOT, paths.verdictReportPath).replaceAll(path.sep, '/'),
+    ],
+    artifactChangeRequired: false,
     evidence: {
       execution_result: cycleRecord.execution_result || cycleRecord.result,
       execution_failures: ensureArray(cycleRecord.failures),
@@ -3426,6 +4333,10 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
         'Blocking concerns are narrow, actionable, and mapped to the current change surface.',
       ],
     },
+    resultArtifacts: [
+      path.relative(REPO_ROOT, paths.reviewReportPath).replaceAll(path.sep, '/'),
+    ],
+    artifactChangeRequired: false,
     evidence: {
       verdict_result: verdictRecord.result,
       verdict_failures: ensureArray(verdictRecord.failures),
@@ -3522,6 +4433,8 @@ function buildRuntimeFollowOnCapsule(project, contract, state, role, cycleNumber
       expected_artifacts: normalizedArtifacts,
       success_conditions: roleSpecific.successConditions,
     },
+    resultArtifacts: normalizedArtifacts,
+    artifactChangeRequired: false,
     evidence: {
       result_artifacts: normalizedArtifacts,
       verify_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
@@ -3535,6 +4448,7 @@ function buildRuntimeFollowOnCapsule(project, contract, state, role, cycleNumber
 function buildFixerCapsule(project, paths, contract, state, cycleRecord, verdictRecord, reviewRecord) {
   const orchestrationConfig = resolveOrchestrationConfig(project, contract.plan);
   const roleConfig = orchestrationConfig.roles.fixer;
+  const delegation = normalizeDelegationConfig(contract.plan);
   const blockingFindings = ensureArray(reviewRecord.findings)
     .filter((finding) => finding.severity !== 'low')
     .map((finding) => `${finding.severity} ${finding.id}: ${finding.title}`);
@@ -3581,6 +4495,8 @@ function buildFixerCapsule(project, paths, contract, state, cycleRecord, verdict
         'Repair leaves enough evidence to rerun the same JUDGE and REVIEW path cleanly.',
       ],
     },
+    resultArtifacts: delegation.result_artifacts,
+    artifactChangeRequired: true,
     evidence: {
       blocking_failures: blockingFailures,
       changed_paths: ensureArray(cycleRecord.scope?.changed_paths),
@@ -3789,6 +4705,7 @@ function normalizePathList(paths) {
 const { dispatchIdFor, dispatchSignature, resolveRuntimeDispatchEntry } = createDispatchHelpers({
   safeSlug,
   normalizePathList,
+  normalizeDispatchCompletionRequirements,
 });
 
 function slugifyProjectName(input) {
@@ -4058,6 +4975,42 @@ function extractListItems(text) {
     const value = cleanMarkdownInline(bullet[1]);
     if (value) {
       items.push(value);
+    }
+  }
+
+  return uniqueStrings(items);
+}
+
+function extractLabeledListItems(text, labelPattern) {
+  const items = [];
+  let capture = false;
+
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    if (labelPattern.test(cleanMarkdownInline(trimmed))) {
+      capture = true;
+      continue;
+    }
+
+    if (!capture) {
+      continue;
+    }
+
+    const bullet = rawLine.match(/^[-*+]\s+(.+)$/) || rawLine.match(/^\d+\.\s+(.+)$/);
+    if (bullet) {
+      const value = cleanMarkdownInline(bullet[1]);
+      if (value) {
+        items.push(value);
+      }
+      continue;
+    }
+
+    if (/^[A-Za-z].*:\s*$/.test(trimmed)) {
+      break;
     }
   }
 
@@ -4592,6 +5545,10 @@ const PLANNING_SHAPE_SECTION_PATTERNS = [
   /^Planning Output Shape$/i,
 ];
 
+const REQUIRED_PLAN_01_CONTRACT_PATTERNS = [
+  /^Required Plan 01 Contract$/i,
+  /^Plan 01 Contract$/i,
+];
 const LEGACY_RECOMMENDED_EXECUTABLE_PATTERN = /^Recommended First Executable Phase$/i;
 
 const NON_GOAL_SECTION_PATTERNS = [
@@ -4611,6 +5568,13 @@ function findSectionByPatterns(sections, patterns) {
 
 function extractListItemsFromSectionPatterns(sections, patterns) {
   return patterns.flatMap((pattern) => extractListItems(sectionText(findSection(sections, pattern))));
+}
+
+function findFirstPhaseContractSection(sections) {
+  return findSectionByPatterns(sections, [
+    ...REQUIRED_PLAN_01_CONTRACT_PATTERNS,
+    LEGACY_RECOMMENDED_EXECUTABLE_PATTERN,
+  ]);
 }
 
 function buildPlanningLintFindings(sections) {
@@ -4653,7 +5617,7 @@ function buildPlanningLintFindings(sections) {
       id: 'spec-legacy-recommended-phase-only',
       severity: 'high',
       title: 'The spec only provides a legacy recommended executable phase hint',
-      details: '`## Recommended First Executable Phase` can still seed a fallback phase, but it is not enough to prove a real multi-phase planning shape. Add `## Required Planning Output Shape` or `## Priority N:` sections.',
+      details: '`## Recommended First Executable Phase` is now treated as a legacy alias. Prefer `## Required Plan 01 Contract`, and still add `## Required Planning Output Shape` or `## Priority N:` sections so the planner has a real decomposition.',
     });
   }
 
@@ -4679,6 +5643,7 @@ function extractPhaseBlueprints(sections) {
   if (recommendedPhases.length > 0) {
     return recommendedPhases.map((phase, index) => {
       const prioritySection = prioritySections[index];
+      const hasPrioritySummary = Boolean(sectionText(prioritySection));
       const summary = summarizeSection(
         sectionText(prioritySection),
         `Implement ${phase.title.toLowerCase()}.`,
@@ -4686,6 +5651,7 @@ function extractPhaseBlueprints(sections) {
       return {
         ...phase,
         summary,
+        summary_source: hasPrioritySummary ? 'priority' : 'fallback_blueprint',
         category: phase.declared_category || inferPhaseCategory(`${phase.title} ${summary}`),
         dependency_mode: phase.declared_depends_on.length > 0 ? 'explicit' : 'implicit',
       };
@@ -4695,11 +5661,13 @@ function extractPhaseBlueprints(sections) {
   if (prioritySections.length > 0) {
     return prioritySections.map((section, index) => {
       const title = cleanMarkdownInline(section.title.replace(/^Priority\s+\d+:\s*/i, ''));
+      const hasPrioritySummary = Boolean(sectionText(section));
       const summary = summarizeSection(sectionText(section), `Implement ${title.toLowerCase()}.`);
       return {
         id: String(index + 1).padStart(2, '0'),
         title,
         summary,
+        summary_source: hasPrioritySummary ? 'priority' : 'fallback_priority',
         category: inferPhaseCategory(`${title} ${summary}`),
         declared_depends_on: [],
         declared_write_scope: [],
@@ -4709,15 +5677,16 @@ function extractPhaseBlueprints(sections) {
     });
   }
 
-  const recommendedExecutableSection = findSection(sections, LEGACY_RECOMMENDED_EXECUTABLE_PATTERN);
-  if (recommendedExecutableSection) {
-    const title = 'Recommended first executable phase';
-    const summary = summarizeSection(sectionText(recommendedExecutableSection), 'Implement the recommended first executable phase.');
+  const firstPhaseContractSection = findFirstPhaseContractSection(sections);
+  if (firstPhaseContractSection) {
+    const title = 'Plan 01 contract';
+    const summary = summarizeSection(sectionText(firstPhaseContractSection), 'Implement the Plan 01 contract.');
     return [
       {
         id: '01',
         title,
         summary,
+        summary_source: 'first_phase_contract',
         category: inferPhaseCategory(`${title} ${summary}`),
         declared_depends_on: [],
         declared_write_scope: [],
@@ -4732,6 +5701,7 @@ function extractPhaseBlueprints(sections) {
       id: '01',
       title: 'Implementation',
       summary: 'Implement the spec in bounded, reviewable slices.',
+      summary_source: 'fallback_implementation',
       category: 'general',
       declared_depends_on: [],
       declared_write_scope: [],
@@ -4753,14 +5723,27 @@ function buildPlanningBundle(project, specRel, contextFiles) {
   const refsFromRequiredRead = extractListItems(sectionText(findSection(sections, /^What The Planner Must Read First$/i)))
     .map((value) => normalizeRel(value))
     .filter(looksLikeRepoPath);
+  const requiredPlanningPostureText = sectionText(findSection(sections, /^Required Planning Posture$/i));
+  const requiredPlanningRefs = extractRepoPathsFromText(requiredPlanningPostureText);
   const primaryRefs = normalizePathList([
     ...extractPrimaryRefs(specText),
     ...refsFromRequiredRead,
+    ...requiredPlanningRefs,
     ...contextFiles,
   ]);
   const deliverables = normalizePathList(extractListItemsFromSectionPatterns(sections, DELIVERABLE_SECTION_PATTERNS));
   const lint = buildPlanningLintFindings(sections);
   const extractedPhases = extractPhaseBlueprints(sections);
+  const integrationRequirementsText = sectionText(findSection(sections, /^Integration Requirements$/i));
+  const planningDecisions = extractLabeledListItems(integrationRequirementsText, /^The plan must decide:?$/i);
+  const integrationRequirements = extractListItems(integrationRequirementsText)
+    .filter((item) => !planningDecisions.includes(item));
+  const riskHotspots = extractListItems(sectionText(findSection(sections, /^Risk Hotspots$/i)));
+  const firstPhaseContractSection = findFirstPhaseContractSection(sections);
+  const firstPhaseContractText = sectionText(firstPhaseContractSection);
+  const firstPhaseContractItems = extractListItems(firstPhaseContractText);
+  const explicitDeferrals = extractListItems(sectionText(findSection(sections, /^Explicit Deferrals$/i)));
+  const unresolvedRefTokens = uniqueStrings(String(specText || '').match(/@ref[^\s`)]*/g) || []);
   const explicitDependenciesDeclared = extractedPhases.some((phase) => ensureArray(phase.declared_depends_on).length > 0);
   const phaseBlueprints = extractedPhases.map((phase, index, allPhases) => {
     const writeScope = inferPhaseWriteScope(project, mode, phase, primaryRefs);
@@ -4793,15 +5776,42 @@ function buildPlanningBundle(project, specRel, contextFiles) {
     deliverables,
     constraints: extractListItems(sectionText(findSection(sections, /^Critical Constraints$/i))),
     non_goals: extractListItemsFromSectionPatterns(sections, NON_GOAL_SECTION_PATTERNS),
+    required_planning_refs: requiredPlanningRefs,
+    integration_requirements: integrationRequirements,
+    planning_decisions: planningDecisions,
+    risk_hotspots: riskHotspots,
+    first_phase_contract_heading: firstPhaseContractSection?.title || null,
+    first_phase_contract_summary: summarizeSection(firstPhaseContractText, ''),
+    first_phase_contract_items: firstPhaseContractItems,
+    recommended_first_phase_summary: summarizeSection(firstPhaseContractText, ''),
+    recommended_first_phase_items: firstPhaseContractItems,
+    explicit_deferrals: explicitDeferrals,
     protected_areas: extractListItems(sectionText(findSection(sections, /^Protected \/ High-Collision Areas$/i))),
     drift_seeds: extractListItems(sectionText(findSection(sections, /^Known Current Drift Seeds$/i))),
     lint,
     explicit_dependencies_declared: explicitDependenciesDeclared,
+    unresolved_ref_tokens: unresolvedRefTokens,
     planning_analysis: planningAnalysis,
     phase_blueprints: phaseBlueprints,
     spec_paths: normalizePathList([specRel, ...contextFiles, ...extractRepoPathsFromText(specText)]),
     spec_hash: crypto.createHash('sha256').update(specText).digest('hex'),
   };
+}
+
+function buildPlanningDraftNextAction(project, promotionCheck) {
+  const blockerText = promotionCheck.blockers.slice(0, 6).join('; ');
+  const suffix = blockerText ? ` Missing before promotion: ${blockerText}.` : '';
+  return `Refine the spec-driven planning draft for ${project} (update the spec, not \`.smike/**\`), then rerun \`${buildCycleCommand(project)}\`.${suffix}`;
+}
+
+function getPlanningDraftNoticeLines(state) {
+  if (!isPlanningDraftLifecycleStatus(state?.lifecycle?.status) && state?.planning?.status !== 'draft') {
+    return [];
+  }
+  return [
+    'Planning draft notice: edits to `.smike/**` are rebuilt from the spec on the next cycle.',
+    'Fix surface: update the spec’s `Required Planning Output Shape`, `Priority N:` summaries, and inline `verify:` commands.',
+  ];
 }
 
 function renderProjectMarkdown(project, specRel, contextFiles, bundle) {
@@ -4863,14 +5873,26 @@ function renderStateMarkdown(project, specRel, state) {
   const latestCapsules = Object.entries(orchestration.capsules.latest_by_role || {})
     .filter(([, capsulePath]) => typeof capsulePath === 'string' && capsulePath.trim());
   const propagatedDiscoveries = ensureDiscoveryLog(state);
-  const actionable = resolveActionablePlanContext(project, paths, state, rootPlan);
-  const delegation = normalizeDelegationConfig(actionable.plan);
-  const currentDispatches = getCurrentRuntimeDispatchEntries(state, actionable.plan_id);
-  const readyDispatches = getReadyRuntimeDispatchEntries(state, actionable.plan_id);
+  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+  const actionable = runtimeContext.actionable;
+  const delegation = runtimeContext.delegation;
+  const currentDispatches = runtimeContext.dispatches;
+  const readyDispatches = runtimeContext.ready_dispatches;
+  const dispatchSummary = summarizeRuntimeDispatchContext(runtimeContext);
   const planningAnalysis = loadPlanningAnalysis(paths);
+  const planningFreshness = getPlanningArtifactFreshness(paths);
+  const actionableDispatch = orchestration.current_actionable_dispatch;
+  const actionableDispatchSummary = actionableDispatch
+    ? `${actionableDispatch.dispatch_id} (${actionableDispatch.role} / ${actionableDispatch.status}${actionableDispatch.freshness ? ` / ${actionableDispatch.freshness}` : ''})`
+    : 'none';
+  const actionableCapsule = orchestration.current_actionable_capsule || 'none';
 
   return [
     '# SMIKE State',
+    '',
+    '## Authority',
+    `Canonical state: .smike/${project}/STATE.json`,
+    `Derived views: .smike/${project}/RUNTIME-DELEGATION.json, .smike/${project}/IMPLEMENTATION-HANDOFF.json, .smike/${project}/PLANNING-HANDOFF.md`,
     '',
     '## Project',
     `Name: ${project}`,
@@ -4889,10 +5911,12 @@ function renderStateMarkdown(project, specRel, state) {
     ...(planningAnalysis.blocking_findings.length > 0
       ? [`Planning blockers: ${planningAnalysis.blocking_findings.length}`]
       : []),
+    ...getPlanningDraftNoticeLines(state),
     '',
     '## Planning Analysis',
     `Checker: ${planningAnalysis.checker?.result || 'not-generated'}`,
     `Auditor: ${planningAnalysis.auditor?.result || 'not-generated'}`,
+    `Artifacts fresh: ${planningFreshness.stale ? `no (${planningFreshness.reason})` : 'yes'}`,
     ...(planningAnalysis.blocking_findings.length > 0
       ? planningAnalysis.blocking_findings.slice(0, 5).map((finding) => `- ${finding.source}:${finding.id} ${finding.title}`)
       : ['- none']),
@@ -4907,9 +5931,19 @@ function renderStateMarkdown(project, specRel, state) {
     `Mode: ${delegation.mode}`,
     `Owner: ${delegation.owner}`,
     `Actionable plan: ${actionable.plan_id || 'none'}`,
+    `Actionable plan ids: ${dispatchSummary.plan_ids}`,
+    `Dispatch group: ${dispatchSummary.group}`,
+    `Completable group: ${currentCompletableRuntimeDispatchGroup(runtimeContext)}`,
     `Dispatch surface: .smike/${project}/RUNTIME-DELEGATION.json`,
     `Ready dispatches: ${readyDispatches.length}`,
     `Tracked dispatches: ${currentDispatches.length}`,
+    '',
+    '## Actionable Surface',
+    `Dispatch: ${actionableDispatchSummary}`,
+    `Capsule: ${actionableCapsule}`,
+    `Command: ${getLifecycleNextCommand(state) || 'none'}`,
+    `Handoff: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
+    `Planning handoff: .smike/${project}/PLANNING-HANDOFF.md`,
     '',
     '## Runtime Dispatches',
     ...(currentDispatches.length > 0
@@ -4919,7 +5953,7 @@ function renderStateMarkdown(project, specRel, state) {
         })
       : ['- none']),
     '',
-    '## Capsules',
+    '## Latest Capsules',
     ...(latestCapsules.length > 0
       ? latestCapsules.map(([role, capsulePath]) => `- ${role}: ${capsulePath}`)
       : ['- none']),
@@ -4939,6 +5973,57 @@ function renderStateMarkdown(project, specRel, state) {
       : ['- none']),
     '',
   ].join('\n');
+}
+
+function renderPlanningHandoffMarkdown(project, handoff) {
+  const lines = [
+    '# Planning Handoff',
+    '',
+    `Project: ${project}`,
+    `Status: ${handoff.lifecycle?.status || 'unknown'}`,
+    `Next: ${handoff.lifecycle?.next_action || 'unknown'}`,
+    `Next command: ${handoff.lifecycle?.next_command || 'none'}`,
+    '',
+    '## Authority',
+    `- STATE.json is authoritative: .smike/${project}/STATE.json`,
+    `- Dispatch convenience view: .smike/${project}/RUNTIME-DELEGATION.json`,
+    `- Machine handoff: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
+    '',
+    '## Actionable Surface',
+    `- Plan: ${handoff.actionable_surface?.plan_id || 'none'}`,
+    `- Dispatch group: ${handoff.actionable_surface?.dispatch_group ?? 'none'}`,
+    `- Current dispatch: ${handoff.actionable_surface?.current_dispatch?.dispatch_id || 'none'}`,
+    `- Capsule: ${handoff.actionable_surface?.current_capsule || 'none'}`,
+    `- Dispatch surface: ${handoff.actionable_surface?.runtime_delegation || 'none'}`,
+    '',
+    '## Phase Graph',
+  ];
+
+  for (const phase of ensureArray(handoff.phase_graph)) {
+    lines.push(`- ${phase.plan_id}: depends on ${ensureArray(phase.depends_on).join(', ') || 'none'}`);
+    lines.push(`  Write scope: ${ensureArray(phase.write_scope).join(', ') || 'none'}`);
+    lines.push(`  Acceptance: ${ensureArray(phase.acceptance_surface).join('; ') || 'none'}`);
+  }
+
+  lines.push('');
+  lines.push('## Deferred Items');
+  for (const item of ensureArray(handoff.deferred_items)) {
+    lines.push(`- ${item}`);
+  }
+  if (ensureArray(handoff.deferred_items).length === 0) {
+    lines.push('- none');
+  }
+
+  lines.push('');
+  lines.push('## Protected Areas');
+  for (const item of ensureArray(handoff.protected_areas)) {
+    lines.push(`- ${item}`);
+  }
+  if (ensureArray(handoff.protected_areas).length === 0) {
+    lines.push('- none');
+  }
+
+  return `${lines.join('\n')}\n`;
 }
 
 function renderRoadmapMarkdown(project, bundle) {
@@ -5000,6 +6085,24 @@ function renderStrategyMarkdown(project, bundle) {
     bundle.constraints.forEach((constraint) => lines.push(`- ${constraint}`));
   }
 
+  if (bundle.integration_requirements.length > 0) {
+    lines.push('');
+    lines.push('## Integration Requirements');
+    bundle.integration_requirements.forEach((item) => lines.push(`- ${item}`));
+  }
+
+  if (bundle.planning_decisions.length > 0) {
+    lines.push('');
+    lines.push('## Planning Decisions');
+    bundle.planning_decisions.forEach((item) => lines.push(`- ${item}`));
+  }
+
+  if (bundle.risk_hotspots.length > 0) {
+    lines.push('');
+    lines.push('## Risk Hotspots');
+    bundle.risk_hotspots.forEach((item) => lines.push(`- ${item}`));
+  }
+
   lines.push('');
   lines.push('## Drift Seeds');
   if (bundle.drift_seeds.length === 0) {
@@ -5026,6 +6129,26 @@ function renderStrategyMarkdown(project, bundle) {
     lines.push(`- Blocked files: ${phase.blocked_files.join(', ')}`);
     lines.push('');
   });
+
+  if (bundle.first_phase_contract_items.length > 0) {
+    lines.push('## Required Plan 01 Contract');
+    if (bundle.first_phase_contract_summary) {
+      lines.push(bundle.first_phase_contract_summary);
+      lines.push('');
+    }
+    if (bundle.first_phase_contract_heading === 'Recommended First Executable Phase') {
+      lines.push('_Legacy heading detected: `Recommended First Executable Phase`._');
+      lines.push('');
+    }
+    bundle.first_phase_contract_items.forEach((item) => lines.push(`- ${item}`));
+    lines.push('');
+  }
+
+  if (bundle.explicit_deferrals.length > 0) {
+    lines.push('## Deferred Items');
+    bundle.explicit_deferrals.forEach((item) => lines.push(`- ${item}`));
+    lines.push('');
+  }
 
   if (bundle.non_goals.length > 0) {
     lines.push('## Non-Goals');
@@ -5068,10 +6191,10 @@ function renderPlanningPlanMarkdown(specRel, contextFiles, bundle) {
   }
   lines.push('');
   lines.push('## Runtime Delegation');
-  lines.push('- Planning roles are runtime-delegated via capsules and `RUNTIME-DELEGATION.json`.');
+  lines.push('- Strategist and detailer planning roles are runtime-delegated via capsules and `RUNTIME-DELEGATION.json`.');
   lines.push('- The local runner manages contracts and state; it does not spawn subagents itself.');
   if (bundle.planning_analysis.checker_enabled || bundle.planning_analysis.auditor_enabled) {
-    lines.push('- Local planning analysis is recorded in `CHECKER.json` and `AUDITOR.json`; blocking findings stop planning from passing.');
+    lines.push('- Checker and auditor remain local analysis passes; they are refreshed from the current on-disk phase plans before planning can pass.');
   } else {
     lines.push(`- Full checker/auditor planning analysis is skipped for this bundle. Reason: ${bundle.planning_analysis.reason}`);
   }
@@ -5097,7 +6220,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
   orchestration.discovery_propagation = roleConfig.discovery_propagation;
   orchestration.active_role = null;
   orchestration.last_role = null;
-  orchestration.next_role = 'executor';
+  orchestration.next_role = 'strategist';
 
   if (roleConfig.roles.strategist.enabled) {
     const strategistCapsule = buildRoleCapsule({
@@ -5136,9 +6259,16 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
           'Planning artifacts point detailers, checker, and auditor at the same canonical spec context.',
         ],
       },
+      contextSnapshot: buildPlanningStrategistContextSnapshot(bundle),
+      resultArtifacts: buildPlanningRoleResultArtifacts(project, 'strategist', rootPlan.plan_id),
+      artifactChangeRequired: true,
       evidence: {
         deliverables: bundle.deliverables,
         constraints: bundle.constraints,
+        integration_requirements: bundle.integration_requirements,
+        planning_decisions: bundle.planning_decisions,
+        risk_hotspots: bundle.risk_hotspots,
+        recommended_first_phase_items: bundle.recommended_first_phase_items,
         protected_areas: bundle.protected_areas,
         drift_seeds: bundle.drift_seeds,
       },
@@ -5200,6 +6330,9 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
           'Phase plan carries forward gotchas and dependency edges instead of rediscovering them later.',
         ],
       },
+      contextSnapshot: buildPlanningDetailerContextSnapshot(bundle, phase),
+      resultArtifacts: buildPlanningRoleResultArtifacts(project, 'detailer', phase.id),
+      artifactChangeRequired: true,
       evidence: {
         depends_on: phase.depends_on,
         category: phase.category,
@@ -5340,11 +6473,24 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
   }
 }
 
-function buildPlanningRootPlan(project, specRel, contextFiles, bundle) {
+function resolvePlanningAnalysisForMode(bundle, planningMode = 'active') {
+  const planningAnalysis = bundle.planning_analysis || { checker_enabled: true, auditor_enabled: true };
+  if (planningMode === 'draft') {
+    return {
+      ...planningAnalysis,
+      checker_enabled: false,
+      auditor_enabled: false,
+      reason: 'Draft bootstrap skips checker/auditor until promotion.',
+    };
+  }
+  return planningAnalysis;
+}
+
+function buildPlanningRootPlan(project, specRel, contextFiles, bundle, planningMode = 'active') {
   const plan = readTemplateJson('PLAN.json');
   plan.$schema = ROOT_PLAN_SCHEMA_REF;
   const phaseIds = bundle.phase_blueprints.map((phase) => phase.id);
-  const planningAnalysis = bundle.planning_analysis || { checker_enabled: true, auditor_enabled: true };
+  const planningAnalysis = resolvePlanningAnalysisForMode(bundle, planningMode);
   plan.plan_id = `${project}-plan`;
   plan.phase = 'Planning';
   plan.spec = specRel;
@@ -5408,10 +6554,7 @@ function buildPlanningRootPlan(project, specRel, contextFiles, bundle) {
   plan.delegation = {
     mode: 'runtime_subagents',
     owner: 'runtime_orchestrator',
-    runtime_roles: ['strategist', 'detailer', ...[
-      planningAnalysis.checker_enabled ? 'checker' : null,
-      planningAnalysis.auditor_enabled ? 'auditor' : null,
-    ].filter(Boolean)],
+    runtime_roles: ['strategist', 'detailer'],
     dispatch_artifacts: [
       `.smike/${project}/RUNTIME-DELEGATION.json`,
     ],
@@ -5428,8 +6571,8 @@ function buildPlanningRootPlan(project, specRel, contextFiles, bundle) {
     roles: {
       strategist: { enabled: true },
       detailer: { enabled: true },
-      checker: { enabled: planningAnalysis.checker_enabled },
-      auditor: { enabled: planningAnalysis.auditor_enabled },
+      checker: { enabled: false },
+      auditor: { enabled: false },
       executor: { enabled: true },
       judge: { enabled: true },
       reviewer: { enabled: true },
@@ -5443,6 +6586,9 @@ function buildPhasePlan(project, specRel, bundle, phase) {
   const isResearch = bundle.mode === 'research';
   const researchResults = isResearch ? getResearchResultPaths(project, phase.id) : null;
   const reviewerRequired = isResearch ? phase.research_reviewer_required !== false : true;
+  const phaseRefreshMode = isResearch
+    ? 'lightweight'
+    : (phase.depends_on.length > 0 ? 'auto_detailer_on_drift' : 'lightweight');
   return {
     $schema: PHASE_PLAN_SCHEMA_REF,
     schema_version: '2.1.0',
@@ -5482,9 +6628,9 @@ function buildPhasePlan(project, specRel, bundle, phase) {
       phase_plans: [],
     },
     delegation: {
-      mode: isResearch ? 'runtime_subagents' : 'local_only',
+      mode: isResearch ? 'runtime_subagents' : 'auto',
       owner: isResearch ? 'runtime_orchestrator' : 'smike_runner',
-      runtime_roles: isResearch ? ['executor', 'judge', ...(reviewerRequired ? ['reviewer'] : [])] : [],
+      runtime_roles: isResearch ? ['executor', 'judge', ...(reviewerRequired ? ['reviewer'] : [])] : ['executor'],
       dispatch_artifacts: [
         `.smike/${project}/RUNTIME-DELEGATION.json`,
       ],
@@ -5502,10 +6648,13 @@ function buildPhasePlan(project, specRel, bundle, phase) {
         fixer: { enabled: true },
       },
     },
+    feature_flags: {
+      phase_refresh_mode: phaseRefreshMode,
+    },
   };
 }
 
-function buildPlanningState(project, specRel, contextFiles, plan, bundle) {
+function buildPlanningState(project, specRel, contextFiles, plan, bundle, planningMode = 'active', inputSnapshot = null) {
   const state = readTemplateJson('STATE.json');
   state.$schema = ROOT_STATE_SCHEMA_REF;
   const rootPlanHash = hashPlanContract(plan);
@@ -5520,12 +6669,14 @@ function buildPlanningState(project, specRel, contextFiles, plan, bundle) {
     contract_hash: rootPlanHash,
   };
   state.lifecycle = {
-    status: 'ready',
+    status: planningMode === 'draft' ? PLANNING_DRAFT_LIFECYCLE_STATUS : 'planning',
     cycle_count: 0,
     last_started_at: null,
     last_completed_at: null,
     last_result: null,
-    next_action: `Execute the planning phase for ${project}.`,
+    next_action: planningMode === 'draft'
+      ? `Planning draft created for ${project}. Refine it with \`${buildCycleCommand(project)}\`.`
+      : `Execute the planning phase for ${project}.`,
     next_command: buildCycleCommand(project),
   };
   state.workflow = {
@@ -5541,7 +6692,7 @@ function buildPlanningState(project, specRel, contextFiles, plan, bundle) {
     stage: 'planning',
     active_role: null,
     last_role: null,
-    next_role: 'executor',
+    next_role: 'strategist',
     discovery_propagation: true,
     role_history: [],
     capsules: {
@@ -5550,11 +6701,12 @@ function buildPlanningState(project, specRel, contextFiles, plan, bundle) {
     },
   };
   state.planning = {
-    status: 'bundle_created',
+    status: planningMode === 'draft' ? 'draft' : 'in_progress',
     mode: bundle.mode,
     spec_path: specRel,
     spec_hash: bundle.spec_hash,
     context_files: contextFiles,
+    input_snapshot: inputSnapshot,
     primary_refs: bundle.primary_refs,
     deliverables: bundle.deliverables,
     initial_plan_hash: rootPlanHash,
@@ -5581,8 +6733,8 @@ function buildPlanningPhaseContracts(project, specRel, bundle) {
   });
 }
 
-function writePlanningAnalysisArtifacts(project, paths, bundle, phaseContracts) {
-  const planningAnalysis = bundle.planning_analysis || { checker_enabled: true, auditor_enabled: true };
+function writePlanningAnalysisArtifacts(project, paths, bundle, phaseContracts, planningMode = 'active') {
+  const planningAnalysis = resolvePlanningAnalysisForMode(bundle, planningMode);
   const analysisPlans = phaseContracts.map((contract) => contract.analysisPlan);
   const removeIfExists = (filePath) => {
     if (filePath && fs.existsSync(filePath)) {
@@ -5613,13 +6765,79 @@ function writePlanningAnalysisArtifacts(project, paths, bundle, phaseContracts) 
   }
 }
 
-function writePlanningArtifacts(project, specRel, contextFiles) {
+function buildPlanningAnalysisPlanFromCurrentPhasePlan(phasePlan) {
+  return {
+    ...phasePlan,
+    dependency_mode: phasePlan?.dependency_mode || phasePlan?.metadata?.dependency_mode || 'implicit',
+    declared_write_scope: normalizePathList(
+      phasePlan?.declared_write_scope
+      || phasePlan?.metadata?.declared_write_scope
+      || phasePlan?.write_scope?.allowed_files
+      || [],
+    ),
+    declared_verify_commands: normalizeStringArray(
+      phasePlan?.declared_verify_commands
+      || phasePlan?.metadata?.declared_verify_commands
+      || ensureArray(phasePlan?.verify_commands).map((command) => command?.id),
+    ),
+    write_scope_allowed_files: normalizePathList(
+      phasePlan?.write_scope_allowed_files
+      || phasePlan?.metadata?.write_scope_allowed_files
+      || phasePlan?.write_scope?.allowed_files
+      || [],
+    ),
+  };
+}
+
+function readPlanningAnalysisPlansFromDisk(project, paths, bundle) {
+  return ensureArray(bundle.phase_blueprints).map((phase) => {
+    const phasePlanJsonPath = path.join(paths.projectDir, 'phases', phase.id, `${phase.id}-PLAN.json`);
+    if (!fs.existsSync(phasePlanJsonPath)) {
+      fail(`missing planning phase contract: ${phasePlanJsonPath}`);
+    }
+    return buildPlanningAnalysisPlanFromCurrentPhasePlan(readJson(phasePlanJsonPath));
+  });
+}
+
+function refreshPlanningAnalysisArtifactsFromCurrentPlans(project, paths, bundle) {
+  const planningAnalysis = resolvePlanningAnalysisForMode(bundle, 'active');
+  const analysisPlans = readPlanningAnalysisPlansFromDisk(project, paths, bundle);
+  const removeIfExists = (filePath) => {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  };
+
+  if (planningAnalysis.checker_enabled) {
+    writeJson(paths.planningCheckerJsonPath, buildPlanningCheckerRecord(bundle, analysisPlans));
+    removeIfExists(paths.planningCheckerMdPath);
+  } else {
+    removeIfExists(paths.planningCheckerJsonPath);
+    removeIfExists(paths.planningCheckerMdPath);
+  }
+
+  if (planningAnalysis.auditor_enabled) {
+    writeJson(paths.planningAuditorJsonPath, buildPlanningAuditorRecord(bundle, analysisPlans));
+    removeIfExists(paths.planningAuditorMdPath);
+    removeIfExists(paths.planningAuditJsonPath);
+    removeIfExists(paths.planningAuditMdPath);
+  } else {
+    removeIfExists(paths.planningAuditorJsonPath);
+    removeIfExists(paths.planningAuditorMdPath);
+    removeIfExists(paths.planningAuditJsonPath);
+    removeIfExists(paths.planningAuditMdPath);
+  }
+}
+
+function writePlanningArtifacts(project, specRel, contextFiles, options = {}) {
+  const planningMode = options.planningMode === 'draft' ? 'draft' : 'active';
   const paths = getProjectPaths(project);
   ensureDir(paths.projectDir);
 
   const bundle = buildPlanningBundle(project, specRel, contextFiles);
-  const plan = buildPlanningRootPlan(project, specRel, contextFiles, bundle);
-  const state = buildPlanningState(project, specRel, contextFiles, plan, bundle);
+  const plan = buildPlanningRootPlan(project, specRel, contextFiles, bundle, planningMode);
+  const inputSnapshot = snapshotProjectInputs(project, paths, specRel, contextFiles);
+  const state = buildPlanningState(project, specRel, contextFiles, plan, bundle, planningMode, inputSnapshot);
   const phaseContracts = buildPlanningPhaseContracts(project, specRel, bundle);
 
   writeJson(paths.projectMetaPath, {
@@ -5629,6 +6847,7 @@ function writePlanningArtifacts(project, specRel, contextFiles) {
     mode: bundle.mode,
     spec_path: specRel,
     context_files: contextFiles,
+    input_snapshot: inputSnapshot,
     primary_refs: bundle.primary_refs,
     deliverables: bundle.deliverables,
     created_at: state.created_at,
@@ -5662,7 +6881,7 @@ function writePlanningArtifacts(project, specRel, contextFiles) {
     }
   }
 
-  writePlanningAnalysisArtifacts(project, paths, bundle, phaseContracts);
+  writePlanningAnalysisArtifacts(project, paths, bundle, phaseContracts, planningMode);
 
   const workflowSettings = resolveWorkflowSettings(plan, {});
   const contracts = buildWorkflowContracts(paths, plan, workflowSettings);
@@ -5681,20 +6900,21 @@ function shouldRefreshPlanningArtifacts(paths) {
   if (!fs.existsSync(paths.roadmapPath) || !fs.existsSync(paths.strategyPath)) {
     return true;
   }
-  if (!fs.existsSync(paths.planningCheckerJsonPath)) {
-    return true;
-  }
-  if (!fs.existsSync(paths.planningAuditorJsonPath)) {
-    return true;
-  }
 
   try {
     const plan = readJson(paths.planJsonPath);
     const state = readJson(paths.statePath);
+    const isDraft = isPlanningDraftState(state);
     if (plan?.plan_id === LEGACY_PLACEHOLDER_PLAN_ID) {
       return true;
     }
-    if (state?.planning?.status === 'draft') {
+    if (isDraft) {
+      return true;
+    }
+    if (!fs.existsSync(paths.planningCheckerJsonPath)) {
+      return true;
+    }
+    if (!fs.existsSync(paths.planningAuditorJsonPath)) {
       return true;
     }
 
@@ -5702,6 +6922,8 @@ function shouldRefreshPlanningArtifacts(paths) {
     const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : {};
     const specRel = typeof plan?.spec === 'string' ? plan.spec : null;
     const contextFiles = normalizePathList(projectMeta?.context_files || []);
+    const runtimeOwnedPlanning = inferPlanStage(project, plan) === 'planning'
+      && normalizeDelegationConfig(plan).mode === 'runtime_subagents';
     if (specRel && fs.existsSync(path.join(REPO_ROOT, specRel))) {
       const expectedBundle = buildPlanningBundle(project, specRel, contextFiles);
       const expectedPhaseContracts = buildPlanningPhaseContracts(project, specRel, expectedBundle);
@@ -5715,6 +6937,9 @@ function shouldRefreshPlanningArtifacts(paths) {
           return true;
         }
         const currentPhasePlan = readJson(phasePlanPath);
+        if (runtimeOwnedPlanning) {
+          continue;
+        }
         if (
           JSON.stringify(normalizePathList(currentPhasePlan.write_scope?.allowed_files || []))
           !== JSON.stringify(normalizePathList(phasePlan.write_scope?.allowed_files || []))
@@ -5733,6 +6958,10 @@ function shouldRefreshPlanningArtifacts(paths) {
         if (JSON.stringify(currentVerifyIds) !== JSON.stringify(expectedVerifyIds)) {
           return true;
         }
+      }
+
+      if (runtimeOwnedPlanning) {
+        return false;
       }
 
       const expectedCheckerRecord = buildPlanningCheckerRecord(
@@ -5776,7 +7005,28 @@ function syncPlanningState(project, state, plan) {
   const currentHash = hashPlanContract(plan);
   const initialHash = planning.initial_plan_hash;
   const changed = typeof initialHash === 'string' && currentHash !== initialHash;
-  if (!changed || state.lifecycle?.status !== 'planning') {
+  if (!changed || !isPlanningLifecycleStatus(state.lifecycle?.status) || isPlanningDraftState(state)) {
+    return { transitioned: false, currentHash };
+  }
+
+  const paths = getProjectPaths(project);
+  const specRel = typeof planning.spec_path === 'string' ? planning.spec_path.trim() : '';
+  const contextFiles = normalizePathList(planning.context_files || []);
+  if (!specRel || !fs.existsSync(path.join(REPO_ROOT, specRel))) {
+    return { transitioned: false, currentHash };
+  }
+
+  let promotionCheck = { ready: false, blockers: ['spec-unreadable'] };
+  try {
+    const bundle = buildPlanningBundle(project, specRel, contextFiles);
+    const phaseContracts = buildPlanningPhaseContracts(project, specRel, bundle);
+    promotionCheck = buildPlanningDraftPromotionCheck(bundle, phaseContracts);
+  } catch {
+    return { transitioned: false, currentHash };
+  }
+
+  const planningAnalysis = loadPlanningAnalysis(paths);
+  if (!promotionCheck.ready || !planningAnalysisIsExecutionReady(planningAnalysis)) {
     return { transitioned: false, currentHash };
   }
 
@@ -5799,7 +7049,6 @@ function syncPlanningState(project, state, plan) {
   orchestration.active_role = null;
   orchestration.next_role = 'executor';
 
-  const paths = getProjectPaths(project);
   syncActionableRuntimeDispatchState(project, paths, state, plan);
   writeJson(paths.statePath, state);
   fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, planning.spec_path || project, state), 'utf8');
@@ -5818,9 +7067,30 @@ function printResumeSummary(project, specRel, state, extraLines = []) {
   if (nextCommand) {
     console.log(`next_command: ${nextCommand}`);
   }
+  if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
+    console.log('runtime_requirement: host runtime must execute next_command before treating this project state as complete.');
+  }
+  for (const line of getRuntimeDispatchSummaryLines(project, state)) {
+    console.log(line);
+  }
+  console.log(`planning_handoff: .smike/${project}/PLANNING-HANDOFF.md`);
+  for (const line of getPlanningDraftNoticeLines(state)) {
+    console.log(line);
+  }
   for (const line of extraLines) {
     console.log(line);
   }
+}
+
+function getRuntimeDispatchSummaryLines(project, state) {
+  const paths = getProjectPaths(project);
+  if (!fs.existsSync(paths.planJsonPath)) {
+    return [];
+  }
+
+  const rootPlan = readJson(paths.planJsonPath);
+  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+  return buildRuntimeDispatchSummaryLines(runtimeContext);
 }
 
 function getQualitySummaryLines(state) {
@@ -5883,6 +7153,253 @@ function runStatus() {
   ]);
 }
 
+function collectDoctorIssues(project, paths, state, active = null) {
+  const issues = [];
+  const specRel = active?.spec_path || state?.planning?.spec_path || null;
+  const contextFiles = normalizePathList(active?.context_files || state?.planning?.context_files || []);
+  const inputStatus = collectProjectPlanningInputStatus(project, paths, specRel, contextFiles);
+  const nextCommand = getLifecycleNextCommand(state);
+  const currentDispatchId = state?.orchestration?.current_actionable_dispatch?.dispatch_id || null;
+
+  if (active?.project === project) {
+    const activeSpec = typeof active.spec_path === 'string' ? active.spec_path.trim() : null;
+    const stateSpec = typeof state?.planning?.spec_path === 'string' ? state.planning.spec_path.trim() : null;
+    if (activeSpec && stateSpec && activeSpec !== stateSpec) {
+      issues.push({
+        severity: 'error',
+        id: 'active-spec-mismatch',
+        message: `ACTIVE.json points at ${activeSpec}, but STATE.json points at ${stateSpec}.`,
+      });
+    }
+  }
+
+  if (!specRel) {
+    issues.push({
+      severity: 'error',
+      id: 'missing-spec-path',
+      message: 'No spec_path is recorded in ACTIVE.json or STATE.json.',
+    });
+  }
+
+  if (inputStatus.missing_source_paths.length > 0) {
+    issues.push({
+      severity: 'error',
+      id: 'missing-planning-inputs',
+      message: `Missing planning inputs: ${inputStatus.missing_source_paths.join(', ')}`,
+    });
+    if (inputStatus.recoverable_paths.length > 0) {
+      issues.push({
+        severity: 'warning',
+        id: 'recoverable-planning-inputs',
+        message: `Recoverable from .smike/${project}/inputs: ${inputStatus.recoverable_paths.join(', ')}`,
+      });
+    }
+    if (inputStatus.unrecoverable_paths.length > 0) {
+      issues.push({
+        severity: 'error',
+        id: 'unrecoverable-planning-inputs',
+        message: `No snapshot available for: ${inputStatus.unrecoverable_paths.join(', ')}`,
+      });
+    }
+  }
+
+  if (nextCommand && !parseCanonicalSmikeCommand(nextCommand)) {
+    issues.push({
+      severity: 'error',
+      id: 'non-canonical-next-command',
+      message: `STATE.json next_command is not canonical: ${nextCommand}`,
+    });
+  }
+
+  const runtimeDelegation = fs.existsSync(paths.runtimeDelegationJsonPath) ? readJson(paths.runtimeDelegationJsonPath) : null;
+  if (!runtimeDelegation) {
+    issues.push({
+      severity: 'error',
+      id: 'missing-runtime-delegation',
+      message: `Missing derived artifact: .smike/${project}/RUNTIME-DELEGATION.json`,
+    });
+  } else {
+    if ((runtimeDelegation.lifecycle?.status || null) !== (state.lifecycle?.status || null)) {
+      issues.push({
+        severity: 'error',
+        id: 'runtime-delegation-status-mismatch',
+        message: `RUNTIME-DELEGATION.json status ${runtimeDelegation.lifecycle?.status || 'null'} does not match STATE.json status ${state.lifecycle?.status || 'null'}.`,
+      });
+    }
+    if ((runtimeDelegation.lifecycle?.next_command || null) !== (nextCommand || null)) {
+      issues.push({
+        severity: 'error',
+        id: 'runtime-delegation-next-command-mismatch',
+        message: `RUNTIME-DELEGATION.json next_command ${runtimeDelegation.lifecycle?.next_command || 'null'} does not match STATE.json next_command ${nextCommand || 'null'}.`,
+      });
+    }
+    if ((runtimeDelegation.current_plan?.plan_id || null) !== (state.current_plan?.plan_id || null)) {
+      issues.push({
+        severity: 'error',
+        id: 'runtime-delegation-plan-mismatch',
+        message: `RUNTIME-DELEGATION.json current plan ${runtimeDelegation.current_plan?.plan_id || 'null'} does not match STATE.json current plan ${state.current_plan?.plan_id || 'null'}.`,
+      });
+    }
+  }
+
+  const implementationHandoff = fs.existsSync(paths.implementationHandoffJsonPath) ? readJson(paths.implementationHandoffJsonPath) : null;
+  if (!implementationHandoff) {
+    issues.push({
+      severity: 'error',
+      id: 'missing-implementation-handoff',
+      message: `Missing derived artifact: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
+    });
+  } else {
+    if ((implementationHandoff.lifecycle?.status || null) !== (state.lifecycle?.status || null)) {
+      issues.push({
+        severity: 'error',
+        id: 'implementation-handoff-status-mismatch',
+        message: `IMPLEMENTATION-HANDOFF.json status ${implementationHandoff.lifecycle?.status || 'null'} does not match STATE.json status ${state.lifecycle?.status || 'null'}.`,
+      });
+    }
+    if ((implementationHandoff.lifecycle?.next_command || null) !== (nextCommand || null)) {
+      issues.push({
+        severity: 'error',
+        id: 'implementation-handoff-next-command-mismatch',
+        message: `IMPLEMENTATION-HANDOFF.json next_command ${implementationHandoff.lifecycle?.next_command || 'null'} does not match STATE.json next_command ${nextCommand || 'null'}.`,
+      });
+    }
+  }
+
+  const stateMarkdown = fs.existsSync(paths.stateMdPath) ? fs.readFileSync(paths.stateMdPath, 'utf8') : null;
+  if (!stateMarkdown) {
+    issues.push({
+      severity: 'error',
+      id: 'missing-state-markdown',
+      message: `Missing derived artifact: .smike/${project}/STATE.md`,
+    });
+  } else {
+    if (!stateMarkdown.includes(`Status: ${state.lifecycle?.status}`)) {
+      issues.push({
+        severity: 'error',
+        id: 'state-markdown-status-mismatch',
+        message: 'STATE.md status line does not match STATE.json.',
+      });
+    }
+    const expectedNextCommandLine = `Next command: ${nextCommand || 'none'}`;
+    if (!stateMarkdown.includes(expectedNextCommandLine)) {
+      issues.push({
+        severity: 'error',
+        id: 'state-markdown-next-command-mismatch',
+        message: `STATE.md is missing the expected next command line: ${expectedNextCommandLine}`,
+      });
+    }
+    if (!stateMarkdown.includes(`Canonical state: .smike/${project}/STATE.json`)) {
+      issues.push({
+        severity: 'warning',
+        id: 'state-markdown-authority-missing',
+        message: 'STATE.md is missing the authority banner.',
+      });
+    }
+  }
+
+  const planningHandoffMarkdown = fs.existsSync(paths.planningHandoffMdPath)
+    ? fs.readFileSync(paths.planningHandoffMdPath, 'utf8')
+    : null;
+  if (!planningHandoffMarkdown) {
+    issues.push({
+      severity: 'error',
+      id: 'missing-planning-handoff',
+      message: `Missing derived artifact: .smike/${project}/PLANNING-HANDOFF.md`,
+    });
+  } else if (!planningHandoffMarkdown.includes(`Next command: ${nextCommand || 'none'}`)) {
+    issues.push({
+      severity: 'error',
+      id: 'planning-handoff-next-command-mismatch',
+      message: 'PLANNING-HANDOFF.md next command does not match STATE.json.',
+    });
+  }
+
+  if (
+    implementationHandoff?.actionable_surface?.current_dispatch?.dispatch_id
+    && currentDispatchId
+    && implementationHandoff.actionable_surface.current_dispatch.dispatch_id !== currentDispatchId
+  ) {
+    issues.push({
+      severity: 'error',
+      id: 'current-dispatch-mismatch',
+      message:
+        `IMPLEMENTATION-HANDOFF.json current dispatch ${implementationHandoff.actionable_surface.current_dispatch.dispatch_id} `
+        + `does not match STATE.json current actionable dispatch ${currentDispatchId}.`,
+    });
+  }
+
+  return {
+    specRel,
+    contextFiles,
+    inputStatus,
+    issues,
+  };
+}
+
+function runDoctor(projectSelector = null) {
+  const selectedProject = typeof projectSelector === 'string' && projectSelector.trim()
+    ? (resolveProjectSelector(projectSelector) || projectSelector.trim())
+    : null;
+  const active = selectedProject ? readActiveProject() : readActiveProject();
+  const project = selectedProject || active?.project || null;
+  if (!project) {
+    fail('no project selected. Use `./smike doctor <project>` or activate a project first.');
+  }
+
+  console.log(`smike doctor: ${project}`);
+  const paths = getProjectPaths(project);
+  const missingRuntime = getStaleActiveProjectMissingPath(paths);
+  if (missingRuntime) {
+    console.log('result: FAIL');
+    console.log(`- missing runtime artifact: ${missingRuntime}`);
+    console.log(`- next: run \`./smike activate ${project}\` or recreate the project from spec.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const { state } = readValidatedState(paths, { persistRepair: true });
+  const report = collectDoctorIssues(project, paths, state, active);
+  const errorCount = report.issues.filter((issue) => issue.severity === 'error').length;
+  const warningCount = report.issues.filter((issue) => issue.severity === 'warning').length;
+
+  console.log(`status: ${state.lifecycle?.status || 'unknown'}`);
+  console.log(`next_command: ${getLifecycleNextCommand(state) || 'none'}`);
+  console.log(`spec: ${report.specRel || 'none'}`);
+  console.log(`context: ${report.contextFiles.join(', ') || 'none'}`);
+  console.log(`inputs_snapshot_root: .smike/${project}/inputs`);
+  console.log(`errors: ${errorCount}`);
+  console.log(`warnings: ${warningCount}`);
+
+  if (report.issues.length === 0) {
+    console.log('result: PASS');
+    return;
+  }
+
+  console.log('result: FAIL');
+  for (const issue of report.issues) {
+    console.log(`- ${issue.severity} ${issue.id}: ${issue.message}`);
+  }
+  const needsDerivedRefresh = report.issues.some((issue) => [
+    'missing-runtime-delegation',
+    'missing-implementation-handoff',
+    'missing-state-markdown',
+    'missing-planning-handoff',
+    'runtime-delegation-status-mismatch',
+    'runtime-delegation-next-command-mismatch',
+    'runtime-delegation-plan-mismatch',
+    'implementation-handoff-status-mismatch',
+    'implementation-handoff-next-command-mismatch',
+    'state-markdown-status-mismatch',
+    'state-markdown-next-command-mismatch',
+    'planning-handoff-next-command-mismatch',
+  ].includes(issue.id));
+  if (needsDerivedRefresh) {
+    console.log(`- remediation derived-artifacts: run \`./smike generate ${project}\` to refresh derived views from STATE.json.`);
+  }
+  process.exitCode = 1;
+}
+
 function runActivate(project) {
   const paths = getProjectPaths(project);
   if (!fs.existsSync(paths.projectDir)) {
@@ -5920,7 +7437,7 @@ async function runStart(specArgs) {
   const needsPlanningRefresh = hasExistingArtifacts && shouldRefreshPlanningArtifacts(paths);
 
   if (!hasExistingArtifacts || needsPlanningRefresh) {
-    writePlanningArtifacts(project, spec.relative, contextFiles);
+    writePlanningArtifacts(project, spec.relative, contextFiles, { planningMode: 'draft' });
   }
 
   setActiveProject({
@@ -5948,10 +7465,15 @@ async function runStart(specArgs) {
     return;
   }
 
-  await runResume();
+  await runResume(null, { suppressHandoffFailure: true });
 }
 
-async function runResume() {
+async function runResume(projectSelector = null, options = {}) {
+  if (typeof projectSelector === 'string' && projectSelector.trim()) {
+    const project = resolveProjectSelector(projectSelector) || projectSelector.trim();
+    runActivate(project);
+  }
+
   const active = readActiveProject();
   if (!active) {
     fail('no active project. Start one with `./smike <spec.md>`.');
@@ -5997,13 +7519,15 @@ async function runResume() {
     return;
   }
 
-  if (state.lifecycle?.status === 'planning') {
-    printResumeSummary(project, specRel, state, [
-      `plan: .smike/${project}/PLAN.md`,
-      `contract: .smike/${project}/PLAN.json`,
-      ...getQualitySummaryLines(state),
-    ]);
+  if (isPlanningLifecycleStatus(state.lifecycle?.status)) {
+    await runCycle(project, {});
     return;
+  }
+
+  const clearedFreshSessionGate = clearFreshSessionImplementationGate(state);
+  if (clearedFreshSessionGate) {
+    persistProjectState(project, paths, state, plan, specRel);
+    console.log(`smike resume: cleared implementation gate for ${project}`);
   }
 
   const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, plan);
@@ -6012,8 +7536,15 @@ async function runResume() {
     state,
     buildRuntimeDispatchPendingState(runtimeContext),
   );
+  const planningRecheck = shouldAutoRecheckPlanning(project, paths, state, specRel, normalizePathList(active.context_files || state?.planning?.context_files || []));
+  if (planningRecheck.stale) {
+    await runRecheck(project);
+    return;
+  }
   if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
-    const handoffRecorded = maybeRecordHandoffFailure(project, state);
+    const handoffRecorded = options.suppressHandoffFailure === true
+      ? false
+      : maybeRecordHandoffFailure(project, state);
     if (lifecycleReconciled || handoffRecorded) {
       persistProjectState(project, paths, state, plan, specRel);
     }
@@ -6026,6 +7557,431 @@ async function runResume() {
   }
 
   await runCycle(project, {});
+}
+
+function parseCanonicalSmikeCommand(commandText) {
+  const normalized = typeof commandText === 'string' ? commandText.trim() : '';
+  if (!normalized.startsWith('./smike ')) {
+    return null;
+  }
+
+  let match = normalized.match(/^\.\/smike advance(?: (\S+))?$/);
+  if (match) {
+    return { command: 'advance', project: match[1] || null };
+  }
+  match = normalized.match(/^\.\/smike recheck (\S+)$/);
+  if (match) {
+    return { command: 'recheck', project: match[1] };
+  }
+  match = normalized.match(/^\.\/smike resume(?: (\S+))?$/);
+  if (match) {
+    return { command: 'resume', project: match[1] || null };
+  }
+  match = normalized.match(/^\.\/smike cycle (\S+)$/);
+  if (match) {
+    return { command: 'cycle', project: match[1] };
+  }
+  match = normalized.match(/^\.\/smike dispatch (\S+) (spawned|completed|failed|retry|complete-group) (\S+)$/);
+  if (match) {
+    return {
+      command: 'dispatch',
+      project: match[1],
+      action: match[2],
+      dispatch_id: match[3],
+    };
+  }
+
+  return null;
+}
+
+function shouldAutoRecheckPlanning(project, paths, state, planningSpecRel, planningContextFiles) {
+  if (!planningSpecRel || !fs.existsSync(path.join(REPO_ROOT, planningSpecRel))) {
+    return { stale: false, freshness: null };
+  }
+  if (isPlanningDraftState(state)) {
+    return { stale: false, freshness: null };
+  }
+
+  const bundle = buildPlanningBundle(project, planningSpecRel, planningContextFiles);
+  const freshness = getPlanningArtifactFreshness(paths, bundle);
+  if (!freshness.stale) {
+    return { stale: false, freshness };
+  }
+
+  return { stale: true, freshness, bundle };
+}
+
+async function runPlanningRecheckInternal(
+  project,
+  paths,
+  rootPlan,
+  state,
+  workflowSettings,
+  planningSpecRel,
+  planningContextFiles,
+  options = {},
+) {
+  const planningInputRecovery = ensurePlanningInputsReadable(
+    project,
+    paths,
+    planningSpecRel,
+    planningContextFiles,
+    'planning recheck',
+  );
+  printPlanningInputRecovery(project, planningInputRecovery);
+
+  const bundle = options.bundle || buildPlanningBundle(project, planningSpecRel, planningContextFiles);
+  refreshPlanningAnalysisArtifactsFromCurrentPlans(project, paths, bundle);
+
+  const contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
+  syncWorkflowState(state, contracts, workflowSettings);
+  const contractsByPath = new Map(contracts.map((contract) => [contract.plan_json_rel, contract]));
+  const planningContract = contracts.find((contract) => contract.plan.plan_id === `${project}-plan`);
+  if (!planningContract) {
+    fail(`missing planning root contract for ${project}`);
+  }
+
+  const orchestration = ensureOrchestrationState(state);
+  ensureDiscoveryLog(state);
+  const planOrchestration = resolveOrchestrationConfig(project, planningContract.plan);
+  const cycleNumber = (state.lifecycle?.cycle_count || 0) + 1;
+  state.lifecycle = state.lifecycle || {};
+  state.lifecycle.cycle_count = cycleNumber;
+  state.lifecycle.last_started_at = nowIso();
+  state.lifecycle.status = 'running';
+  orchestration.stage = planOrchestration.stage;
+  orchestration.discovery_propagation = planOrchestration.discovery_propagation;
+  state.current_plan = {
+    plan_id: planningContract.plan.plan_id,
+    plan_json: planningContract.plan_json_rel,
+    plan_md: planningContract.plan_md_rel,
+    depends_on: ensureArray(planningContract.plan.depends_on),
+    contract_hash: hashPlanContract(planningContract.plan),
+  };
+
+  let executorCapsulePaths = null;
+  orchestration.active_role = 'executor';
+  orchestration.next_role = 'judge';
+  if (planOrchestration.roles.executor.enabled) {
+    const executorCapsule = buildExecutorCapsule(project, planningContract, state, cycleNumber);
+    executorCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      executorCapsule,
+      'prepared',
+      `Executor context prepared for ${planningContract.plan.plan_id}.`,
+    );
+  }
+
+  const cycleRecord = await executeSinglePlan(planningContract, cycleNumber, paths.projectDir);
+  if (executorCapsulePaths) {
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'executor',
+      plan_id: planningContract.plan.plan_id,
+      status: cycleRecord.result,
+      capsule_json: executorCapsulePaths.jsonRel,
+      generated_at: nowIso(),
+      summary: `Executor finished ${planningContract.plan.plan_id} with ${cycleRecord.result}.`,
+    });
+    orchestration.last_role = 'executor';
+  }
+
+  let judgeCapsulePaths = null;
+  orchestration.active_role = 'judge';
+  orchestration.next_role = 'reviewer';
+  if (planOrchestration.roles.judge.enabled) {
+    const judgeCapsule = buildJudgeCapsule(project, paths, planningContract, state, cycleRecord);
+    judgeCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      judgeCapsule,
+      'prepared',
+      `Judge context prepared for ${planningContract.plan.plan_id}.`,
+    );
+  }
+  const verdictRecord = await buildVerdictRecord(planningContract, cycleRecord, paths.projectDir);
+  if (judgeCapsulePaths) {
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'judge',
+      plan_id: planningContract.plan.plan_id,
+      status: verdictRecord.result,
+      capsule_json: judgeCapsulePaths.jsonRel,
+      generated_at: verdictRecord.generated_at,
+      summary: `Judge returned ${verdictRecord.result} for ${planningContract.plan.plan_id}.`,
+    });
+    orchestration.last_role = 'judge';
+  }
+  fs.writeFileSync(paths.verdictReportPath, buildVerdictReport(project, cycleRecord, verdictRecord), 'utf8');
+
+  let reviewerCapsulePaths = null;
+  orchestration.active_role = 'reviewer';
+  orchestration.next_role = null;
+  if (planOrchestration.roles.reviewer.enabled) {
+    const reviewerCapsule = buildReviewerCapsule(project, paths, planningContract, state, cycleRecord, verdictRecord);
+    reviewerCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      reviewerCapsule,
+      'prepared',
+      `Reviewer context prepared for ${planningContract.plan.plan_id}.`,
+    );
+  }
+  const reviewRecord = buildReviewRecord(planningContract, cycleRecord, verdictRecord);
+  if (reviewerCapsulePaths) {
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'reviewer',
+      plan_id: planningContract.plan.plan_id,
+      status: reviewRecord.result,
+      capsule_json: reviewerCapsulePaths.jsonRel,
+      generated_at: reviewRecord.generated_at,
+      summary: `Reviewer returned ${reviewRecord.result} for ${planningContract.plan.plan_id}.`,
+    });
+    orchestration.last_role = 'reviewer';
+  }
+  const qualityFailures = uniqueStrings([
+    ...ensureArray(cycleRecord.failures),
+    ...ensureArray(verdictRecord.failures).map((value) => `judge.${value}`),
+    ...(reviewRecord.result === 'concerns' ? ['review.concerns'] : []),
+  ]);
+  cycleRecord.execution_result = cycleRecord.result;
+  cycleRecord.verdict = {
+    result: verdictRecord.result,
+    failures: verdictRecord.failures,
+    generated_at: verdictRecord.generated_at,
+  };
+  cycleRecord.review = {
+    result: reviewRecord.result,
+    findings: reviewRecord.findings.map((finding) => ({
+      id: finding.id,
+      severity: finding.severity,
+      title: finding.title,
+    })),
+    generated_at: reviewRecord.generated_at,
+  };
+  cycleRecord.failures = qualityFailures;
+  cycleRecord.result = qualityFailures.length === 0 ? 'pass' : 'fail';
+  fs.writeFileSync(paths.reviewReportPath, buildReviewReport(project, cycleRecord, reviewRecord, planningContract.plan), 'utf8');
+
+  state.history.push(cycleRecord);
+  const planningWorkflowPlan = state.workflow.plans.find((plan) => plan.plan_id === planningContract.plan.plan_id);
+  if (planningWorkflowPlan) {
+    planningWorkflowPlan.last_result = cycleRecord.result;
+    planningWorkflowPlan.last_cycle = cycleNumber;
+    planningWorkflowPlan.status = cycleRecord.result === 'pass' ? 'complete' : 'failed';
+  }
+
+  state.lifecycle.last_completed_at = cycleRecord.completed_at;
+  state.lifecycle.last_result = cycleRecord.result;
+  const planningAnalysis = loadPlanningAnalysis(paths);
+  const planningReady = cycleRecord.result === 'pass' && planningAnalysisIsExecutionReady(planningAnalysis);
+
+  if (state.planning && typeof state.planning === 'object') {
+    state.planning = {
+      ...state.planning,
+      status: planningReady ? 'complete' : 'blocked',
+      completed_at: planningReady ? cycleRecord.completed_at : state.planning.completed_at || null,
+    };
+  }
+
+  const readyWorkflowPlans = getReadyWorkflowPlans(project, state.workflow.plans);
+  const nextRunnablePending = readyWorkflowPlans[0] || null;
+  const nextRunnableContract = nextRunnablePending ? contractsByPath.get(nextRunnablePending.plan_json) : null;
+  let runtimeDispatchPending = null;
+
+  if (planningReady) {
+    orchestration.stage = 'execution';
+    if (
+      nextRunnableContract
+      && inferPlanStage(project, nextRunnableContract.plan) !== 'planning'
+    ) {
+      applyFreshSessionImplementationGate(state);
+    }
+    if (nextRunnableContract) {
+      const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+      if (
+        nextRuntimeContext.actionable.plan_ids?.includes(nextRunnableContract.plan.plan_id)
+        && nextRuntimeContext.dispatches.length > 0
+        && !nextRuntimeContext.all_dispatches_completed_fresh
+      ) {
+        state.current_plan = {
+          plan_id: nextRunnableContract.plan.plan_id,
+          plan_json: nextRunnableContract.plan_json_rel,
+          plan_md: nextRunnableContract.plan_md_rel,
+          depends_on: ensureArray(nextRunnableContract.plan.depends_on),
+          contract_hash: hashPlanContract(nextRunnableContract.plan),
+        };
+        runtimeDispatchPending = {
+          plan_id: nextRunnableContract.plan.plan_id,
+          plan_ids: nextRuntimeContext.actionable.plan_ids,
+          group: currentRuntimeDispatchGroup(nextRuntimeContext),
+          ready_dispatches: nextRuntimeContext.ready_dispatches,
+          active_dispatches: nextRuntimeContext.active_dispatches,
+          failed_dispatches: nextRuntimeContext.failed_dispatches,
+        };
+      }
+    }
+  }
+
+  orchestration.active_role = null;
+  if (!planningReady) {
+    state.lifecycle.status = 'planning_blocked';
+    setLifecycleStopReason(state, 'planning_blocked');
+    setLifecycleNextStep(state, buildPlanningBlockedNextAction(project, paths, planningAnalysis), buildRecheckCommand(project));
+    orchestration.next_role = null;
+  } else if (runtimeDispatchPending && isFreshSessionImplementationPauseReason(state.workflow.pause_reason)) {
+    enterAwaitingFreshSession(state, project, readyWorkflowPlans, runtimeDispatchPending);
+    orchestration.next_role = null;
+  } else if (runtimeDispatchPending) {
+    applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPending);
+    orchestration.next_role = null;
+  } else if (nextRunnablePending && isFreshSessionImplementationPauseReason(state.workflow.pause_reason)) {
+    enterAwaitingFreshSession(state, project, readyWorkflowPlans);
+    orchestration.next_role = null;
+  } else if (nextRunnablePending) {
+    state.lifecycle.status = 'in_progress';
+    setLifecycleStopReason(state, null);
+    setLifecycleNextStep(state, describeReadyWorkflowPlans(readyWorkflowPlans), buildCycleCommand(project));
+    orchestration.next_role = 'executor';
+  } else {
+    state.lifecycle.status = 'complete';
+    setLifecycleStopReason(state, null);
+    setLifecycleNextStep(state, 'Scope complete.');
+    orchestration.next_role = null;
+  }
+
+  state.updated_at = nowIso();
+  if (state.history.length > 50) {
+    state.history = state.history.slice(-50);
+  }
+  syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+  const reportMarkdown = buildExecReport(project, rootPlan, [cycleRecord], state);
+  fs.writeFileSync(paths.execReportPath, reportMarkdown, 'utf8');
+  writeJson(paths.statePath, state);
+  fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, rootPlan.spec || state?.planning?.spec_path || project, state), 'utf8');
+  generateDerivedArtifacts(project, paths, state, rootPlan);
+
+  const overallResult = planningReady ? 'PASS' : 'FAIL';
+  console.log(`smike recheck ${project}: ${overallResult} (1 plan executed)`);
+  if (!planningReady && options.exitOnFailure !== false) {
+    if (cycleRecord.failures.length > 0) {
+      console.log(`failing checks: ${cycleRecord.failures.join(', ')}`);
+    }
+    process.exit(1);
+  }
+}
+
+async function runRecheck(projectSelector) {
+  const project = resolveProjectSelector(projectSelector) || projectSelector;
+  if (!project) {
+    fail('project argument is required');
+  }
+
+  const releaseProjectLock = acquireProjectLock(project, 'recheck');
+  try {
+    const paths = getProjectPaths(project);
+    if (!fs.existsSync(paths.planJsonPath)) {
+      fail(`missing PLAN.json: ${paths.planJsonPath}`);
+    }
+    if (!fs.existsSync(paths.statePath)) {
+      fail(`missing STATE.json: ${paths.statePath}`);
+    }
+
+    const rootPlan = readJson(paths.planJsonPath);
+    const workflowSettings = resolveWorkflowSettings(rootPlan, {});
+    const { state } = readValidatedState(paths, { persistRepair: true });
+    const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : {};
+    const planningSpecRel = projectMeta?.spec_path || rootPlan?.spec || state?.planning?.spec_path || null;
+    const planningContextFiles = normalizePathList(projectMeta?.context_files || state?.planning?.context_files || []);
+    await runPlanningRecheckInternal(
+      project,
+      paths,
+      rootPlan,
+      state,
+      workflowSettings,
+      planningSpecRel,
+      planningContextFiles,
+      {},
+    );
+  } finally {
+    releaseProjectLock();
+  }
+}
+
+async function runAdvance(projectSelector = null) {
+  const selectedProject = typeof projectSelector === 'string' && projectSelector.trim()
+    ? (resolveProjectSelector(projectSelector) || projectSelector.trim())
+    : null;
+  const active = selectedProject ? null : readActiveProject();
+  const project = selectedProject || active?.project || null;
+  if (!project) {
+    fail('no project selected. Use `./smike advance <project>` or activate a project first.');
+  }
+
+  const paths = getProjectPaths(project);
+  if (getStaleActiveProjectMissingPath(paths)) {
+    fail(`project is stale or missing runtime artifacts: ${project}`);
+  }
+
+  const { state } = readValidatedState(paths, { persistRepair: true });
+  const nextCommand = getLifecycleNextCommand(state);
+  if (!nextCommand) {
+    fail(`no next_command recorded for ${project}`);
+  }
+
+  if (nextCommand === buildAdvanceCommand(project)) {
+    if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
+      const rootPlan = readJson(paths.planJsonPath);
+      const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+      const readyDispatches = runtimeContext.ready_dispatches
+        .filter((entry) => entry.group === currentRuntimeDispatchGroup(runtimeContext));
+      if (readyDispatches.length === 0) {
+        fail(`no ready runtime dispatches found for ${project}`);
+      }
+      for (const entry of readyDispatches) {
+        runDispatch(project, 'spawned', entry.dispatch_id, {});
+      }
+      return;
+    }
+
+    if (state.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
+      await runResume(project);
+      return;
+    }
+  }
+
+  const parsed = parseCanonicalSmikeCommand(nextCommand);
+  if (!parsed) {
+    fail(`advance only supports canonical ./smike next_command values. Got: ${nextCommand}`);
+  }
+
+  if (parsed.command === 'advance' || parsed.command === 'resume') {
+    await runResume(parsed.project || project);
+    return;
+  }
+  if (parsed.command === 'recheck') {
+    await runRecheck(parsed.project || project);
+    return;
+  }
+  if (parsed.command === 'cycle') {
+    await runCycle(parsed.project || project, {});
+    return;
+  }
+  if (parsed.command === 'dispatch') {
+    if (parsed.action === 'complete-group') {
+      runDispatchGroup(parsed.project || project, parsed.action, parsed.dispatch_id, {});
+      return;
+    }
+    runDispatch(parsed.project || project, parsed.action, parsed.dispatch_id, {});
+    return;
+  }
+
+  fail(`advance cannot execute unsupported next_command: ${nextCommand}`);
 }
 
 async function runProjectSelector(projectSelector) {
@@ -6528,14 +8484,19 @@ function findReadyWorkflowGroup(project, workflowPlans) {
 }
 
 function describeReadyWorkflowPlans(readyPlans) {
-  const planIds = ensureArray(readyPlans).map((plan) => plan.plan_id);
+  const plans = ensureArray(readyPlans);
+  const planIds = plans.map((plan) => plan.plan_id);
   if (planIds.length === 0) {
     return 'No ready plans.';
   }
   if (planIds.length === 1) {
-    return `Continue with ${planIds[0]}.`;
+    const dependencyIds = normalizeStringArray(plans[0]?.depends_on);
+    if (dependencyIds.length > 0) {
+      return `Continue with ${planIds[0]}. Only the lowest-numbered ready dependency group advances in a cycle, and execution will refresh from dependency evidence: ${dependencyIds.join(', ')}.`;
+    }
+    return `Continue with ${planIds[0]}. Only the lowest-numbered ready dependency group advances in a cycle.`;
   }
-  return `Continue with ready plans: ${planIds.join(', ')}.`;
+  return `Continue with ready plans: ${planIds.join(', ')}. Only the lowest-numbered ready dependency group advances in a cycle.`;
 }
 
 function describeDependencyBlockers(dependencyBlockers) {
@@ -6559,7 +8520,7 @@ function resolveActionablePlanContext(project, paths, state, rootPlan) {
   let actionableWorkflowPlan = currentWorkflowPlan;
   let actionableWorkflowPlans = actionableWorkflowPlan ? [actionableWorkflowPlan] : [];
   let actionableGroup = null;
-  if (state.lifecycle?.status !== 'planning') {
+  if (!isPlanningLifecycleStatus(state.lifecycle?.status)) {
     const currentStatus = currentWorkflowPlan?.status || null;
     if (!currentWorkflowPlan || currentStatus === 'complete') {
       actionableWorkflowPlan = nextRunnablePending || currentWorkflowPlan;
@@ -6703,6 +8664,7 @@ function buildExecReport(project, rootPlan, executedPlans, state) {
       !runtimeContext.all_dispatches_completed_fresh
     ) {
       lines.push(`No pending plans were executed because ${runtimeContext.actionable.plan_id} is waiting on runtime dispatch work.`);
+      lines.push('This planning/execution loop is not complete until the host runtime runs lifecycle.next_command and reconciles again.');
       lines.push('');
       lines.push('## Runtime Dispatches');
       for (const dispatch of runtimeContext.dispatches) {
@@ -6719,6 +8681,13 @@ function buildExecReport(project, rootPlan, executedPlans, state) {
           .map((dependency) => `${dependency.plan_id} (${dependency.status})`)
           .join(', ');
         lines.push(`- ${blocker.plan_id}: waiting on ${unmet}`);
+      }
+      const readyGroup = buildReadyPlanGroup(project, ensureArray(state.workflow?.plans));
+      if (readyGroup?.plans?.length > 0) {
+        lines.push('');
+        lines.push('## Ready Group');
+        lines.push(`- Current runnable group: ${readyGroup.group}`);
+        lines.push(`- Plans in that group: ${readyGroup.plans.map((plan) => plan.plan_id).join(', ')}`);
       }
     }
     lines.push('');
@@ -6820,16 +8789,18 @@ function reasoningHintForRole(role, stage) {
 
 function resultArtifactsForDispatch(project, currentPlanId, planId, role, delegation) {
   if (currentPlanId === `${project}-plan`) {
-    if (role === 'strategist' || role === 'checker' || role === 'auditor') {
-      return delegation.result_artifacts;
-    }
-    if (role === 'detailer') {
-      return [`.smike/${project}/phases/${planId}/${planId}-PLAN.json`];
-    }
+    return buildPlanningRoleResultArtifacts(project, role, planId);
+  }
+
+  if (role === 'detailer') {
+    return buildPlanningRoleResultArtifacts(project, 'detailer', planId);
   }
 
   if (delegation.mode === 'runtime_subagents' && planId === currentPlanId) {
-    return delegation.result_artifacts;
+    if (delegation.result_artifacts.length > 0) {
+      return delegation.result_artifacts;
+    }
+    return [getRuntimeExecutionResultPaths(project, planId, role).jsonRel];
   }
 
   return [];
@@ -6855,8 +8826,15 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
   const orchestration = ensureOrchestrationState(state);
   const byPlan = orchestration.capsules.by_plan || {};
   const currentPlan = actionableContext.plan;
-  const delegation = normalizeDelegationConfig(currentPlan);
   const activePlanId = actionableContext.plan_id || currentPlan?.plan_id || state.current_plan?.plan_id || null;
+  const rootExecutionContract = {
+    plan: currentPlan,
+    plan_json_rel: actionableContext.workflow_plan?.plan_json || state.current_plan?.plan_json || '',
+    plan_md_rel: actionableContext.workflow_plan?.plan_md || state.current_plan?.plan_md || '',
+  };
+  const delegation = activePlanId === `${project}-plan`
+    ? normalizeDelegationConfig(currentPlan)
+    : resolveExecutionDelegation(project, state, rootExecutionContract);
   const dispatches = [];
 
   const pushDispatch = (planId, role, capsuleJsonRel, currentDelegation = delegation, groupOverride = null, instructionOverride = null) => {
@@ -6864,6 +8842,8 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
       return;
     }
     const stage = activePlanId === `${project}-plan` ? 'planning' : inferPlanStage(project, currentPlan);
+    const resultArtifacts = resultArtifactsForDispatch(project, activePlanId, planId, role, currentDelegation);
+    const artifactChangeRequired = artifactChangeRequiredForRole(role);
     const dispatch = {
       plan_id: planId,
       role,
@@ -6871,8 +8851,9 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
       agent_type_hint: agentTypeHintForRole(role, stage),
       reasoning_effort_hint: reasoningHintForRole(role, stage),
       capsule_json: path.resolve(REPO_ROOT, capsuleJsonRel),
-      result_artifacts: resultArtifactsForDispatch(project, activePlanId, planId, role, currentDelegation),
-      artifact_change_required: artifactChangeRequiredForRole(role),
+      result_artifacts: resultArtifacts,
+      artifact_change_required: artifactChangeRequired,
+      completion_requirements: buildDispatchCompletionRequirements(resultArtifacts, artifactChangeRequired),
       instruction: instructionOverride || `Read the capsule first, then produce the required result artifacts for ${planId} without widening scope.`,
       spawn_recommended: true,
     };
@@ -6881,17 +8862,56 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
     dispatches.push(dispatch);
   };
 
+  const maybePushDetailerRefreshDispatch = (contract, groupOverride = null) => {
+    if (!shouldAutoDetailerRefresh(state, contract)) {
+      return false;
+    }
+    const refreshCapsule = buildExecutionDetailerRefreshCapsule(
+      project,
+      contract,
+      state,
+      (state.lifecycle?.cycle_count || 0) + 1,
+    );
+    const refreshCapsuleRel = writeDispatchCapsule(paths, state, refreshCapsule).jsonRel;
+    const refreshSignals = collectPhaseRefreshSignals(state, contract);
+    const instruction = refreshSignals.length > 0
+      ? `Read the capsule first, then refresh ${contract.plan.plan_id} against upstream drift without widening scope. Signals: ${refreshSignals.slice(0, 4).join('; ')}`
+      : `Read the capsule first, then refresh ${contract.plan.plan_id} against upstream drift without widening scope.`;
+    pushDispatch(
+      contract.plan.plan_id,
+      'detailer',
+      refreshCapsuleRel,
+      {
+        mode: 'runtime_subagents',
+        owner: 'runtime_orchestrator',
+        runtime_roles: ['detailer'],
+        dispatch_artifacts: [`.smike/${project}/RUNTIME-DELEGATION.json`],
+        result_artifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
+      },
+      groupOverride || 1,
+      instruction,
+    );
+    return true;
+  };
+
   if (activePlanId === `${project}-plan`) {
     if (delegation.mode !== 'runtime_subagents') {
       return [];
     }
+    const runtimeRoles = new Set(normalizeStringArray(delegation.runtime_roles || []));
     const rootRoleMap = byPlan[activePlanId] || {};
     for (const role of ['strategist', 'checker', 'auditor']) {
+      if (!runtimeRoles.has(role)) {
+        continue;
+      }
       pushDispatch(activePlanId, role, rootRoleMap[role]);
     }
 
     for (const [planId, roleMap] of Object.entries(byPlan)) {
       if (planId === activePlanId) {
+        continue;
+      }
+      if (!runtimeRoles.has('detailer')) {
         continue;
       }
       pushDispatch(planId, 'detailer', roleMap?.detailer);
@@ -6909,7 +8929,10 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
       }
 
       const contract = resolvePlanContract(paths.projectDir, planJsonPath, planMdPath);
-      const planDelegation = normalizeDelegationConfig(contract.plan);
+      if (maybePushDetailerRefreshDispatch(contract, actionableContext.group || 1)) {
+        continue;
+      }
+      const planDelegation = resolveExecutionDelegation(project, state, contract);
       if (
         planDelegation.mode !== 'runtime_subagents'
         || planDelegation.owner !== 'runtime_orchestrator'
@@ -6923,6 +8946,7 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
         contract,
         state,
         (state.lifecycle?.cycle_count || 0) + 1,
+        planDelegation,
       );
       const executorCapsuleRel = writeDispatchCapsule(paths, state, executorCapsule).jsonRel;
 
@@ -6947,7 +8971,11 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
     const planMdPath = workflowPlan?.plan_md ? path.resolve(REPO_ROOT, workflowPlan.plan_md) : null;
     if (planJsonPath && fs.existsSync(planJsonPath)) {
       const contract = resolvePlanContract(paths.projectDir, planJsonPath, planMdPath);
-      const planDelegation = normalizeDelegationConfig(contract.plan);
+      const baseGroup = actionableContext.group || 1;
+      if (maybePushDetailerRefreshDispatch(contract, baseGroup)) {
+        return dispatches.sort((a, b) => a.group - b.group || a.role.localeCompare(b.role));
+      }
+      const planDelegation = resolveExecutionDelegation(project, state, contract);
       if (
         planDelegation.mode === 'runtime_subagents'
         && planDelegation.owner === 'runtime_orchestrator'
@@ -6958,20 +8986,12 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
           contract,
           state,
           (state.lifecycle?.cycle_count || 0) + 1,
+          planDelegation,
         );
         const executorCapsuleRel = writeDispatchCapsule(paths, state, executorCapsule).jsonRel;
         const instruction = planDelegation.result_artifacts.length > 0
           ? `Read the capsule first, then produce the required result artifacts for ${contract.plan.plan_id} without widening scope.`
           : `Read the capsule first, then implement ${contract.plan.plan_id} inside the declared write scope before reconciliation.`;
-        const baseGroup = actionableContext.group || 1;
-        const resultArtifacts = resultArtifactsForDispatch(
-          project,
-          activePlanId,
-          contract.plan.plan_id,
-          'executor',
-          planDelegation,
-        );
-
         if (!isRuntimeDispatchCompletedFresh(state, contract.plan.plan_id, 'executor')) {
           pushDispatch(
             contract.plan.plan_id,
@@ -6984,6 +9004,12 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
           return dispatches.sort((a, b) => a.group - b.group || a.role.localeCompare(b.role));
         }
 
+        const executorDispatchEntry = getRuntimeDispatchEntry(state, dispatchIdFor(contract.plan.plan_id, 'executor'));
+        const verifiedResultArtifacts = verifiedArtifactPathsFromCompletionArtifacts(executorDispatchEntry);
+        if (planDelegation.result_artifacts.length > 0 && verifiedResultArtifacts.length === 0) {
+          return [];
+        }
+
         if (
           planDelegation.runtime_roles.includes('judge')
           && !isRuntimeDispatchCompletedFresh(state, contract.plan.plan_id, 'judge')
@@ -6994,7 +9020,7 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
             state,
             'judge',
             (state.lifecycle?.cycle_count || 0) + 1,
-            resultArtifacts,
+            verifiedResultArtifacts,
           );
           const judgeCapsuleRel = writeDispatchCapsule(paths, state, judgeCapsule).jsonRel;
           pushDispatch(
@@ -7017,7 +9043,7 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
             state,
             'reviewer',
             (state.lifecycle?.cycle_count || 0) + 1,
-            resultArtifacts,
+            verifiedResultArtifacts,
           );
           const reviewerCapsuleRel = writeDispatchCapsule(paths, state, reviewerCapsule).jsonRel;
           pushDispatch(
@@ -7057,6 +9083,11 @@ function createRuntimeDispatchEntry(dispatch, createdAt = nowIso()) {
     capsule_json: normalizeRel(dispatch.capsule_json),
     result_artifacts: normalizePathList(dispatch.result_artifacts || []),
     artifact_change_required: dispatch.artifact_change_required === true,
+    completion_requirements: normalizeDispatchCompletionRequirements(
+      dispatch.completion_requirements,
+      dispatch.result_artifacts,
+      dispatch.artifact_change_required,
+    ),
     agent_type_hint: dispatch.agent_type_hint,
     reasoning_effort_hint: dispatch.reasoning_effort_hint,
     instruction: dispatch.instruction,
@@ -7109,6 +9140,11 @@ function syncRuntimeDispatchState(state, dispatches) {
     existing.capsule_json = normalizeRel(dispatch.capsule_json);
     existing.result_artifacts = normalizePathList(dispatch.result_artifacts || []);
     existing.artifact_change_required = dispatch.artifact_change_required === true;
+    existing.completion_requirements = normalizeDispatchCompletionRequirements(
+      dispatch.completion_requirements,
+      dispatch.result_artifacts,
+      dispatch.artifact_change_required,
+    );
     existing.agent_type_hint = dispatch.agent_type_hint;
     existing.reasoning_effort_hint = dispatch.reasoning_effort_hint;
     existing.instruction = dispatch.instruction;
@@ -7223,6 +9259,11 @@ function buildRuntimeDispatchContract(entry) {
     reasoning_effort_hint: entry.reasoning_effort_hint,
     capsule_json: entry.capsule_json,
     result_artifacts: normalizePathList(entry.result_artifacts || []),
+    completion_requirements: normalizeDispatchCompletionRequirements(
+      entry.completion_requirements,
+      entry.result_artifacts,
+      entry.artifact_change_required,
+    ),
     instruction: entry.instruction,
   };
 }
@@ -7248,17 +9289,59 @@ function currentRuntimeDispatchGroup(runtimeContext) {
   );
 }
 
+function currentCompletableRuntimeDispatchGroup(runtimeContext) {
+  const activeGroups = [...new Set(runtimeContext.active_dispatches.map((entry) => entry.group).filter((group) => Number.isInteger(group)))];
+  if (activeGroups.length === 1) {
+    return activeGroups[0];
+  }
+  if (activeGroups.length > 1) {
+    return 'mixed';
+  }
+  return 'none';
+}
+
 function syncActionableRuntimeDispatchState(project, paths, state, rootPlan) {
   const actionable = resolveActionablePlanContext(project, paths, state, rootPlan);
-  const delegation = normalizeDelegationConfig(actionable.plan);
+  const orchestration = ensureOrchestrationState(state);
+  const declaredDelegation = normalizeDelegationConfig(actionable.plan);
   const dispatches = buildRuntimeDispatches(project, paths, state, actionable);
   syncRuntimeDispatchState(state, dispatches);
-  const planFilter = actionable.plan_ids.length > 0 ? actionable.plan_ids : actionable.plan_id;
+  const planFilter = runtimeDispatchPlanFilterFromActionable(actionable);
   const currentEntries = getCurrentRuntimeDispatchEntries(state, planFilter);
   const readyEntries = getReadyRuntimeDispatchEntries(state, planFilter);
   const activeEntries = currentEntries.filter((entry) => entry.status === 'spawned');
   const failedEntries = currentEntries.filter((entry) => entry.status === 'failed');
   const completedEntries = currentEntries.filter((entry) => entry.status === 'completed');
+  const delegation = currentEntries.length > 0
+    ? {
+      mode: 'runtime_subagents',
+      owner: 'runtime_orchestrator',
+      runtime_roles: uniqueStrings(currentEntries.map((entry) => entry.role)),
+      dispatch_artifacts: declaredDelegation.dispatch_artifacts,
+      result_artifacts: uniqueStrings(currentEntries.flatMap((entry) => ensureArray(entry.result_artifacts))),
+    }
+    : declaredDelegation;
+  const currentActionableEntry = readyEntries[0]
+    || activeEntries[0]
+    || failedEntries[0]
+    || currentEntries[0]
+    || null;
+  orchestration.current_actionable_dispatch = currentActionableEntry
+    ? {
+      dispatch_id: currentActionableEntry.dispatch_id,
+      plan_id: currentActionableEntry.plan_id,
+      plan_ids: ensureArray(actionable.plan_ids),
+      role: currentActionableEntry.role,
+      group: currentActionableEntry.group,
+      status: currentActionableEntry.status,
+      freshness: currentActionableEntry.freshness?.status || null,
+      capsule_json: typeof currentActionableEntry.capsule_json === 'string'
+        ? normalizeRel(currentActionableEntry.capsule_json)
+        : null,
+      dispatch_surface: `.smike/${project}/RUNTIME-DELEGATION.json`,
+    }
+    : null;
+  orchestration.current_actionable_capsule = orchestration.current_actionable_dispatch?.capsule_json || null;
 
   return {
     actionable,
@@ -7268,10 +9351,9 @@ function syncActionableRuntimeDispatchState(project, paths, state, rootPlan) {
     active_dispatches: activeEntries,
     failed_dispatches: failedEntries,
     completed_dispatches: completedEntries,
-    all_dispatches_completed_fresh:
-      delegation.mode !== 'runtime_subagents' || delegation.owner !== 'runtime_orchestrator'
-        ? true
-        : hasCompletedFreshDispatches(currentEntries),
+    all_dispatches_completed_fresh: currentEntries.length === 0
+      ? true
+      : hasCompletedFreshDispatches(currentEntries),
   };
 }
 
@@ -7302,10 +9384,12 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
   const latestReviewResult = latest?.review?.result || null;
   const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
   const planningAnalysis = loadPlanningAnalysis(paths);
+  const planningFreshness = getPlanningArtifactFreshness(paths);
   const currentPlanPath = runtimeContext.actionable.plan_path;
   const currentPlan = runtimeContext.actionable.plan;
   const currentDelegation = runtimeContext.delegation;
   const currentDispatchGroup = currentRuntimeDispatchGroup(runtimeContext);
+  const completableDispatchGroup = currentCompletableRuntimeDispatchGroup(runtimeContext);
   const readyDispatches = runtimeContext.ready_dispatches.map((entry) => buildRuntimeDispatchContract(entry));
   const dispatchCounts = buildRuntimeDispatchCounts(runtimeContext);
   const latestCapsules = Object.fromEntries(
@@ -7317,6 +9401,27 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     ? fs.readdirSync(paths.capsulesDir).filter((fileName) => fileName.endsWith('.json')).length
     : 0;
   const operatorNotes = readPreservedOperatorNotes(paths.notesPath);
+  const authoritativeState = {
+    path: path.resolve(paths.statePath),
+    updated_at: state.updated_at || null,
+    lifecycle: {
+      status: state.lifecycle?.status || null,
+      next_action: state.lifecycle?.next_action || null,
+      next_command: getLifecycleNextCommand(state),
+      stop_reason: state.lifecycle?.stop_reason || null,
+    },
+  };
+  const workflowPlanDetails = workflowPlans.map((plan) => {
+    const planPath = path.resolve(REPO_ROOT, plan.plan_json);
+    const planContract = fs.existsSync(planPath) ? readJson(planPath) : null;
+    return {
+      plan_id: plan.plan_id,
+      status: plan.status,
+      depends_on: ensureArray(plan.depends_on),
+      write_scope: normalizePathList(planContract?.write_scope?.allowed_files || []),
+      acceptance_surface: ensureArray(planContract?.acceptance_criteria).map((criterion) => criterion?.description).filter(Boolean),
+    };
+  });
   const notesMarkdown = buildImprovementNotes(
     project,
     rootPlan,
@@ -7351,6 +9456,8 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     planning: {
       checker_result: planningAnalysis.checker?.result || null,
       auditor_result: planningAnalysis.auditor?.result || null,
+      artifacts_fresh: !planningFreshness.stale,
+      artifacts_freshness_reason: planningFreshness.reason,
       blocking_findings: planningAnalysis.blocking_findings.map((finding) => ({
         source: finding.source,
         id: finding.id,
@@ -7419,6 +9526,8 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
       review: fs.existsSync(paths.reviewReportPath) ? path.resolve(paths.reviewReportPath) : null,
       checker: fs.existsSync(paths.planningCheckerJsonPath) ? path.resolve(paths.planningCheckerJsonPath) : null,
       auditor: fs.existsSync(paths.planningAuditorJsonPath) ? path.resolve(paths.planningAuditorJsonPath) : null,
+      handoff: path.resolve(paths.implementationHandoffJsonPath),
+      planning_handoff: path.resolve(paths.planningHandoffMdPath),
       runtime_delegation: path.resolve(paths.runtimeDelegationJsonPath),
     },
     orchestration: {
@@ -7435,10 +9544,12 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     schema_version: '1.0.0',
     generated_at: nowIso(),
     project,
+    authoritative_state: authoritativeState,
     current_plan: {
       plan_id: runtimeContext.actionable.plan_id || state.current_plan?.plan_id || null,
       plan_ids: runtimeContext.actionable.plan_ids,
       group: currentDispatchGroup,
+      completable_group: completableDispatchGroup,
       plan_json: currentPlanPath ? path.resolve(currentPlanPath) : null,
       stage: inferPlanStage(project, currentPlan),
     },
@@ -7459,6 +9570,38 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     dispatch_counts: dispatchCounts,
   };
 
+  const implementationHandoffJson = {
+    schema_version: '1.0.0',
+    generated_at: nowIso(),
+    project,
+    authoritative_state: authoritativeState,
+    lifecycle: {
+      status: state.lifecycle.status,
+      next_action: state.lifecycle.next_action,
+      next_command: getLifecycleNextCommand(state),
+      stop_reason: state.lifecycle.stop_reason || null,
+    },
+    planning: {
+      checker_result: planningAnalysis.checker?.result || null,
+      auditor_result: planningAnalysis.auditor?.result || null,
+      artifacts_fresh: !planningFreshness.stale,
+      artifacts_freshness_reason: planningFreshness.reason,
+    },
+    actionable_surface: {
+      plan_id: runtimeContext.actionable.plan_id || state.current_plan?.plan_id || null,
+      plan_ids: runtimeContext.actionable.plan_ids,
+      dispatch_group: currentDispatchGroup,
+      completable_group: completableDispatchGroup,
+      current_dispatch: orchestration.current_actionable_dispatch,
+      current_capsule: orchestration.current_actionable_capsule || null,
+      runtime_delegation: path.resolve(paths.runtimeDelegationJsonPath),
+    },
+    phase_graph: workflowPlanDetails,
+    dependency_blockers: dependencyBlockers,
+    deferred_items: parseMarkdownBulletSection(paths.strategyPath, 'Deferred Items'),
+    protected_areas: parseMarkdownBulletSection(paths.strategyPath, 'Protected Areas'),
+  };
+
   fs.writeFileSync(paths.notesPath, notesMarkdown, 'utf8');
   writeJson(paths.resumeCapsuleJsonPath, resumeCapsuleJson);
   if (fs.existsSync(paths.resumeCapsuleMdPath)) {
@@ -7471,6 +9614,8 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
   }
 
   writeJson(paths.indexJsonPath, indexJson);
+  writeJson(paths.implementationHandoffJsonPath, implementationHandoffJson);
+  fs.writeFileSync(paths.planningHandoffMdPath, renderPlanningHandoffMarkdown(project, implementationHandoffJson), 'utf8');
   writeJson(paths.runtimeDelegationJsonPath, runtimeDelegationJson);
   if (fs.existsSync(paths.runtimeDelegationMdPath)) {
     fs.unlinkSync(paths.runtimeDelegationMdPath);
@@ -7489,7 +9634,7 @@ async function runCycle(project, cycleOptions = {}) {
     fail(`missing canonical plan contract: ${paths.planJsonPath}`);
   }
 
-  const rootPlan = readJson(paths.planJsonPath);
+  let rootPlan = readJson(paths.planJsonPath);
   const rootValidationErrors = validatePlan(rootPlan);
   if (rootValidationErrors.length > 0) {
     fail(`PLAN.json validation failed:\n- ${rootValidationErrors.join('\n- ')}`);
@@ -7501,12 +9646,91 @@ async function runCycle(project, cycleOptions = {}) {
     fail(`missing human plan document: ${paths.planMdPath}`);
   }
 
-  const workflowSettings = resolveWorkflowSettings(rootPlan, cycleOptions);
-  const contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
-  const state = loadOrInitState(project, paths, rootPlan);
+  let workflowSettings = resolveWorkflowSettings(rootPlan, cycleOptions);
+  let contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
+  let state = loadOrInitState(project, paths, rootPlan);
+  const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : {};
+  const planningSpecRel = projectMeta?.spec_path || rootPlan?.spec || state?.planning?.spec_path || null;
+  const planningContextFiles = normalizePathList(projectMeta?.context_files || state?.planning?.context_files || []);
+
+  if (isPlanningDraftState(state)) {
+    const planningInputRecovery = ensurePlanningInputsReadable(
+      project,
+      paths,
+      planningSpecRel,
+      planningContextFiles,
+      'planning draft',
+    );
+    printPlanningInputRecovery(project, planningInputRecovery);
+
+    writePlanningArtifacts(project, planningSpecRel, planningContextFiles, { planningMode: 'draft' });
+    rootPlan = readJson(paths.planJsonPath);
+    workflowSettings = resolveWorkflowSettings(rootPlan, cycleOptions);
+    contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
+    state = loadOrInitState(project, paths, rootPlan);
+
+    const draftBundle = buildPlanningBundle(project, planningSpecRel, planningContextFiles);
+    const draftPhaseContracts = buildPlanningPhaseContracts(project, planningSpecRel, draftBundle);
+    const promotionCheck = buildPlanningDraftPromotionCheck(draftBundle, draftPhaseContracts);
+
+    if (!promotionCheck.ready) {
+      state.current_plan = {
+        plan_id: rootPlan.plan_id,
+        plan_json: `.smike/${project}/PLAN.json`,
+        plan_md: `.smike/${project}/PLAN.md`,
+        depends_on: [],
+        contract_hash: hashPlanContract(rootPlan),
+      };
+      state.lifecycle.status = PLANNING_DRAFT_LIFECYCLE_STATUS;
+      state.lifecycle.last_result = null;
+      setLifecycleStopReason(state, null);
+      setLifecycleNextStep(state, buildPlanningDraftNextAction(project, promotionCheck), buildCycleCommand(project));
+      state.updated_at = nowIso();
+      if (state.planning && typeof state.planning === 'object') {
+        state.planning = {
+          ...state.planning,
+          status: 'draft',
+          completed_at: null,
+        };
+      }
+      const orchestration = ensureOrchestrationState(state);
+      orchestration.stage = 'planning';
+      orchestration.active_role = null;
+      orchestration.next_role = 'strategist';
+      persistProjectState(project, paths, state, rootPlan, planningSpecRel);
+      console.log(`smike cycle ${project}: DRAFT (0 plans executed)`);
+      console.log(`next: ${state.lifecycle.next_action}`);
+      return;
+    }
+
+    writePlanningArtifacts(project, planningSpecRel, planningContextFiles, { planningMode: 'active' });
+    rootPlan = readJson(paths.planJsonPath);
+    workflowSettings = resolveWorkflowSettings(rootPlan, cycleOptions);
+    contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
+    state = loadOrInitState(project, paths, rootPlan);
+  }
+
+  const previousWorkflow = state.workflow && typeof state.workflow === 'object'
+    ? { ...state.workflow }
+    : null;
   syncWorkflowState(state, contracts, workflowSettings);
+  carryForwardFreshSessionImplementationGate(state, previousWorkflow);
   const orchestration = ensureOrchestrationState(state);
   ensureDiscoveryLog(state);
+  const planningRecheck = shouldAutoRecheckPlanning(project, paths, state, planningSpecRel, planningContextFiles);
+  if (planningRecheck.stale) {
+    await runPlanningRecheckInternal(
+      project,
+      paths,
+      rootPlan,
+      state,
+      workflowSettings,
+      planningSpecRel,
+      planningContextFiles,
+      { bundle: planningRecheck.bundle, exitOnFailure: true },
+    );
+    return;
+  }
   maybeRecordHandoffFailure(project, state);
 
   const contractsByPath = new Map(contracts.map((contract) => [contract.plan_json_rel, contract]));
@@ -7520,6 +9744,9 @@ async function runCycle(project, cycleOptions = {}) {
     if (!nextRunnablePlan) {
       break;
     }
+    if (executedPlans.length === 0 && isFreshSessionImplementationPauseReason(state.workflow.pause_reason)) {
+      break;
+    }
     if (executedPlans.length > 0 && !state.workflow.auto_continue) {
       break;
     }
@@ -7529,19 +9756,12 @@ async function runCycle(project, cycleOptions = {}) {
       fail(`workflow state references unknown plan contract: ${nextRunnablePlan.plan_json}`);
     }
     const planOrchestration = resolveOrchestrationConfig(project, contract.plan);
-    const delegation = normalizeDelegationConfig(contract.plan);
-    const currentRuntimeContext =
-      delegation.mode === 'runtime_subagents' && delegation.owner === 'runtime_orchestrator'
-        ? syncActionableRuntimeDispatchState(project, paths, state, rootPlan)
-        : null;
+    const currentRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
     const currentPlanDispatches = currentRuntimeContext?.actionable.plan_ids?.includes(contract.plan.plan_id)
       ? currentRuntimeContext.dispatches
       : [];
 
     if (
-      planOrchestration.stage !== 'planning' &&
-      delegation.mode === 'runtime_subagents' &&
-      delegation.owner === 'runtime_orchestrator' &&
       currentPlanDispatches.length > 0 &&
       !currentRuntimeContext.all_dispatches_completed_fresh
     ) {
@@ -7561,6 +9781,24 @@ async function runCycle(project, cycleOptions = {}) {
         failed_dispatches: currentRuntimeContext.failed_dispatches,
       };
       break;
+    }
+
+    if (
+      contract.plan.plan_id === `${project}-plan`
+      && planOrchestration.stage === 'planning'
+      && currentPlanDispatches.length > 0
+      && currentRuntimeContext?.all_dispatches_completed_fresh
+    ) {
+      const planningInputRecovery = ensurePlanningInputsReadable(
+        project,
+        paths,
+        planningSpecRel,
+        planningContextFiles,
+        'planning phase',
+      );
+      printPlanningInputRecovery(project, planningInputRecovery);
+      const livePlanningBundle = buildPlanningBundle(project, planningSpecRel, planningContextFiles);
+      refreshPlanningAnalysisArtifactsFromCurrentPlans(project, paths, livePlanningBundle);
     }
 
     const cycleNumber = (state.lifecycle?.cycle_count || 0) + 1;
@@ -7743,6 +9981,21 @@ async function runCycle(project, cycleOptions = {}) {
         break;
       }
     }
+
+    if (contract.plan.plan_id === `${project}-plan` && cycleRecord.result === 'pass') {
+      const readyPlansAfterPlanning = getReadyWorkflowPlans(project, state.workflow.plans);
+      const nextPlanAfterPlanning = readyPlansAfterPlanning[0] || null;
+      const nextContractAfterPlanning = nextPlanAfterPlanning
+        ? contractsByPath.get(nextPlanAfterPlanning.plan_json)
+        : null;
+      if (
+        nextContractAfterPlanning
+        && inferPlanStage(project, nextContractAfterPlanning.plan) !== 'planning'
+      ) {
+        applyFreshSessionImplementationGate(state);
+        break;
+      }
+    }
   }
 
   const allComplete = state.workflow.plans.length > 0 && state.workflow.plans.every((plan) => plan.status === 'complete');
@@ -7754,33 +10007,27 @@ async function runCycle(project, cycleOptions = {}) {
   const planningPlan = state.workflow.plans.find((plan) => plan.plan_id === `${project}-plan`) || null;
 
   if (!runtimeDispatchPending && nextRunnableContract) {
-    const nextDelegation = normalizeDelegationConfig(nextRunnableContract.plan);
+    const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
     if (
-      nextDelegation.mode === 'runtime_subagents'
-      && nextDelegation.owner === 'runtime_orchestrator'
+      nextRuntimeContext.actionable.plan_ids?.includes(nextRunnableContract.plan.plan_id)
+      && nextRuntimeContext.dispatches.length > 0
+      && !nextRuntimeContext.all_dispatches_completed_fresh
     ) {
-      const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-      if (
-        nextRuntimeContext.actionable.plan_ids?.includes(nextRunnableContract.plan.plan_id)
-        && nextRuntimeContext.dispatches.length > 0
-        && !nextRuntimeContext.all_dispatches_completed_fresh
-      ) {
-        state.current_plan = {
-          plan_id: nextRunnableContract.plan.plan_id,
-          plan_json: nextRunnableContract.plan_json_rel,
-          plan_md: nextRunnableContract.plan_md_rel,
-          depends_on: ensureArray(nextRunnableContract.plan.depends_on),
-          contract_hash: hashPlanContract(nextRunnableContract.plan),
-        };
-        runtimeDispatchPending = {
-          plan_id: nextRunnableContract.plan.plan_id,
-          plan_ids: nextRuntimeContext.actionable.plan_ids,
-          group: currentRuntimeDispatchGroup(nextRuntimeContext),
-          ready_dispatches: nextRuntimeContext.ready_dispatches,
-          active_dispatches: nextRuntimeContext.active_dispatches,
-          failed_dispatches: nextRuntimeContext.failed_dispatches,
-        };
-      }
+      state.current_plan = {
+        plan_id: nextRunnableContract.plan.plan_id,
+        plan_json: nextRunnableContract.plan_json_rel,
+        plan_md: nextRunnableContract.plan_md_rel,
+        depends_on: ensureArray(nextRunnableContract.plan.depends_on),
+        contract_hash: hashPlanContract(nextRunnableContract.plan),
+      };
+      runtimeDispatchPending = {
+        plan_id: nextRunnableContract.plan.plan_id,
+        plan_ids: nextRuntimeContext.actionable.plan_ids,
+        group: currentRuntimeDispatchGroup(nextRuntimeContext),
+        ready_dispatches: nextRuntimeContext.ready_dispatches,
+        active_dispatches: nextRuntimeContext.active_dispatches,
+        failed_dispatches: nextRuntimeContext.failed_dispatches,
+      };
     }
   }
 
@@ -7798,11 +10045,25 @@ async function runCycle(project, cycleOptions = {}) {
     orchestration.stage = 'execution';
   }
 
+  const planningExecutedThisCycle = executedPlans.some((entry) => entry.plan_id === `${project}-plan`);
+  if (
+    planningExecutedThisCycle
+    && !failTriggered
+    && !runtimeDispatchPending
+    && nextRunnableContract
+    && inferPlanStage(project, nextRunnableContract.plan) !== 'planning'
+  ) {
+    applyFreshSessionImplementationGate(state);
+  }
+
   orchestration.active_role = null;
   setLifecycleStopReason(state, null);
   if (allComplete) {
     state.lifecycle.status = 'complete';
     setLifecycleNextStep(state, 'Scope complete.');
+    orchestration.next_role = null;
+  } else if (runtimeDispatchPending && isFreshSessionImplementationPauseReason(state.workflow.pause_reason)) {
+    enterAwaitingFreshSession(state, project, readyWorkflowPlans, runtimeDispatchPending);
     orchestration.next_role = null;
   } else if (runtimeDispatchPending) {
     applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPending);
@@ -7811,7 +10072,7 @@ async function runCycle(project, cycleOptions = {}) {
     if (state.current_plan?.plan_id === `${project}-plan`) {
       const planningAnalysis = loadPlanningAnalysis(paths);
       state.lifecycle.status = 'planning_blocked';
-      setLifecycleNextStep(state, buildPlanningBlockedNextAction(project, paths, planningAnalysis), buildCycleCommand(project));
+      setLifecycleNextStep(state, buildPlanningBlockedNextAction(project, paths, planningAnalysis), buildRecheckCommand(project));
       orchestration.next_role = null;
       if (state.planning && typeof state.planning === 'object') {
         state.planning = {
@@ -7829,11 +10090,15 @@ async function runCycle(project, cycleOptions = {}) {
       );
     }
   } else if (nextRunnablePending && !state.workflow.auto_continue) {
-    state.lifecycle.status = 'in_progress';
-    const pauseReason = typeof state.workflow.pause_reason === 'string' && state.workflow.pause_reason.trim()
-      ? `Auto-continue paused: ${state.workflow.pause_reason.trim()}. `
-      : 'Auto-continue disabled. ';
-    setLifecycleNextStep(state, `${pauseReason}${describeReadyWorkflowPlans(readyWorkflowPlans)}`, buildCycleCommand(project));
+    if (isFreshSessionImplementationPauseReason(state.workflow.pause_reason)) {
+      enterAwaitingFreshSession(state, project, readyWorkflowPlans);
+    } else {
+      state.lifecycle.status = 'in_progress';
+      const pauseReason = typeof state.workflow.pause_reason === 'string' && state.workflow.pause_reason.trim()
+        ? `Auto-continue paused: ${state.workflow.pause_reason.trim()}. `
+        : 'Auto-continue disabled. ';
+      setLifecycleNextStep(state, `${pauseReason}${describeReadyWorkflowPlans(readyWorkflowPlans)}`, buildCycleCommand(project));
+    }
     orchestration.next_role = 'executor';
   } else if (nextRunnablePending && executedPlans.length >= state.workflow.max_phases_per_run) {
     state.lifecycle.status = 'in_progress';
@@ -7954,6 +10219,134 @@ function persistProjectState(project, paths, state, rootPlan, specRel = null) {
   );
 }
 
+function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
+  const dispatchId = entry.dispatch_id;
+  const at = nowIso();
+  if (entry.status !== 'spawned') {
+    fail(`dispatch ${dispatchId} must be marked spawned before it can be completed`);
+  }
+
+  const snapshots = snapshotArtifactList(entry.result_artifacts);
+  const completionRequirements = normalizeDispatchCompletionRequirements(
+    entry.completion_requirements,
+    entry.result_artifacts,
+    entry.artifact_change_required,
+  );
+  const missingArtifact = snapshots.find((artifact) => !artifact.exists);
+  if (missingArtifact) {
+    entry.freshness = createDispatchFreshness('missing', `Missing result artifact: ${missingArtifact.path}`, at);
+    updateRuntimeDispatchStatus(entry, 'failed', `Missing result artifact: ${missingArtifact.path}`, at);
+    const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+    applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
+    persistProjectState(project, paths, state, rootPlan);
+    fail(`dispatch ${dispatchId} cannot be completed: missing result artifact ${missingArtifact.path}`);
+  }
+
+  const semanticFailures = collectCompletionRequirementFailures(
+    completionRequirements,
+    snapshots,
+    (artifactPath) => fs.readFileSync(path.resolve(REPO_ROOT, artifactPath), 'utf8'),
+  );
+  if (semanticFailures.length > 0) {
+    const failureReason = semanticFailures[0];
+    entry.freshness = createDispatchFreshness('stale', failureReason, at);
+    updateRuntimeDispatchStatus(entry, 'failed', failureReason, at);
+    const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+    applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
+    persistProjectState(project, paths, state, rootPlan);
+    fail(`dispatch ${dispatchId} cannot be completed:\n- ${semanticFailures.join('\n- ')}`);
+  }
+
+  if (entry.artifact_change_required && artifactSnapshotEquivalent(entry.spawn_baseline, snapshots)) {
+    entry.freshness = createDispatchFreshness(
+      'unchanged',
+      'Result artifacts did not change after the dispatch was spawned.',
+      at,
+    );
+    updateRuntimeDispatchStatus(entry, 'failed', 'Result artifacts did not change after spawn.', at);
+    const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+    applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
+    persistProjectState(project, paths, state, rootPlan);
+    fail(`dispatch ${dispatchId} cannot be completed: result artifacts are unchanged from the spawn baseline`);
+  }
+
+  entry.completion_artifacts = snapshots;
+  entry.freshness = buildDispatchFreshnessFromCompletion(entry);
+  updateRuntimeDispatchStatus(entry, 'completed', 'Runtime dispatch completed and artifacts were verified.', at);
+  const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+  if (!applyRuntimeDispatchPendingLifecycle(
+    project,
+    state,
+    buildRuntimeDispatchPendingState(nextRuntimeContext),
+    { readyLifecycle: 'in_progress' },
+  )) {
+    state.lifecycle.status = 'in_progress';
+    setLifecycleStopReason(state, null);
+    setLifecycleNextStep(
+      state,
+      `Runtime dispatch ${dispatchId} completed. Rerun \`${buildAdvanceCommand(project)}\` to reconcile the next action.`,
+      buildAdvanceCommand(project),
+    );
+  }
+  persistProjectState(project, paths, state, rootPlan);
+}
+
+function runDispatchGroup(project, action, groupSelector, options = {}) {
+  const releaseProjectLock = acquireProjectLock(project, 'dispatch');
+  try {
+    const paths = getProjectPaths(project);
+    if (!fs.existsSync(paths.planJsonPath)) {
+      fail(`missing PLAN.json: ${paths.planJsonPath}`);
+    }
+    if (!fs.existsSync(paths.statePath)) {
+      fail(`missing STATE.json: ${paths.statePath}`);
+    }
+
+    const rootPlan = readJson(paths.planJsonPath);
+    const { state } = readValidatedState(paths, { persistRepair: true });
+
+    ensureOrchestrationState(state);
+    ensureDiscoveryLog(state);
+    const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+    if (
+      runtimeContext.delegation.mode !== 'runtime_subagents' ||
+      runtimeContext.delegation.owner !== 'runtime_orchestrator'
+    ) {
+      fail(`current actionable plan for ${project} is not runtime-owned delegation`);
+    }
+
+    if (action !== 'complete-group') {
+      fail(`unknown dispatch group action: ${action}`);
+    }
+
+    const normalizedSelector = typeof groupSelector === 'string' && groupSelector.trim()
+      ? groupSelector.trim().toLowerCase()
+      : 'current';
+    const targetGroup = normalizedSelector === 'current'
+      ? currentRuntimeDispatchGroup(runtimeContext)
+      : Number.parseInt(normalizedSelector, 10);
+    if (!Number.isInteger(targetGroup) || targetGroup < 1) {
+      fail(`invalid dispatch group selector: ${groupSelector}`);
+    }
+
+    const entries = runtimeContext.dispatches
+      .filter((entry) => entry.group === targetGroup && entry.status === 'spawned')
+      .sort((a, b) => a.dispatch_id.localeCompare(b.dispatch_id));
+    if (entries.length === 0) {
+      fail(`no spawned dispatches found in group ${targetGroup} for ${project}`);
+    }
+
+    for (const entry of entries) {
+      completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry);
+      console.log(`smike dispatch ${project}: ${entry.dispatch_id} -> completed`);
+    }
+    console.log(`smike dispatch ${project}: group ${targetGroup} -> completed (${entries.length} dispatches)`);
+    printDispatchFollowOn(project, state);
+  } finally {
+    releaseProjectLock();
+  }
+}
+
 function runDispatch(project, action, dispatchId, options = {}) {
   const releaseProjectLock = acquireProjectLock(project, 'dispatch');
   try {
@@ -7978,7 +10371,11 @@ function runDispatch(project, action, dispatchId, options = {}) {
     fail(`current actionable plan for ${project} is not runtime-owned delegation`);
   }
 
-  const entry = getCurrentRuntimeDispatchEntries(state, runtimeContext.actionable.plan_id)
+  const dispatchPlanFilter =
+    Array.isArray(runtimeContext.actionable.plan_ids) && runtimeContext.actionable.plan_ids.length > 0
+      ? runtimeContext.actionable.plan_ids
+      : runtimeContext.actionable.plan_id;
+  const entry = getCurrentRuntimeDispatchEntries(state, dispatchPlanFilter)
     .find((dispatch) => dispatch.dispatch_id === dispatchId);
   if (!entry) {
     fail(`unknown current dispatch: ${dispatchId}`);
@@ -7996,53 +10393,14 @@ function runDispatch(project, action, dispatchId, options = {}) {
     applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
     persistProjectState(project, paths, state, rootPlan);
     console.log(`smike dispatch ${project}: ${dispatchId} -> spawned`);
+    printDispatchFollowOn(project, state);
     return;
   }
 
   if (action === 'completed') {
-    if (entry.status !== 'spawned') {
-      fail(`dispatch ${dispatchId} must be marked spawned before it can be completed`);
-    }
-
-    const snapshots = snapshotArtifactList(entry.result_artifacts);
-    const missingArtifact = snapshots.find((artifact) => !artifact.exists);
-    if (missingArtifact) {
-      entry.freshness = createDispatchFreshness('missing', `Missing result artifact: ${missingArtifact.path}`, at);
-      updateRuntimeDispatchStatus(entry, 'failed', `Missing result artifact: ${missingArtifact.path}`, at);
-      const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-      applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
-      persistProjectState(project, paths, state, rootPlan);
-      fail(`dispatch ${dispatchId} cannot be completed: missing result artifact ${missingArtifact.path}`);
-    }
-
-    if (entry.artifact_change_required && artifactSnapshotEquivalent(entry.spawn_baseline, snapshots)) {
-      entry.freshness = createDispatchFreshness(
-        'unchanged',
-        'Result artifacts did not change after the dispatch was spawned.',
-        at,
-      );
-      updateRuntimeDispatchStatus(entry, 'failed', 'Result artifacts did not change after spawn.', at);
-      const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-      applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
-      persistProjectState(project, paths, state, rootPlan);
-      fail(`dispatch ${dispatchId} cannot be completed: result artifacts are unchanged from the spawn baseline`);
-    }
-
-    entry.completion_artifacts = snapshots;
-    entry.freshness = buildDispatchFreshnessFromCompletion(entry);
-    updateRuntimeDispatchStatus(entry, 'completed', 'Runtime dispatch completed and artifacts were verified.', at);
-    const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-    if (!applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext))) {
-      state.lifecycle.status = 'in_progress';
-      setLifecycleStopReason(state, null);
-      setLifecycleNextStep(
-        state,
-        `Runtime dispatch ${dispatchId} completed. Rerun \`${buildCycleCommand(project)}\` to reconcile the next action.`,
-        buildCycleCommand(project),
-      );
-    }
-    persistProjectState(project, paths, state, rootPlan);
+    completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry);
     console.log(`smike dispatch ${project}: ${dispatchId} -> completed`);
+    printDispatchFollowOn(project, state);
     return;
   }
 
@@ -8064,6 +10422,7 @@ function runDispatch(project, action, dispatchId, options = {}) {
     }
     persistProjectState(project, paths, state, rootPlan);
     console.log(`smike dispatch ${project}: ${dispatchId} -> failed`);
+    printDispatchFollowOn(project, state);
     return;
   }
 
@@ -8076,9 +10435,15 @@ function runDispatch(project, action, dispatchId, options = {}) {
     entry.freshness = createDispatchFreshness('pending', 'Dispatch requeued for retry.', at);
     updateRuntimeDispatchStatus(entry, 'queued', 'Dispatch requeued for retry.', at);
     const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-    applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
+    applyRuntimeDispatchPendingLifecycle(
+      project,
+      state,
+      buildRuntimeDispatchPendingState(nextRuntimeContext),
+      { readyLifecycle: 'in_progress' },
+    );
     persistProjectState(project, paths, state, rootPlan);
     console.log(`smike dispatch ${project}: ${dispatchId} -> queued`);
+    printDispatchFollowOn(project, state);
     return;
   }
 
@@ -8240,6 +10605,30 @@ async function main() {
     await runCycle(project, cycleOptions);
     return;
   }
+  if (command === 'recheck') {
+    if (!project) {
+      fail('project argument is required');
+    }
+    if (rest.length > 0) {
+      fail(`recheck does not accept extra arguments: ${rest.join(' ')}`);
+    }
+    await runRecheck(project);
+    return;
+  }
+  if (command === 'doctor') {
+    if (rest.length > 0) {
+      fail(`doctor does not accept extra arguments: ${rest.join(' ')}`);
+    }
+    runDoctor(project || null);
+    return;
+  }
+  if (command === 'advance') {
+    if (rest.length > 0) {
+      fail(`advance does not accept extra arguments: ${rest.join(' ')}`);
+    }
+    await runAdvance(project || null);
+    return;
+  }
   if (command === 'dispatch') {
     const action = rest[0];
     const dispatchId = rest[1];
@@ -8261,6 +10650,10 @@ async function main() {
       } else {
         fail(`unknown dispatch flag: ${flag}`);
       }
+    }
+    if (action === 'complete-group') {
+      runDispatchGroup(project, action, dispatchId, options);
+      return;
     }
     runDispatch(project, action, dispatchId, options);
     return;
@@ -8331,10 +10724,10 @@ async function main() {
     return;
   }
   if (command === 'resume') {
-    if (args.length > 1) {
-      fail('resume does not accept extra arguments');
+    if (rest.length > 0) {
+      fail(`resume does not accept extra arguments: ${rest.join(' ')}`);
     }
-    await runResume();
+    await runResume(project || null);
     return;
   }
   if (command === 'status') {

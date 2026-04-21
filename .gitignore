@@ -1,2 +1,4 @@
 node_modules
 .smike
+.smike-archive
+.smike-test-tmp
