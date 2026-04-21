@@ -154,7 +154,7 @@ Goal: remove the specific ambiguity where the runtime can stop even though a run
 
 #### 2a. Add `awaiting_runtime_dispatch` lifecycle state
 
-Current state: after `./smike cycle` queues a runtime-owned dispatch, `STATE.json.lifecycle.status` is `in_progress` — the same status the project has when local work is mid-flight. The runtime has to read `RUNTIME-DELEGATION.json.ready_dispatches` separately to know whether it is supposed to act next. When the runtime misses this signal, the project looks "in progress" forever.
+Current state: after `./smike cycle` queues a runtime-owned dispatch, `STATE.json.lifecycle.status` is `in_progress` — the same status the project has when local work is mid-flight. The runtime had to read a second dispatch surface separately to know whether it was supposed to act next. When the runtime missed this signal, the project looked "in progress" forever.
 
 Add a new lifecycle state: `awaiting_runtime_dispatch`. Semantics:
 - Entered when `./smike cycle` reconciles and finds one or more `ready_dispatches` that the runtime must spawn
@@ -199,7 +199,7 @@ Do not start Pass 3 until at least one real project has completed end-to-end on 
 
 Candidates for Pass 3 (listed, not committed):
 
-- **Collapse `RUNTIME-DELEGATION.json` into `STATE.json`**: every field in `RUNTIME-DELEGATION` already corresponds to a field in `STATE.json.orchestration`. The dual surface is a historical accident. Fold it into STATE, delete the separate file, simplify the read path to one input file per cycle.
+- **Collapse `RUNTIME-DELEGATION.json` into `STATE.json`**: completed. The grouped runtime-dispatch view now lives under `STATE.json.orchestration.runtime_dispatch_view`, so the runtime reads one authoritative file per cycle instead of juggling a duplicate projection.
 - **Inline small `lib/` modules back into `cli.mjs`**: `planning-review.mjs` is a 5-line stub. `review.mjs` is 92 lines. The 7-module split added test isolation but cost `grep`-ability. Revisit whether the split pays off once the cli surface area has stabilized post-Pass 1.
 - **Minimal profile for read-only research**: a separate `./smike cycle --profile read-only` mode that skips detailer + reviewer by default, writes fewer capsules, and uses a shorter runtime doc. Only add this if Pass 1d alone is insufficient.
 - **Replace the capsule `.json` files with inline fields on the phase directory's `PLAN.json`**: eliminates the `capsules/` directory entirely. Most capsule content is derivable from the plan — generating a separate artifact is a convenience, not a load-bearing contract.

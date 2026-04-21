@@ -82,7 +82,7 @@ Plan a broad implementation without committing to concrete proof commands yet.
   }
 });
 
-test('status surfaces that planning_draft is spec-driven', () => {
+test('STATE.md surfaces that planning_draft is spec-driven', () => {
   const specRel = `.smike-test-tmp/smike-planning-draft-${Date.now()}-status.md`;
   const project = slugifyProjectName(specRel);
 
@@ -101,11 +101,70 @@ Plan a broad implementation without committing to concrete proof commands yet.
 
   try {
     runCli([specRel], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
-    runCli(['activate', project], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
 
-    const statusOutput = runCli(['status'], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
-    assert.match(statusOutput, /Planning draft notice: edits to `\.smike\/\*\*` are rebuilt from the spec on the next cycle\./);
-    assert.match(statusOutput, /Fix surface: update the spec’s `Required Planning Output Shape`, `Priority N:` summaries, and inline `verify:` commands\./);
+    const stateMd = fs.readFileSync(path.join(repoRoot, `.smike/${project}/STATE.md`), 'utf8');
+    assert.match(stateMd, /Planning draft notice: edits to `\.smike\/\*\*` are rebuilt from the spec on the next cycle\./);
+    assert.match(stateMd, /Fix surface: update the spec’s `Required Planning Output Shape`, `Priority N:` summaries, and inline `verify:` commands\./);
+  } finally {
+    cleanupProject(project, specRel);
+  }
+});
+
+test('freeform prompt bootstraps a planning_draft project without a separate command', () => {
+  const promptParts = ['build', 'release', 'dashboard', 'with', 'audit', 'trail', String(Date.now())];
+  const prompt = promptParts.join(' ');
+  let project = null;
+  let specRel = null;
+
+  try {
+    runCli(promptParts, { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
+
+    const active = readJson('.smike/ACTIVE.json');
+    project = active.project;
+    specRel = active.spec_path;
+
+    const state = readJson(`.smike/${project}/STATE.json`);
+    const specText = fs.readFileSync(path.join(repoRoot, specRel), 'utf8');
+
+    assert.match(specRel, /^memories\/build-release-dashboard-with-audit-trail-/);
+    assert.match(specText, /## Intake Prompt/);
+    assert.match(specText, /## Clarifying Questions/);
+    assert.match(specText, new RegExp(prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(state.lifecycle.status, 'planning_draft');
+    assert.equal(state.planning.status, 'draft');
+    assert.match(state.planning.intake_prompt, /build release dashboard with audit trail/i);
+    assert.equal(Array.isArray(state.planning.clarifying_questions), true);
+    assert.equal(state.planning.clarifying_questions.length >= 3, true);
+    assert.match(state.lifecycle.next_action, /Answer onboarding questions:/);
+  } finally {
+    if (project && specRel) {
+      cleanupProject(project, specRel);
+    }
+  }
+});
+
+test('freeform prompt accepts explicit spec and context paths', () => {
+  const prompt = `add account-level feature flags ${Date.now()}`;
+  const specRel = `.smike-test-tmp/intake-${Date.now()}.md`;
+  const project = slugifyProjectName(specRel);
+
+  try {
+    runCli([
+      prompt,
+      `--spec=${specRel}`,
+      '--context=README.md,scripts/smike/SPEC_AUTHORING.md',
+    ], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
+
+    const active = readJson('.smike/ACTIVE.json');
+    const state = readJson(`.smike/${project}/STATE.json`);
+    const specText = fs.readFileSync(path.join(repoRoot, specRel), 'utf8');
+
+    assert.equal(active.spec_path, specRel);
+    assert.deepEqual(active.context_files, ['README.md', 'scripts/smike/SPEC_AUTHORING.md']);
+    assert.deepEqual(state.planning.context_files, ['README.md', 'scripts/smike/SPEC_AUTHORING.md']);
+    assert.match(specText, /## What The Planner Must Read First/);
+    assert.match(specText, /1\. README\.md/);
+    assert.match(specText, /2\. scripts\/smike\/SPEC_AUTHORING\.md/);
   } finally {
     cleanupProject(project, specRel);
   }
@@ -189,7 +248,6 @@ Define the route and auth slice with concrete boundaries, explicit proof obligat
     const startOutput = runCli([specRel], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
 
     const state = readJson(`.smike/${project}/STATE.json`);
-    const runtimeDelegation = readJson(`.smike/${project}/RUNTIME-DELEGATION.json`);
     const dispatchEntries = Object.values(state.orchestration.runtime_dispatches.by_id || {});
     const dispatchRoles = new Set(dispatchEntries.map((entry) => entry.role));
     const strategistCapsulePath = state.orchestration.capsules.by_plan[`${project}-plan`].strategist;
@@ -200,9 +258,9 @@ Define the route and auth slice with concrete boundaries, explicit proof obligat
     assert.equal(state.lifecycle.status, 'awaiting_runtime_dispatch');
     assert.match(
       startOutput,
-      /runtime_requirement: host runtime must execute next_command before treating this project state as complete\./,
+      new RegExp(`operator_requirement: run \\\./smike advance ${project} now, then mark each finished dispatch with \\\./smike dispatch ${project} completed <dispatch-id>\\.`),
     );
-    assert.deepEqual(runtimeDelegation.ready_dispatches.map((entry) => entry.role), ['strategist']);
+    assert.deepEqual(state.orchestration.runtime_dispatch_view.ready_dispatches.map((entry) => entry.role), ['strategist']);
     assert.equal(dispatchRoles.has('strategist'), true);
     assert.equal(dispatchRoles.has('detailer'), true);
     assert.equal(dispatchRoles.has('checker'), false);
@@ -214,10 +272,12 @@ Define the route and auth slice with concrete boundaries, explicit proof obligat
     ]);
     assert.equal(strategistCapsule.dispatch.artifact_change_required, true);
     assert.equal(strategistCapsule.dispatch.completion_requirements.require_artifact_change, true);
+    assert.equal('completion_checks' in strategistCapsule.dispatch, false);
     assert.equal(
       strategistCapsule.dispatch.completion_requirements.artifact_requirements[0].must_be_nonempty,
       true,
     );
+    assert.deepEqual(strategistCapsule.outputs.expected_artifacts, strategistCapsule.dispatch.result_artifacts);
     assert.equal(Array.isArray(strategistCapsule.context_snapshot.phase_blueprints), true);
     assert.equal(strategistCapsule.context_snapshot.phase_blueprints.length, 2);
 
@@ -226,7 +286,9 @@ Define the route and auth slice with concrete boundaries, explicit proof obligat
     ]);
     assert.equal(detailerCapsule.dispatch.artifact_change_required, true);
     assert.equal(detailerCapsule.dispatch.completion_requirements.require_artifact_change, true);
+    assert.equal('completion_checks' in detailerCapsule.dispatch, false);
     assert.equal(detailerCapsule.dispatch.completion_requirements.artifact_requirements[0].must_parse_json, true);
+    assert.deepEqual(detailerCapsule.outputs.expected_artifacts, detailerCapsule.dispatch.result_artifacts);
     assert.equal(detailerCapsule.context_snapshot.phase_blueprint.id, '01');
     assert.deepEqual(detailerCapsule.context_snapshot.phase_blueprint.write_scope_allowed_files, ['scripts/smike/**']);
   } finally {

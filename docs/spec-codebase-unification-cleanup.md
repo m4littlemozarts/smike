@@ -34,7 +34,7 @@ This spec must align with the current SMIKE contract in `scripts/smike/RUNTIME_O
 Treat these as required framework rules for the planner:
 - bootstrap and reconciliation are canonical through `./smike` and `./smike cycle <project>`
 - `PLAN.json` is the machine contract; `PLAN.md` is the readable summary
-- planning output is not complete until the root bundle includes `PROJECT.*`, `PLAN.*`, `ROADMAP.md`, `STRATEGY.md`, `CHECKER.json`, `AUDITOR.json`, `STATE.json`, `PLAN-GRAPH.json`, `RESUME-CAPSULE.json`, and `RUNTIME-DELEGATION.json`
+- planning output is not complete until the root bundle includes `PROJECT.*`, `PLAN.*`, `ROADMAP.md`, `STRATEGY.md`, `CHECKER.json`, `AUDITOR.json`, `STATE.json`, `PLAN-GRAPH.json`, and `RESUME-CAPSULE.json`
 - research phases are runtime-delegated when the plan says `delegation.mode=runtime_subagents` and `delegation.owner=runtime_orchestrator`
 - the local runner writes capsules and validates artifacts; it does not pretend to spawn the real research subagents itself
 - contract changes should reopen the affected plans through normal SMIKE contract diffing; do not rely on any older special revision-mode behavior
@@ -341,7 +341,6 @@ At minimum it should produce:
 - `STATE.json`
 - `PLAN-GRAPH.json`
 - `RESUME-CAPSULE.json`
-- `RUNTIME-DELEGATION.json`
 
 Recommended decomposition:
 - Plan 01: Canonical auth/permissions model + worker truth cleanup

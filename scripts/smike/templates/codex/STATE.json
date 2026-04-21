@@ -17,7 +17,7 @@
     "last_started_at": null,
     "last_completed_at": null,
     "last_result": null,
-    "next_action": "Run `npm run smike:cycle -- <project>`"
+    "next_action": "Run `./smike cycle <project>`"
   },
   "workflow": {
     "auto_continue": true,
@@ -37,6 +37,22 @@
     "role_history": [],
     "runtime_dispatches": {
       "by_id": {}
+    },
+    "runtime_dispatch_view": {
+      "actionable_plan": null,
+      "ready_dispatches": [],
+      "dispatch_counts": {
+        "tracked": 0,
+        "ready": 0,
+        "active": 0,
+        "failed": 0,
+        "completed": 0
+      },
+      "delegation": {
+        "mode": "local_only",
+        "owner": "smike_runner",
+        "result_artifacts": []
+      }
     },
     "current_actionable_dispatch": null,
     "current_actionable_capsule": null,

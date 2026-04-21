@@ -407,6 +407,56 @@
             }
           }
         },
+        "runtime_dispatch_view": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "actionable_plan": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
+            },
+            "ready_dispatches": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "dispatch_counts": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "tracked": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "ready": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "active": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "failed": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "completed": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "delegation": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
         "current_actionable_dispatch": {
           "type": [
             "object",

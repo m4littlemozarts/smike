@@ -73,12 +73,9 @@ const SMIKE_FEEDBACK_SYNC_MODE = (() => {
   return raw === 'planning_complete' ? 'planning_complete' : 'full';
 })();
 const KNOWN_PHASE_REFRESH_MODES = new Set(['lightweight', 'auto_detailer_on_drift', 'always_detailer']);
-const RUNTIME_GUIDE_PATH = process.env.SMIKE_RUNTIME_GUIDE_PATH
-  ? path.resolve(process.env.SMIKE_RUNTIME_GUIDE_PATH)
-  : path.join(FRAMEWORK_ROOT, 'scripts', 'smike', 'RUNTIME_ORCHESTRATOR.md');
 const DEFAULT_FEEDBACK_NOTES_PROMPT =
   '- Add durable workflow follow-ups here when a SMIKE run reveals something worth keeping in repo memory.';
-const RESERVED_COMMANDS = new Set(['advance', 'cycle', 'recheck', 'doctor', 'validate', 'generate', 'activate', 'resume', 'status', 'dispatch', 'archive', 'restore', 'gc']);
+const RESERVED_COMMANDS = new Set(['advance', 'cycle', 'recheck', 'doctor', 'validate', 'generate', 'activate', 'resume', 'status', 'list', 'dispatch', 'archive', 'restore', 'gc', 'intake']);
 const DEFAULT_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SHELL_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const MANAGED_CHILD_REAP_GRACE_MS = 500;
@@ -239,6 +236,7 @@ function usage() {
   console.log(`Usage:
   smike
   smike <spec.md|spec-slug> [context.md ...]
+  smike "<freeform prompt...>" [--context=path1,path2] [--spec=memories/name.md]
   smike <project>
   smike advance [project]
   smike cycle <project> [--no-auto-continue] [--max-phases=<n>]
@@ -253,7 +251,8 @@ function usage() {
   smike generate <project>
   smike activate <project>
   smike resume [project]
-  smike status
+  smike status [project]
+  smike list
 
 Project directory must be: .smike/<project>
 Canonical machine contract: .smike/<project>/PLAN.json
@@ -271,6 +270,31 @@ function nowIso() {
 
 function normalizeRel(p) {
   return p.replaceAll('\\\\', '/').replace(/^\.\//, '').trim();
+}
+
+function compactCapsuleValue(value) {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  }
+  if (Array.isArray(value)) {
+    const compacted = value
+      .map((entry) => compactCapsuleValue(entry))
+      .filter((entry) => entry !== undefined);
+    return compacted.length > 0 ? compacted : undefined;
+  }
+  if (typeof value === 'object') {
+    const compacted = Object.fromEntries(
+      Object.entries(value)
+        .map(([key, entry]) => [key, compactCapsuleValue(entry)])
+        .filter(([, entry]) => entry !== undefined),
+    );
+    return Object.keys(compacted).length > 0 ? compacted : undefined;
+  }
+  return value;
 }
 
 function shellEscape(value) {
@@ -1191,6 +1215,44 @@ function ensureOrchestrationState(state) {
     && orchestration.current_actionable_capsule.trim()
     ? orchestration.current_actionable_capsule.trim()
     : null;
+  if (
+    !orchestration.runtime_dispatch_view
+    || typeof orchestration.runtime_dispatch_view !== 'object'
+    || Array.isArray(orchestration.runtime_dispatch_view)
+  ) {
+    orchestration.runtime_dispatch_view = {};
+  }
+  const runtimeDispatchView = orchestration.runtime_dispatch_view;
+  runtimeDispatchView.actionable_plan =
+    runtimeDispatchView.actionable_plan
+    && typeof runtimeDispatchView.actionable_plan === 'object'
+    && !Array.isArray(runtimeDispatchView.actionable_plan)
+      ? runtimeDispatchView.actionable_plan
+      : null;
+  runtimeDispatchView.ready_dispatches = ensureArray(runtimeDispatchView.ready_dispatches)
+    .filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry));
+  runtimeDispatchView.dispatch_counts =
+    runtimeDispatchView.dispatch_counts
+    && typeof runtimeDispatchView.dispatch_counts === 'object'
+    && !Array.isArray(runtimeDispatchView.dispatch_counts)
+      ? runtimeDispatchView.dispatch_counts
+      : {
+        tracked: 0,
+        ready: 0,
+        active: 0,
+        failed: 0,
+        completed: 0,
+      };
+  runtimeDispatchView.delegation =
+    runtimeDispatchView.delegation
+    && typeof runtimeDispatchView.delegation === 'object'
+    && !Array.isArray(runtimeDispatchView.delegation)
+      ? runtimeDispatchView.delegation
+      : {
+        mode: 'local_only',
+        owner: 'smike_runner',
+        result_artifacts: [],
+      };
   ensureRuntimeDispatchState(orchestration);
 
   return orchestration;
@@ -1679,8 +1741,6 @@ function getProjectPaths(project) {
     projectDir,
     inputsDir: path.join(projectDir, 'inputs'),
     capsulesDir: path.join(projectDir, 'capsules'),
-    runtimeDelegationJsonPath: path.join(projectDir, 'RUNTIME-DELEGATION.json'),
-    runtimeDelegationMdPath: path.join(projectDir, 'RUNTIME-DELEGATION.md'),
     projectMetaPath: path.join(projectDir, 'PROJECT.json'),
     projectMdPath: path.join(projectDir, 'PROJECT.md'),
     roadmapPath: path.join(projectDir, 'ROADMAP.md'),
@@ -1707,6 +1767,15 @@ function getProjectPaths(project) {
     planGraphMdPath: path.join(projectDir, 'PLAN-GRAPH.md'),
     indexJsonPath: path.join(projectDir, 'INDEX.json'),
   };
+}
+
+function removeLegacyRuntimeDelegationArtifacts(projectDir) {
+  for (const fileName of ['RUNTIME-DELEGATION.json', 'RUNTIME-DELEGATION.md']) {
+    const filePath = path.join(projectDir, fileName);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  }
 }
 
 function getArchivePaths(project) {
@@ -3469,8 +3538,8 @@ function buildAwaitingRuntimeDispatchState(project, runtimeDispatchPending) {
     status: 'awaiting_runtime_dispatch',
     stop_reason: 'awaiting_runtime_dispatch',
     next_action:
-      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} from .smike/${project}/RUNTIME-DELEGATION.json `
-      + `for ${pendingPlansText}: ${readyIds}. Mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
+      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} for ${pendingPlansText}: ${readyIds}. `
+      + `Use \`STATE.json.lifecycle.next_command\` as authority, mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
       + `then rerun \`${buildAdvanceCommand(project)}\`.`,
     next_command: buildAdvanceCommand(project),
   };
@@ -3483,8 +3552,8 @@ function buildReadyRuntimeDispatchFollowOnState(project, runtimeDispatchPending)
     status: 'in_progress',
     stop_reason: null,
     next_action:
-      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} from .smike/${project}/RUNTIME-DELEGATION.json `
-      + `for ${pendingPlansText}: ${readyIds}. Mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
+      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} for ${pendingPlansText}: ${readyIds}. `
+      + `Use \`STATE.json.lifecycle.next_command\` as authority, mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
       + 'then follow the updated `next_command`.',
     next_command: buildAdvanceCommand(project),
   };
@@ -3974,7 +4043,14 @@ function buildRoleCapsule({
     normalizedResultArtifacts,
     artifactChangeRequired === true,
   );
-  return {
+  const expectedArtifacts = normalizeStringArray(
+    outputs?.expected_artifacts && outputs.expected_artifacts.length > 0
+      ? outputs.expected_artifacts
+      : normalizedResultArtifacts.length > 0
+        ? normalizedResultArtifacts
+        : roleConfig.expected_outputs || [],
+  );
+  return compactCapsuleValue({
     schema_version: '1.0.0',
     generated_at: nowIso(),
     project,
@@ -4003,16 +4079,15 @@ function buildRoleCapsule({
       result_artifacts: normalizedResultArtifacts,
       artifact_change_required: artifactChangeRequired === true,
       completion_requirements: completionRequirements,
-      completion_checks: buildCompletionChecksFromRequirements(completionRequirements),
     },
     outputs: {
-      expected_artifacts: normalizeStringArray(outputs?.expected_artifacts || roleConfig.expected_outputs || []),
+      expected_artifacts: expectedArtifacts,
       success_conditions: normalizeStringArray(outputs?.success_conditions || []),
     },
     evidence: evidence || {},
     anti_patterns: normalizeStringArray(roleConfig.anti_patterns || []),
     next_action: nextAction || '',
-  };
+  });
 }
 
 function buildPlanningRoleResultArtifacts(project, role, planId) {
@@ -4078,10 +4153,219 @@ function buildPlanningDetailerContextSnapshot(bundle, phase) {
   };
 }
 
+function buildPlanningRoleGuidance(role, options = {}) {
+  if (role === 'strategist') {
+    return {
+      readOrder: [
+        'Read the spec first, then the refs that define truth and scope.',
+        'Extract deliverables, constraints, protected areas, and phase boundaries before sequencing work.',
+      ],
+      questions: [
+        'What must this loop deliver before implementation can be considered complete?',
+        'What phase graph keeps the work reviewable and collision-aware?',
+      ],
+      successConditions: [
+        'Strategy captures truth sources, constraints, drift seeds, and bounded phases.',
+        'Planning artifacts keep downstream roles anchored on the same spec context.',
+      ],
+      nextAction: 'Hand bounded phase blueprints to detailers.',
+    };
+  }
+
+  if (role === 'detailer') {
+    return {
+      readOrder: [
+        'Read the root planning artifacts first so this phase inherits the same objective and constraints.',
+        'Use only the refs needed for this phase and make files, checks, and dependencies explicit.',
+      ],
+      questions: [
+        `What is the smallest reviewable slice for Plan ${options.planId || 'this phase'}?`,
+        'What discoveries or dependency edges must be carried forward now?',
+      ],
+      successConditions: [
+        'Phase plan is explicit about files, verification, and boundaries.',
+        'Dependency edges and gotchas are captured now instead of rediscovered later.',
+      ],
+      nextAction: 'Hand completed phase plans to checker and auditor for cross-plan review.',
+    };
+  }
+
+  if (role === 'checker') {
+    return {
+      readOrder: [
+        'Read the phase graph before individual plans so dependency checks stay global.',
+        'Look for overlap, missing edges, and discoveries that should propagate downstream.',
+      ],
+      questions: [
+        'Do any plans overlap in scope or miss a required dependency edge?',
+        'What concrete discoveries should be propagated before execution?',
+      ],
+      successConditions: [
+        'Cross-plan mismatches and blast-radius conflicts are surfaced before execution.',
+        'Checker notes stay specific enough to help later plans instead of creating noise.',
+      ],
+      nextAction: 'Pass any concrete discoveries to the auditor and downstream phase plans.',
+    };
+  }
+
+  return {
+    readOrder: [
+      'Read the spec and required deliverables before looking at the phase plans.',
+      'Map each promised behavior or deliverable to a concrete phase before declaring coverage.',
+    ],
+    questions: [
+      'Which deliverables or promises are not yet traced to a concrete phase?',
+      'Are any coverage matches weak or based on wording instead of behavior?',
+    ],
+    successConditions: [
+      'Coverage gaps are concrete and traceable back to the spec.',
+      'Ambiguous prose stays ambiguous instead of being silently promoted to a hard requirement.',
+    ],
+    nextAction: 'If coverage is sound, hand the first execution slice to the executor.',
+  };
+}
+
+function buildExecutionRoleGuidance(role, options = {}) {
+  const hasDependencies = options.hasDependencies === true;
+
+  if (role === 'detailer') {
+    return {
+      readOrder: [
+        'Read STATE.md and the current phase contract first.',
+        'Read dependency judge/reviewer capsules and propagated discoveries before rewriting the phase plan.',
+      ],
+      questions: [
+        'What assumptions changed because upstream phases finished or discovered new constraints?',
+        'How should this phase narrow or reorder itself before execution starts?',
+      ],
+      successConditions: [
+        'The refreshed phase plan reflects upstream dependency evidence before execution starts.',
+        'The refresh stays phase-local and does not widen into a new planning loop.',
+      ],
+      nextAction: 'Hand the refreshed phase contract to the executor.',
+    };
+  }
+
+  if (role === 'executor') {
+    return {
+      readOrder: [
+        'Start with STATE.md and the current plan contract so execution is grounded on disk.',
+        'Read the same-plan detailer capsule before opening raw source files.',
+        hasDependencies
+          ? 'If dependencies exist, read only their judge/reviewer capsules and propagated discoveries before editing.'
+          : 'Touch broader source only when the plan contract or local evidence requires it.',
+      ],
+      questions: [
+        'What is the smallest change set that satisfies the objective and acceptance criteria?',
+        'Which discoveries or prior findings must be preserved while making this change?',
+        'What verification will leave enough evidence for JUDGE?',
+      ],
+      successConditions: [
+        'Implementation stays within write scope and leaves a clear verification surface for JUDGE.',
+        'Execution is honest about partial work, baseline failures, and discoveries worth propagating.',
+      ],
+      nextAction: 'Hand changed files, verification results, and discoveries to JUDGE.',
+    };
+  }
+
+  if (role === 'judge') {
+    return {
+      readOrder: [
+        'Read the current plan contract and executor capsule before opening changed files.',
+        'Rerun verify commands first; use file reads only where acceptance needs behavioral tracing.',
+      ],
+      questions: [
+        'Which acceptance criteria are proven by fresh evidence and which still need tracing?',
+        'Did the observed file changes stay inside scope and align with the objective?',
+      ],
+      successConditions: [
+        'VERDICT is based on fresh verification, explicit AC mapping, and scope enforcement.',
+        'Any failures or weak evidence are concrete enough to route into a narrow fix.',
+      ],
+      nextAction: 'Write VERDICT.md, then hand the bounded change surface to REVIEW.',
+    };
+  }
+
+  if (role === 'reviewer') {
+    return {
+      readOrder: [
+        'Read VERDICT.md and the judge capsule first so review starts from verified evidence.',
+        'Use the changed surface and focus areas to stay on correctness, drift, and interface risk.',
+      ],
+      questions: [
+        'Does the diff actually deliver the stated objective, or is there drift despite passing commands?',
+        'Are any review findings concrete enough to block completion or require a narrow fix route?',
+      ],
+      successConditions: [
+        'REVIEW focuses on correctness, invariants, and drift instead of cosmetic commentary.',
+        'Blocking concerns are narrow, actionable, and mapped to the current change surface.',
+      ],
+      nextAction: options.verdictPassed
+        ? 'Either clear the plan or route concrete review concerns into a fix capsule.'
+        : 'Route verdict failures and review concerns into a narrow fix capsule.',
+    };
+  }
+
+  return {
+    readOrder: [
+      'Read VERDICT.md and REVIEW.md first so the exact failures are clear before touching code.',
+      'Use the existing capsules and changed surface to find the narrowest repair path.',
+    ],
+    questions: [
+      'What is the smallest repair that clears the current blocking failures?',
+      'Which already-passing behaviors must remain untouched while the fix is applied?',
+    ],
+    successConditions: [
+      'Fix stays inside the current write scope and addresses only the reported blocking issues.',
+      'Repair leaves enough evidence to rerun the same JUDGE and REVIEW path cleanly.',
+    ],
+    nextAction: 'Apply a narrow fix, rerun the same plan, and keep the repair scoped to the reported issues.',
+  };
+}
+
+function buildRuntimeFollowOnRoleGuidance(role, planId) {
+  if (role === 'judge') {
+    return {
+      objective: `Independently verify the runtime-owned findings for ${planId}.`,
+      readOrder: [
+        'Read STATE.md, the current plan contract, and the same-plan executor capsule first.',
+        'Treat the findings artifacts as claims to verify, not proof.',
+      ],
+      questions: [
+        'Do the current result artifacts satisfy the declared outputs and acceptance criteria?',
+        'What gaps, drift, or scope issues should be surfaced before review proceeds?',
+      ],
+      successConditions: [
+        'Judge context stays phase-matched and anchored on the live result artifacts.',
+        'The findings are verified without relying on stale capsules from an earlier phase.',
+      ],
+      nextAction: 'If the findings hold up, hand the same phase surface to REVIEW.',
+    };
+  }
+
+  return {
+    objective: `Review runtime-owned findings for ${planId} for drift, correctness, and follow-on risk.`,
+    readOrder: [
+      'Read STATE.md, the current plan contract, and the same-plan judge capsule first.',
+      'Use the result artifacts and same-plan executor context as the primary review surface.',
+    ],
+    questions: [
+      'Do the findings materially support the intended follow-on work, or are there gaps or drift?',
+      'Should this phase be treated as complete, or is a narrower follow-up still required?',
+    ],
+    successConditions: [
+      'Reviewer context stays anchored on the same phase artifacts and fresh same-plan judge/executor capsules.',
+      'The review can reason about drift without reusing stale review context from an earlier phase.',
+    ],
+    nextAction: 'If no blocking concerns remain, allow reconciliation to close the phase.',
+  };
+}
+
 function buildExecutionDetailerRefreshCapsule(project, contract, state, cycleNumber) {
   const orchestrationConfig = resolveOrchestrationConfig(project, contract.plan);
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
   const refreshSignals = collectPhaseRefreshSignals(state, contract);
+  const guidance = buildExecutionRoleGuidance('detailer');
 
   return buildRoleCapsule({
     project,
@@ -4104,16 +4388,8 @@ function buildExecutionDetailerRefreshCapsule(project, contract, state, cycleNum
       contract.plan.spec,
       ...collectCapsulePathsForPlan(state, contract.plan.plan_id, ['detailer']),
     ],
-    readOrder: [
-      'Read STATE.md and the current phase contract first.',
-      'Read dependency judge/reviewer capsules and propagated discoveries before changing the phase plan.',
-      'Refresh only this phase contract; do not widen into a whole-project replanning pass.',
-    ],
-    questions: [
-      'What assumptions in this phase changed because upstream phases finished or discovered new constraints?',
-      'How should this phase contract narrow or reorder itself before execution starts?',
-      'What stays explicitly deferred to later phases even after this refresh?',
-    ],
+    readOrder: guidance.readOrder,
+    questions: guidance.questions,
     boundaries: {
       allowed_files: [contract.plan_json_rel],
       blocked_files: contract.plan.blocked_files,
@@ -4121,10 +4397,7 @@ function buildExecutionDetailerRefreshCapsule(project, contract, state, cycleNum
     },
     outputs: {
       expected_artifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
-      success_conditions: [
-        'The refreshed phase plan reflects upstream dependency evidence before execution starts.',
-        'The refresh remains phase-local and does not silently widen into a new planning loop.',
-      ],
+      success_conditions: guidance.successConditions,
     },
     resultArtifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
     artifactChangeRequired: true,
@@ -4133,7 +4406,7 @@ function buildExecutionDetailerRefreshCapsule(project, contract, state, cycleNum
       dependency_discoveries: collectDependencyDiscoveries(state, dependencyIds, contract.plan.plan_id),
       refresh_signals: refreshSignals,
     },
-    nextAction: 'Hand the refreshed phase contract to the executor.',
+    nextAction: guidance.nextAction,
   });
 }
 
@@ -4144,6 +4417,7 @@ function buildExecutorCapsule(project, contract, state, cycleNumber, delegationO
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
   const dependencyDiscoveries = collectDependencyDiscoveries(state, dependencyIds, contract.plan.plan_id);
   const downstreamPlanIds = findDownstreamPlanIds(state.workflow?.plans, contract.plan.plan_id);
+  const guidance = buildExecutionRoleGuidance('executor', { hasDependencies: dependencyIds.length > 0 });
 
   return buildRoleCapsule({
     project,
@@ -4166,18 +4440,8 @@ function buildExecutorCapsule(project, contract, state, cycleNumber, delegationO
       ...collectLatestCapsulePaths(state, ['strategist', 'checker', 'auditor']),
       ...limitCapsuleRefs(roleConfig.additional_context, ADDITIONAL_CONTEXT_LIMIT),
     ],
-    readOrder: [
-      'Start with STATE.md and the current plan contract so execution is grounded on disk, not prior memory.',
-      'Read the same-plan detailer capsule before expanding to raw source files.',
-      'If dependencies exist, treat this as a phase refresh: read only their judge/reviewer capsules and propagated discoveries first, then inspect code in the declared write scope.',
-      'Touch broader source only when the plan or dependency discoveries force it.',
-    ],
-    questions: [
-      'What is the smallest code change set that satisfies the objective and acceptance criteria?',
-      'Which dependency discoveries or prior findings must be preserved while making this change?',
-      'Has any upstream result changed the practical shape of this phase enough to require narrowing or re-sequencing before edits start?',
-      'What verification commands and behavioral checks will leave enough evidence for JUDGE?',
-    ],
+    readOrder: guidance.readOrder,
+    questions: guidance.questions,
     boundaries: {
       allowed_files: contract.plan.write_scope?.allowed_files || contract.plan.allowed_files,
       blocked_files: contract.plan.write_scope?.blocked_files || contract.plan.blocked_files,
@@ -4185,11 +4449,7 @@ function buildExecutorCapsule(project, contract, state, cycleNumber, delegationO
     },
     outputs: {
       expected_artifacts: delegation.result_artifacts,
-      success_conditions: [
-        'Implementation stays within write scope and leaves a clear verification surface for JUDGE.',
-        'Executor refreshes against upstream dependency evidence before editing instead of relying only on the original planning snapshot.',
-        'Execution summary is honest about partial work, baseline failures, and any discoveries worth propagating.',
-      ],
+      success_conditions: guidance.successConditions,
     },
     resultArtifacts: delegation.result_artifacts,
     artifactChangeRequired: true,
@@ -4205,7 +4465,7 @@ function buildExecutorCapsule(project, contract, state, cycleNumber, delegationO
       },
       write_scope: contract.plan.write_scope,
     },
-    nextAction: 'Hand changed files, verification results, and any discoveries to JUDGE.',
+    nextAction: guidance.nextAction,
   });
 }
 
@@ -4213,6 +4473,7 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
   const orchestrationConfig = resolveOrchestrationConfig(project, contract.plan);
   const roleConfig = orchestrationConfig.roles.judge;
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
+  const guidance = buildExecutionRoleGuidance('judge');
 
   return buildRoleCapsule({
     project,
@@ -4234,16 +4495,8 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
       ...collectDependencyCapsulePaths(state, dependencyIds, ['judge', 'reviewer']),
       ...limitCapsuleRefs(roleConfig.additional_context, ADDITIONAL_CONTEXT_LIMIT),
     ],
-    readOrder: [
-      'Read the current plan contract and executor capsule before opening changed files.',
-      'Rerun the plan verify commands first; use file reads only where ACs need behavioral tracing.',
-      'Treat the executor summary as a lead, not proof. Independent evidence must come from your own reruns or code inspection.',
-    ],
-    questions: [
-      'Which acceptance criteria are actually proven by fresh command output, and which still need code-level tracing?',
-      'Did the observed file changes stay inside scope and align with the plan objective?',
-      'Were any baseline failures or weak signals hidden behind a nominal PASS?',
-    ],
+    readOrder: guidance.readOrder,
+    questions: guidance.questions,
     boundaries: {
       allowed_files: uniqueStrings([
         ...ensureArray(contract.plan.allowed_files),
@@ -4253,10 +4506,7 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
       reason: 'Judge verifies the declared plan scope plus the observed changed surface so execution drift stays inspectable.',
     },
     outputs: {
-      success_conditions: [
-        'VERDICT is based on fresh verification, explicit AC mapping, and scope enforcement.',
-        'Any failures or weak evidence are concrete enough to route directly into a narrow fix.',
-      ],
+      success_conditions: guidance.successConditions,
     },
     resultArtifacts: [
       path.relative(REPO_ROOT, paths.verdictReportPath).replaceAll(path.sep, '/'),
@@ -4277,7 +4527,7 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
       })),
       dependency_discoveries: collectDependencyDiscoveries(state, dependencyIds),
     },
-    nextAction: 'Write VERDICT.md, then hand the bounded change surface to REVIEW.',
+    nextAction: guidance.nextAction,
   });
 }
 
@@ -4286,6 +4536,7 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
   const roleConfig = orchestrationConfig.roles.reviewer;
   const qualityConfig = getQualityGateConfig(contract.plan);
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
+  const guidance = buildExecutionRoleGuidance('reviewer', { verdictPassed: verdictRecord.result === 'pass' });
 
   return buildRoleCapsule({
     project,
@@ -4307,16 +4558,8 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
       ...collectDependencyCapsulePaths(state, dependencyIds, ['reviewer']),
       ...limitCapsuleRefs(roleConfig.additional_context, ADDITIONAL_CONTEXT_LIMIT),
     ],
-    readOrder: [
-      'Read VERDICT.md and the judge capsule first so review starts from independently verified evidence.',
-      'Use evidence.changed_paths from this capsule to read only the changed files and any adjacent invariant-bearing files needed for correctness review.',
-      'Use focus areas and anti-pattern watch to stay on bugs, drift, and interface risk instead of style.',
-    ],
-    questions: [
-      'Does the diff actually deliver the stated objective, or is there drift despite passing commands?',
-      'Which invariants or interfaces remain weakly covered even after JUDGE passed?',
-      'Are any review findings concrete enough to block completion or require a narrow fix route?',
-    ],
+    readOrder: guidance.readOrder,
+    questions: guidance.questions,
     boundaries: {
       allowed_files: uniqueStrings([
         ...ensureArray(cycleRecord.scope?.changed_paths),
@@ -4328,10 +4571,7 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
       reason: 'Reviewer stays on the current diff and adjacent invariant checks; no broad repo tour.',
     },
     outputs: {
-      success_conditions: [
-        'REVIEW focuses on correctness, invariants, and drift instead of cosmetic commentary.',
-        'Blocking concerns are narrow, actionable, and mapped to the current change surface.',
-      ],
+      success_conditions: guidance.successConditions,
     },
     resultArtifacts: [
       path.relative(REPO_ROOT, paths.reviewReportPath).replaceAll(path.sep, '/'),
@@ -4344,9 +4584,7 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
       changed_paths: ensureArray(cycleRecord.scope?.changed_paths),
       dependency_discoveries: collectDependencyDiscoveries(state, dependencyIds),
     },
-    nextAction: verdictRecord.result === 'pass'
-      ? 'Either clear the plan or route concrete review concerns into a fix capsule.'
-      : 'Route verdict failures and review concerns into a narrow fix capsule.',
+    nextAction: guidance.nextAction,
   });
 }
 
@@ -4357,43 +4595,7 @@ function buildRuntimeFollowOnCapsule(project, contract, state, role, cycleNumber
   const normalizedArtifacts = normalizePathList(resultArtifacts);
   const samePlanRoles = role === 'judge' ? ['executor'] : ['judge', 'executor'];
   const dependencyRoles = role === 'reviewer' ? ['reviewer'] : ['judge', 'reviewer'];
-  const roleSpecific = role === 'judge'
-    ? {
-        objective: `Independently verify runtime-owned findings for ${contract.plan.plan_id}.`,
-        readOrder: [
-          'Read STATE.md and the current plan contract first so judgment stays grounded in the live dispatch state.',
-          'Read the same-plan executor capsule and the declared result artifacts before widening to dependency context.',
-          'Treat the findings artifacts as claims to verify, not proof. Fresh command reruns or direct file inspection should drive the judgment.',
-        ],
-        questions: [
-          'Do the current result artifacts satisfy the declared outputs and acceptance criteria for this phase?',
-          'What evidence in the findings artifacts or rerun commands proves the phase objective was actually met?',
-          'What gaps, drift, or scope issues should the runtime surface before review proceeds?',
-        ],
-        successConditions: [
-          'Judge context is phase-matched and points at the same-plan executor output plus the live result artifacts.',
-          'The judge can verify the findings without relying on stale capsules from an earlier phase.',
-        ],
-        nextAction: 'If the findings hold up, hand the same phase surface to REVIEW.',
-      }
-    : {
-        objective: `Review runtime-owned findings for ${contract.plan.plan_id} for drift, correctness, and follow-on risk.`,
-        readOrder: [
-          'Read STATE.md, the current plan contract, and the same-plan judge capsule first.',
-          'Use the result artifacts and same-plan executor context as the primary review surface.',
-          'Stay focused on correctness, drift, and missing evidence rather than style or repo-wide exploration.',
-        ],
-        questions: [
-          'Do the findings materially support the intended follow-on implementation work, or are there gaps or drift?',
-          'Are any invariants, interfaces, or documented claims still weakly evidenced after the judge pass?',
-          'Should this phase be treated as complete, or is a narrower follow-up still required?',
-        ],
-        successConditions: [
-          'Reviewer context stays anchored on the same phase artifacts and fresh same-plan judge/executor capsules.',
-          'The review can reason about drift without reusing stale review context from an earlier phase.',
-        ],
-        nextAction: 'If no blocking concerns remain, allow reconciliation to close the phase.',
-      };
+  const roleSpecific = buildRuntimeFollowOnRoleGuidance(role, contract.plan.plan_id);
 
   return buildRoleCapsule({
     project,
@@ -4456,6 +4658,7 @@ function buildFixerCapsule(project, paths, contract, state, cycleRecord, verdict
     ...ensureArray(verdictRecord.failures).map((value) => `judge.${value}`),
     ...blockingFindings,
   ]);
+  const guidance = buildExecutionRoleGuidance('fixer');
 
   return buildRoleCapsule({
     project,
@@ -4474,26 +4677,15 @@ function buildFixerCapsule(project, paths, contract, state, cycleRecord, verdict
       ...collectCapsulePathsForPlan(state, contract.plan.plan_id, ['executor', 'judge', 'reviewer']),
     ],
     additionalPaths: [...limitCapsuleRefs(roleConfig.additional_context, ADDITIONAL_CONTEXT_LIMIT)],
-    readOrder: [
-      'Read VERDICT.md and REVIEW.md first. Do not reopen the entire plan or codebase before you know the exact failures.',
-      'Use the role capsules to identify the narrowest fix path before touching source.',
-      'Use evidence.changed_paths to read only the implicated files from the changed surface unless the failure explicitly proves wider scope is required.',
-    ],
-    questions: [
-      'What is the narrowest repair that clears the current blocking failures?',
-      'Which already-passing behaviors must remain untouched while the fix is applied?',
-      'Can the failure be resolved inside the existing write scope, or does the contract need to be tightened first?',
-    ],
+    readOrder: guidance.readOrder,
+    questions: guidance.questions,
     boundaries: {
       allowed_files: contract.plan.write_scope?.allowed_files || contract.plan.allowed_files,
       blocked_files: contract.plan.write_scope?.blocked_files || contract.plan.blocked_files,
       reason: 'Fix scope is narrower than execution scope: only repair the reported failures.',
     },
     outputs: {
-      success_conditions: [
-        'Fix stays inside the current write scope and addresses only the reported blocking issues.',
-        'Repair leaves enough evidence to rerun the same JUDGE and REVIEW path cleanly.',
-      ],
+      success_conditions: guidance.successConditions,
     },
     resultArtifacts: delegation.result_artifacts,
     artifactChangeRequired: true,
@@ -4508,7 +4700,7 @@ function buildFixerCapsule(project, paths, contract, state, cycleRecord, verdict
         title: finding.title,
       })),
     },
-    nextAction: 'Apply a narrow fix, rerun the same plan, and keep the repair scoped to the reported issues.',
+    nextAction: guidance.nextAction,
   });
 }
 
@@ -4617,14 +4809,18 @@ function findPathCandidates(inputPath) {
   return repoFiles.filter((file) => path.posix.basename(file.relative) === inputBaseName);
 }
 
-function resolveExistingPath(inputPath) {
+function tryResolveExistingPath(inputPath) {
   const absolute = path.resolve(REPO_ROOT, inputPath);
   if (!isPathInside(REPO_ROOT, absolute)) {
-    fail(`path must stay inside repository: ${inputPath}`);
+    return {
+      status: 'outside_repo',
+      inputPath,
+    };
   }
 
   if (fs.existsSync(absolute)) {
     return {
+      status: 'ok',
       absolute,
       relative: path.relative(REPO_ROOT, absolute).replaceAll(path.sep, '/'),
     };
@@ -4632,12 +4828,36 @@ function resolveExistingPath(inputPath) {
 
   const candidates = findPathCandidates(inputPath);
   if (candidates.length === 1) {
-    return candidates[0];
+    return {
+      status: 'ok',
+      ...candidates[0],
+    };
   }
   if (candidates.length > 1) {
-    fail(`path is ambiguous: ${inputPath}\n- ${candidates.map((candidate) => candidate.relative).join('\n- ')}`);
+    return {
+      status: 'ambiguous',
+      inputPath,
+      candidates,
+    };
   }
 
+  return {
+    status: 'missing',
+    inputPath,
+  };
+}
+
+function resolveExistingPath(inputPath) {
+  const resolution = tryResolveExistingPath(inputPath);
+  if (resolution.status === 'ok') {
+    return resolution;
+  }
+  if (resolution.status === 'outside_repo') {
+    fail(`path must stay inside repository: ${inputPath}`);
+  }
+  if (resolution.status === 'ambiguous') {
+    fail(`path is ambiguous: ${inputPath}\n- ${resolution.candidates.map((candidate) => candidate.relative).join('\n- ')}`);
+  }
   fail(`path not found: ${inputPath}`);
 }
 
@@ -4646,6 +4866,203 @@ function resolvePathList(inputPaths) {
     absolute: resolved.absolute,
     relative: normalizeRel(resolved.relative),
   }));
+}
+
+function buildDefaultIntakeSpecRel(promptText) {
+  const base = safeSlug(promptText).slice(0, 72) || 'smike-intake';
+  let candidate = normalizeRel(path.posix.join('memories', `${base}.md`));
+  let counter = 2;
+  while (fs.existsSync(path.join(REPO_ROOT, candidate))) {
+    candidate = normalizeRel(path.posix.join('memories', `${base}-${counter}.md`));
+    counter += 1;
+  }
+  return candidate;
+}
+
+function resolvePlannedPath(inputPath, surface = 'path') {
+  const normalized = normalizeRel(String(inputPath || ''));
+  if (!normalized) {
+    fail(`${surface} is required`);
+  }
+
+  const absolute = path.resolve(REPO_ROOT, normalized);
+  if (!isPathInside(REPO_ROOT, absolute)) {
+    fail(`${surface} must stay inside repository: ${inputPath}`);
+  }
+
+  return {
+    absolute,
+    relative: normalizeRel(path.relative(REPO_ROOT, absolute).replaceAll(path.sep, '/')),
+  };
+}
+
+function resolveIntakeSpecTarget(specPath, promptText) {
+  if (!specPath) {
+    return resolvePlannedPath(buildDefaultIntakeSpecRel(promptText), 'intake spec path');
+  }
+
+  const resolved = resolvePlannedPath(specPath, 'intake spec path');
+  if (!resolved.relative.endsWith('.md')) {
+    fail(`intake spec path must end in .md: ${specPath}`);
+  }
+  if (fs.existsSync(resolved.absolute)) {
+    fail(`intake spec already exists: ${resolved.relative}`);
+  }
+  return resolved;
+}
+
+function extractContextFlagPaths(flagValue) {
+  return String(flagValue || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function parseIntakeArgs(rawArgs) {
+  const promptParts = [];
+  const contextInputs = [];
+  let specPath = null;
+
+  for (const arg of ensureArray(rawArgs)) {
+    if (!String(arg).startsWith('--')) {
+      if (specPath || contextInputs.length > 0) {
+        fail('intake prompt text must come before flags');
+      }
+      promptParts.push(arg);
+      continue;
+    }
+
+    if (arg.startsWith('--context=')) {
+      contextInputs.push(...extractContextFlagPaths(arg.slice('--context='.length)));
+      continue;
+    }
+    if (arg.startsWith('--spec=')) {
+      if (specPath) {
+        fail('intake accepts only one --spec flag');
+      }
+      specPath = arg.slice('--spec='.length).trim();
+      continue;
+    }
+    fail(`unknown intake flag: ${arg}`);
+  }
+
+  const promptText = promptParts.join(' ').trim().replace(/\s+/g, ' ');
+  if (!promptText) {
+    fail('intake prompt text is required');
+  }
+
+  return {
+    promptText,
+    specPath,
+    contextFiles: normalizePathList(
+      contextInputs.map((contextPath) => resolveExistingPath(contextPath).relative),
+    ),
+  };
+}
+
+function argsIncludeIntakeFlags(args) {
+  return ensureArray(args).some((arg) => {
+    const value = String(arg || '');
+    return value.startsWith('--context=') || value.startsWith('--spec=');
+  });
+}
+
+function shouldRouteArgsToIntake(args) {
+  const normalizedArgs = ensureArray(args).map((arg) => String(arg));
+  if (normalizedArgs.length === 0) {
+    return false;
+  }
+  if (argsIncludeIntakeFlags(normalizedArgs)) {
+    return true;
+  }
+
+  const promptParts = normalizedArgs.filter((arg) => !arg.startsWith('--'));
+  if (promptParts.length === 0) {
+    return false;
+  }
+
+  if (promptParts.length > 1) {
+    return !promptParts.every((arg) => tryResolveExistingPath(arg).status === 'ok');
+  }
+
+  const [singleArg] = promptParts;
+  if (!/\s/.test(singleArg)) {
+    return false;
+  }
+  if (resolveSpecShortcut(singleArg) || resolveProjectSelector(singleArg)) {
+    return false;
+  }
+  return true;
+}
+
+function promptToSpecTitle(promptText) {
+  const trimmed = String(promptText || '').trim().replace(/\s+/g, ' ');
+  if (!trimmed) {
+    return 'SMIKE Intake Draft';
+  }
+  const sentence = trimmed.replace(/[.?!]+$/g, '');
+  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
+}
+
+function buildIntakeSpecMarkdown(promptText, contextFiles = []) {
+  const title = promptToSpecTitle(promptText);
+  const refLines = contextFiles.length > 0
+    ? contextFiles.map((ref) => `> - ${ref}`)
+    : ['> - Add canonical repo paths here before promoting out of planning_draft.'];
+  const plannerReadLines = contextFiles.length > 0
+    ? contextFiles.map((ref, index) => `${index + 1}. ${ref}`)
+    : ['Add repo docs, routes, packages, tests, or design references here before promotion.'];
+  const promptSentence = promptText.endsWith('.') ? promptText : `${promptText}.`;
+
+  return [
+    `# ${title}`,
+    '',
+    '> **SMIKE intake draft.**',
+    '> Generated from a short prompt so the onboarding planner can expand it into a real spec.',
+    '> Refine this file during `planning_draft`; SMIKE will rebuild `.smike/**` from it on the next cycle.',
+    '> Primary refs:',
+    ...refLines,
+    '',
+    '## Intake Prompt',
+    promptSentence,
+    '',
+    '## Objective',
+    `Expand the short intake prompt into a concrete, reviewable implementation plan for ${promptText}.`,
+    '',
+    '## What The Planner Must Read First',
+    ...plannerReadLines,
+    '',
+    '## Required Deliverable From This Loop',
+    '1. A bounded implementation plan that turns the intake prompt into reviewable execution slices.',
+    '2. Clarified assumptions, constraints, and truth sources needed before execution begins.',
+    '3. Phase-specific verification commands once the implementation surface is concrete.',
+    '',
+    '## Required Planning Output Shape',
+    '- Plan 01: Scope and truth-source intake (category:general)',
+    '- Plan 02: First executable slice (depends:01; category:general)',
+    '- Plan 03: Follow-on slice and verification (depends:02; category:verification)',
+    '',
+    '## Priority 1: Scope and truth-source intake',
+    'Turn the short prompt into a concrete problem statement, capture the repo truth sources, and answer the open questions before promotion.',
+    '',
+    '## Priority 2: First executable slice',
+    'Define the first bounded implementation slice once the target files, interfaces, and constraints are concrete.',
+    '',
+    '## Priority 3: Follow-on slice and verification',
+    'Define the remaining implementation work and add phase-specific verification commands for each code-bearing slice.',
+    '',
+    '## Clarifying Questions',
+    '- What user-visible behavior should exist when this feature is done?',
+    '- Which files, packages, routes, screens, or APIs are most likely in scope?',
+    '- What existing docs, tests, or implementation references should the planner treat as truth?',
+    '- What is explicitly out of scope for this loop?',
+    '- How should the finished work be verified?',
+    '',
+    '## Notes From Intake',
+    `- Raw prompt: ${promptText}`,
+    '- Replace generic phase titles, summaries, and verification with concrete repo-aware details before promotion.',
+    '',
+  ].join('\n');
 }
 
 function resolveSpecShortcut(input) {
@@ -5316,7 +5733,7 @@ function buildPlanningBundleCheckCommand(project, phaseIds, planningAnalysis = {
     `.smike/${project}/ROADMAP.md`,
     `.smike/${project}/STRATEGY.md`,
     `.smike/${project}/PLAN-GRAPH.json`,
-    `.smike/${project}/RUNTIME-DELEGATION.json`,
+    `.smike/${project}/STATE.json`,
     ...phaseIds.map((phaseId) => `.smike/${project}/phases/${phaseId}/${phaseId}-PLAN.json`),
   ];
   if (planningAnalysis.checker_enabled) {
@@ -5716,6 +6133,10 @@ function buildPlanningBundle(project, specRel, contextFiles) {
   const specText = fs.readFileSync(specPath, 'utf8');
   const sections = parseMarkdownSections(specText);
   const mode = inferPlanningMode(specText);
+  const intakePrompt = summarizeSection(
+    sectionText(findSection(sections, /^Intake Prompt$/i)),
+    '',
+  );
   const objective = summarizeSection(
     sectionText(findSection(sections, /^Objective$/i)),
     `Implement ${project}.`,
@@ -5742,6 +6163,7 @@ function buildPlanningBundle(project, specRel, contextFiles) {
   const firstPhaseContractSection = findFirstPhaseContractSection(sections);
   const firstPhaseContractText = sectionText(firstPhaseContractSection);
   const firstPhaseContractItems = extractListItems(firstPhaseContractText);
+  const clarifyingQuestions = extractListItems(sectionText(findSection(sections, /^Clarifying Questions$/i)));
   const explicitDeferrals = extractListItems(sectionText(findSection(sections, /^Explicit Deferrals$/i)));
   const unresolvedRefTokens = uniqueStrings(String(specText || '').match(/@ref[^\s`)]*/g) || []);
   const explicitDependenciesDeclared = extractedPhases.some((phase) => ensureArray(phase.declared_depends_on).length > 0);
@@ -5770,6 +6192,7 @@ function buildPlanningBundle(project, specRel, contextFiles) {
 
   return {
     title: extractMarkdownTitle(specText, project),
+    intake_prompt: intakePrompt,
     objective,
     mode,
     primary_refs: primaryRefs,
@@ -5786,6 +6209,7 @@ function buildPlanningBundle(project, specRel, contextFiles) {
     recommended_first_phase_summary: summarizeSection(firstPhaseContractText, ''),
     recommended_first_phase_items: firstPhaseContractItems,
     explicit_deferrals: explicitDeferrals,
+    clarifying_questions: clarifyingQuestions,
     protected_areas: extractListItems(sectionText(findSection(sections, /^Protected \/ High-Collision Areas$/i))),
     drift_seeds: extractListItems(sectionText(findSection(sections, /^Known Current Drift Seeds$/i))),
     lint,
@@ -5798,9 +6222,17 @@ function buildPlanningBundle(project, specRel, contextFiles) {
   };
 }
 
-function buildPlanningDraftNextAction(project, promotionCheck) {
+function buildPlanningDraftNextAction(project, promotionCheck, bundle = null) {
   const blockerText = promotionCheck.blockers.slice(0, 6).join('; ');
-  const suffix = blockerText ? ` Missing before promotion: ${blockerText}.` : '';
+  const questionText = ensureArray(bundle?.clarifying_questions).slice(0, 2).join(' / ');
+  const suffixBits = [];
+  if (questionText) {
+    suffixBits.push(`Answer onboarding questions: ${questionText}.`);
+  }
+  if (blockerText) {
+    suffixBits.push(`Missing before promotion: ${blockerText}.`);
+  }
+  const suffix = suffixBits.length > 0 ? ` ${suffixBits.join(' ')}` : '';
   return `Refine the spec-driven planning draft for ${project} (update the spec, not \`.smike/**\`), then rerun \`${buildCycleCommand(project)}\`.${suffix}`;
 }
 
@@ -5818,27 +6250,32 @@ function renderProjectMarkdown(project, specRel, contextFiles, bundle) {
   const lines = [
     `# ${project}`,
     '',
-    '## What',
     bundle.objective,
     '',
-    '## Profile',
+    '## Snapshot',
     `- Project: ${project}`,
     `- Spec: ${specRel}`,
     `- Mode: ${bundle.mode}`,
-    `- Created: ${nowIso()}`,
+    `- Resume: ./smike`,
   ];
 
   if (contextFiles.length > 0) {
-    lines.push('- Context files:');
-    for (const filePath of contextFiles) {
-      lines.push(`  - ${filePath}`);
+    lines.push(`- Context: ${contextFiles.join(', ')}`);
+  }
+
+  if (bundle.intake_prompt) {
+    lines.push('');
+    lines.push('## Intake');
+    lines.push(`- Prompt: ${bundle.intake_prompt}`);
+    if (bundle.clarifying_questions.length === 0) {
+      lines.push('- Clarifying questions: none captured');
+    } else {
+      bundle.clarifying_questions.forEach((question) => lines.push(`- ${question}`));
     }
-  } else {
-    lines.push('- Context files: none');
   }
 
   lines.push('');
-  lines.push('## Primary Refs');
+  lines.push('## Refs');
   if (bundle.primary_refs.length === 0) {
     lines.push('- none captured from spec');
   } else {
@@ -5846,17 +6283,12 @@ function renderProjectMarkdown(project, specRel, contextFiles, bundle) {
   }
 
   lines.push('');
-  lines.push('## Active Requirements');
+  lines.push('## Deliverables');
   if (bundle.deliverables.length === 0) {
-    lines.push('1. Produce a bounded implementation graph from the spec.');
+    lines.push('- produce a bounded implementation graph from the spec');
   } else {
-    bundle.deliverables.forEach((deliverable, index) => lines.push(`${index + 1}. ${deliverable}`));
+    bundle.deliverables.forEach((deliverable) => lines.push(`- ${deliverable}`));
   }
-
-  lines.push('');
-  lines.push('## Resume');
-  lines.push('- Run `./smike` to continue the active project.');
-  lines.push('');
 
   return `${lines.join('\n')}\n`;
 }
@@ -5886,59 +6318,59 @@ function renderStateMarkdown(project, specRel, state) {
     ? `${actionableDispatch.dispatch_id} (${actionableDispatch.role} / ${actionableDispatch.status}${actionableDispatch.freshness ? ` / ${actionableDispatch.freshness}` : ''})`
     : 'none';
   const actionableCapsule = orchestration.current_actionable_capsule || 'none';
+  const planningBlockers = planningAnalysis.blocking_findings.slice(0, 3);
+  const planningPrompt = typeof state.planning?.intake_prompt === 'string' ? state.planning.intake_prompt.trim() : '';
+  const planningQuestions = ensureArray(state.planning?.clarifying_questions).slice(0, 5);
+  const recentDiscoveries = propagatedDiscoveries.slice(-5);
+  const operatorGuidance = getOperatorGuidanceLines(project, state);
 
   return [
     '# SMIKE State',
     '',
     '## Authority',
     `Canonical state: .smike/${project}/STATE.json`,
-    `Derived views: .smike/${project}/RUNTIME-DELEGATION.json, .smike/${project}/IMPLEMENTATION-HANDOFF.json, .smike/${project}/PLANNING-HANDOFF.md`,
+    'Canonical operator handoff: this file (`STATE.md`)',
+    `Supporting views: .smike/${project}/IMPLEMENTATION-HANDOFF.json, .smike/${project}/PLANNING-HANDOFF.md`,
     '',
-    '## Project',
-    `Name: ${project}`,
+    '## Resume',
+    `Project: ${project}`,
     `Spec: ${specRel}`,
-    `spec_hash: ${state.planning?.spec_hash || '(unknown)'}`,
-    '',
-    '## Position',
     `Plan: ${graphSummary}`,
     `Current: ${state.current_plan?.plan_id || 'none'}`,
     `Status: ${state.lifecycle.status}`,
-    '',
-    '## Resume',
     `Next: ${state.lifecycle.next_action}`,
     `Next command: ${getLifecycleNextCommand(state) || 'none'}`,
     ...(state.lifecycle.stop_reason ? [`Stop reason: ${state.lifecycle.stop_reason}`] : []),
-    ...(planningAnalysis.blocking_findings.length > 0
-      ? [`Planning blockers: ${planningAnalysis.blocking_findings.length}`]
-      : []),
+    `spec_hash: ${state.planning?.spec_hash || '(unknown)'}`,
     ...getPlanningDraftNoticeLines(state),
+    '',
+    '## Operator',
+    'Read this file first in a fresh Codex session.',
+    ...operatorGuidance.map((line) => `- ${line}`),
     '',
     '## Planning Analysis',
     `Checker: ${planningAnalysis.checker?.result || 'not-generated'}`,
     `Auditor: ${planningAnalysis.auditor?.result || 'not-generated'}`,
     `Artifacts fresh: ${planningFreshness.stale ? `no (${planningFreshness.reason})` : 'yes'}`,
-    ...(planningAnalysis.blocking_findings.length > 0
-      ? planningAnalysis.blocking_findings.slice(0, 5).map((finding) => `- ${finding.source}:${finding.id} ${finding.title}`)
+    ...(planningBlockers.length > 0
+      ? planningBlockers.map((finding) => `- ${finding.source}:${finding.id} ${finding.title}`)
       : ['- none']),
+    ...(planningPrompt
+      ? [
+          '',
+          '## Planning Intake',
+          `Prompt: ${planningPrompt}`,
+          ...(planningQuestions.length > 0
+            ? planningQuestions.map((question) => `- ${question}`)
+            : ['- no clarifying questions captured']),
+        ]
+      : []),
     '',
-    '## Loop Position',
+    '## Actionable Surface',
     `Stage: ${orchestration.stage}`,
-    `Active role: ${orchestration.active_role || 'none'}`,
-    `Last role: ${orchestration.last_role || 'none'}`,
-    `Next role: ${orchestration.next_role || 'none'}`,
-    '',
-    '## Delegation',
     `Mode: ${delegation.mode}`,
     `Owner: ${delegation.owner}`,
     `Actionable plan: ${actionable.plan_id || 'none'}`,
-    `Actionable plan ids: ${dispatchSummary.plan_ids}`,
-    `Dispatch group: ${dispatchSummary.group}`,
-    `Completable group: ${currentCompletableRuntimeDispatchGroup(runtimeContext)}`,
-    `Dispatch surface: .smike/${project}/RUNTIME-DELEGATION.json`,
-    `Ready dispatches: ${readyDispatches.length}`,
-    `Tracked dispatches: ${currentDispatches.length}`,
-    '',
-    '## Actionable Surface',
     `Dispatch: ${actionableDispatchSummary}`,
     `Capsule: ${actionableCapsule}`,
     `Command: ${getLifecycleNextCommand(state) || 'none'}`,
@@ -5946,6 +6378,11 @@ function renderStateMarkdown(project, specRel, state) {
     `Planning handoff: .smike/${project}/PLANNING-HANDOFF.md`,
     '',
     '## Runtime Dispatches',
+    `Dispatch group: ${dispatchSummary.group}`,
+    `Completable group: ${currentCompletableRuntimeDispatchGroup(runtimeContext)}`,
+    `Actionable plan ids: ${dispatchSummary.plan_ids}`,
+    `Ready dispatches: ${readyDispatches.length}`,
+    `Tracked dispatches: ${currentDispatches.length}`,
     ...(currentDispatches.length > 0
       ? currentDispatches.map((entry) => {
           const freshness = entry.freshness?.status || 'pending';
@@ -5953,24 +6390,20 @@ function renderStateMarkdown(project, specRel, state) {
         })
       : ['- none']),
     '',
-    '## Latest Capsules',
+    '## Notes',
     ...(latestCapsules.length > 0
-      ? latestCapsules.map(([role, capsulePath]) => `- ${role}: ${capsulePath}`)
-      : ['- none']),
-    '',
-    '## Gotchas',
+      ? [`Latest capsules: ${latestCapsules.map(([role]) => role).join(', ')}`]
+      : ['Latest capsules: none']),
     ...(ensureArray(state.gotchas).length > 0
-      ? ensureArray(state.gotchas).map((gotcha) => `- ${gotcha}`)
-      : ['- none']),
-    '',
-    '## Propagated Discoveries',
-    ...(propagatedDiscoveries.length > 0
-      ? propagatedDiscoveries.slice(-10).map((entry) => {
+      ? ensureArray(state.gotchas).slice(0, 5).map((gotcha) => `- Gotcha: ${gotcha}`)
+      : ['- Gotcha: none']),
+    ...(recentDiscoveries.length > 0
+      ? recentDiscoveries.map((entry) => {
           const targets = ensureArray(entry.target_plan_ids).join(', ') || 'none';
           const discoveries = ensureArray(entry.discoveries).join('; ');
-          return `- ${entry.source_plan_id} -> ${targets}: ${discoveries}`;
+          return `- Discovery: ${entry.source_plan_id} -> ${targets}: ${discoveries}`;
         })
-      : ['- none']),
+      : ['- Discovery: none']),
     '',
   ].join('\n');
 }
@@ -5984,24 +6417,19 @@ function renderPlanningHandoffMarkdown(project, handoff) {
     `Next: ${handoff.lifecycle?.next_action || 'unknown'}`,
     `Next command: ${handoff.lifecycle?.next_command || 'none'}`,
     '',
-    '## Authority',
-    `- STATE.json is authoritative: .smike/${project}/STATE.json`,
-    `- Dispatch convenience view: .smike/${project}/RUNTIME-DELEGATION.json`,
-    `- Machine handoff: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
-    '',
     '## Actionable Surface',
     `- Plan: ${handoff.actionable_surface?.plan_id || 'none'}`,
     `- Dispatch group: ${handoff.actionable_surface?.dispatch_group ?? 'none'}`,
     `- Current dispatch: ${handoff.actionable_surface?.current_dispatch?.dispatch_id || 'none'}`,
     `- Capsule: ${handoff.actionable_surface?.current_capsule || 'none'}`,
-    `- Dispatch surface: ${handoff.actionable_surface?.runtime_delegation || 'none'}`,
+    `- Handoff: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
     '',
     '## Phase Graph',
   ];
 
   for (const phase of ensureArray(handoff.phase_graph)) {
     lines.push(`- ${phase.plan_id}: depends on ${ensureArray(phase.depends_on).join(', ') || 'none'}`);
-    lines.push(`  Write scope: ${ensureArray(phase.write_scope).join(', ') || 'none'}`);
+    lines.push(`  Scope: ${ensureArray(phase.write_scope).join(', ') || 'none'}`);
     lines.push(`  Acceptance: ${ensureArray(phase.acceptance_surface).join('; ') || 'none'}`);
   }
 
@@ -6103,6 +6531,12 @@ function renderStrategyMarkdown(project, bundle) {
     bundle.risk_hotspots.forEach((item) => lines.push(`- ${item}`));
   }
 
+  if (bundle.protected_areas.length > 0) {
+    lines.push('');
+    lines.push('## Protected Areas');
+    bundle.protected_areas.forEach((item) => lines.push(`- ${item}`));
+  }
+
   lines.push('');
   lines.push('## Drift Seeds');
   if (bundle.drift_seeds.length === 0) {
@@ -6112,33 +6546,28 @@ function renderStrategyMarkdown(project, bundle) {
   }
 
   lines.push('');
-  lines.push('## Proposed Phases');
+  lines.push('## Phase Plan');
   bundle.phase_blueprints.forEach((phase) => {
-    lines.push(`### Plan ${phase.id}: ${phase.title}`);
-    lines.push(phase.summary);
-    lines.push('');
-    lines.push(`- Category: ${phase.category}`);
-    lines.push(`- Depends on: ${phase.depends_on.join(', ') || 'none'}`);
-    lines.push(`- Write scope: ${phase.write_scope_allowed_files.join(', ')}`);
-    if (ensureArray(phase.declared_write_scope).length > 0) {
-      lines.push(`- Declared write scope: ${phase.declared_write_scope.join(', ')}`);
-    }
+    const phaseBits = [
+      `${phase.id}: ${phase.title}`,
+      phase.summary,
+      `depends ${phase.depends_on.join(', ') || 'none'}`,
+      `scope ${phase.write_scope_allowed_files.join(', ') || 'none'}`,
+    ];
     if (ensureArray(phase.declared_verify_commands).length > 0) {
-      lines.push(`- Declared verify: ${phase.declared_verify_commands.join(' | ')}`);
+      phaseBits.push(`verify ${phase.declared_verify_commands.join(' | ')}`);
     }
-    lines.push(`- Blocked files: ${phase.blocked_files.join(', ')}`);
-    lines.push('');
+    lines.push(`- ${phaseBits.join(' | ')}`);
   });
+  lines.push('');
 
   if (bundle.first_phase_contract_items.length > 0) {
     lines.push('## Required Plan 01 Contract');
     if (bundle.first_phase_contract_summary) {
-      lines.push(bundle.first_phase_contract_summary);
-      lines.push('');
+      lines.push(`Summary: ${bundle.first_phase_contract_summary}`);
     }
     if (bundle.first_phase_contract_heading === 'Recommended First Executable Phase') {
-      lines.push('_Legacy heading detected: `Recommended First Executable Phase`._');
-      lines.push('');
+      lines.push('Legacy heading detected: `Recommended First Executable Phase`.');
     }
     bundle.first_phase_contract_items.forEach((item) => lines.push(`- ${item}`));
     lines.push('');
@@ -6173,36 +6602,34 @@ function renderPlanningPlanMarkdown(specRel, contextFiles, bundle) {
   }
 
   lines.push('');
-  lines.push('## Planning Scope');
-  lines.push('- Produce a real strategist bundle from the spec.');
+  lines.push('## Planning Rules');
+  lines.push('- Produce concrete phase plans from the spec, not a placeholder bundle.');
   if (bundle.mode === 'research') {
-    lines.push('- Create read-only research phase plans that write findings inside `.smike/<project>/` only.');
-    lines.push('- Keep implementation changes out of this first loop.');
+    lines.push('- This is read-only research: write findings inside `.smike/<project>/` only and leave repo code untouched.');
   } else {
-    lines.push('- Create implementation phase plans with bounded write scopes.');
+    lines.push('- Each implementation phase needs a bounded write scope and explicit verification.');
   }
-  lines.push('- Keep planning writes inside `.smike/<project>/` only.');
+  lines.push('- Planning writes stay inside `.smike/<project>/`.');
   lines.push('');
-  lines.push('## Planned Deliverables');
+  lines.push('## Deliverables');
   if (bundle.deliverables.length === 0) {
     lines.push('- phase graph and execution plan');
   } else {
     bundle.deliverables.forEach((deliverable) => lines.push(`- ${deliverable}`));
   }
   lines.push('');
-  lines.push('## Runtime Delegation');
-  lines.push('- Strategist and detailer planning roles are runtime-delegated via capsules and `RUNTIME-DELEGATION.json`.');
-  lines.push('- The local runner manages contracts and state; it does not spawn subagents itself.');
+  lines.push('## Delegation');
+  lines.push('- Strategist and detailer may run from runtime-owned capsules.');
+  lines.push('- The runner owns state and contract writing.');
   if (bundle.planning_analysis.checker_enabled || bundle.planning_analysis.auditor_enabled) {
-    lines.push('- Checker and auditor remain local analysis passes; they are refreshed from the current on-disk phase plans before planning can pass.');
+    lines.push('- Checker and auditor stay local and re-read the current on-disk plans before planning can pass.');
   } else {
-    lines.push(`- Full checker/auditor planning analysis is skipped for this bundle. Reason: ${bundle.planning_analysis.reason}`);
+    lines.push(`- Checker/auditor are skipped for this bundle: ${bundle.planning_analysis.reason}`);
   }
   lines.push('');
-  lines.push('## Scoping Guide');
-  lines.push('- Use research mode for advice-only loops such as architecture audits, backlog reconciliation, or cleanup planning. Research mode writes findings inside `.smike/<project>/` only.');
-  lines.push('- Use implementation mode when the goal is to ship code or docs in the repo.');
-  lines.push('- Keep each phase to one reviewable surface with an explicit write scope and targeted verification.');
+  lines.push('## Phase Guide');
+  lines.push('- Keep each phase to one reviewable surface.');
+  lines.push('- Prefer narrow scopes over speculative future work.');
   lines.push('');
   lines.push('## Phase Index');
   bundle.phase_blueprints.forEach((phase) => lines.push(`- ${phase.id}: ${phase.title}`));
@@ -6223,6 +6650,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
   orchestration.next_role = 'strategist';
 
   if (roleConfig.roles.strategist.enabled) {
+    const strategistGuidance = buildPlanningRoleGuidance('strategist');
     const strategistCapsule = buildRoleCapsule({
       project,
       planId: rootPlan.plan_id,
@@ -6238,26 +6666,15 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
         `.smike/${project}/STRATEGY.md`,
         ...bundle.spec_paths.slice(0, CAPSULE_REF_LIMIT),
       ],
-      readOrder: [
-        'Read the spec first, then the primary refs that shape truth and scope.',
-        'Extract deliverables, constraints, protected areas, and drift seeds before sequencing phases.',
-        'Prefer bounded write scopes and collision-aware ordering over ambitious breadth.',
-      ],
-      questions: [
-        'What must this loop produce before any implementation is considered complete?',
-        'What phase graph keeps the work reviewable and collision-aware?',
-        'Which refs and constraints need to be propagated into every downstream plan?',
-      ],
+      readOrder: strategistGuidance.readOrder,
+      questions: strategistGuidance.questions,
       boundaries: {
         allowed_files: rootPlan.write_scope.allowed_files,
         blocked_files: rootPlan.write_scope.blocked_files,
         reason: rootPlan.write_scope.reason,
       },
       outputs: {
-        success_conditions: [
-          'Strategy captures truth sources, constraints, drift seeds, and bounded phases.',
-          'Planning artifacts point detailers, checker, and auditor at the same canonical spec context.',
-        ],
+        success_conditions: strategistGuidance.successConditions,
       },
       contextSnapshot: buildPlanningStrategistContextSnapshot(bundle),
       resultArtifacts: buildPlanningRoleResultArtifacts(project, 'strategist', rootPlan.plan_id),
@@ -6272,7 +6689,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
         protected_areas: bundle.protected_areas,
         drift_seeds: bundle.drift_seeds,
       },
-      nextAction: 'Hand bounded phase blueprints to detailers.',
+      nextAction: strategistGuidance.nextAction,
     });
     const capsulePaths = writeRoleCapsule(paths, strategistCapsule);
     updateCapsuleRefs(orchestration, 'strategist', strategistCapsule.plan_id, capsulePaths);
@@ -6294,6 +6711,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
       break;
     }
 
+    const detailerGuidance = buildPlanningRoleGuidance('detailer', { planId: phase.id });
     const detailerCapsule = buildRoleCapsule({
       project,
       planId: phase.id,
@@ -6309,26 +6727,15 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
         `.smike/${project}/phases/${phase.id}/${phase.id}-PLAN.json`,
       ],
       additionalPaths: [...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      readOrder: [
-        'Read the root planning artifacts first to inherit the same objective and constraints.',
-        'Read only the refs needed for this phase before editing the phase plan.',
-        'Carry forward gotchas and dependency edges into the phase-level plan contract.',
-      ],
-      questions: [
-        `What is the smallest reviewable slice for Plan ${phase.id}?`,
-        'Which files, checks, and dependencies must be explicit so execution does not guess?',
-        'What discoveries should be propagated to later phases up front?',
-      ],
+      readOrder: detailerGuidance.readOrder,
+      questions: detailerGuidance.questions,
       boundaries: {
         allowed_files: phase.allowed_files,
         blocked_files: phase.blocked_files,
         reason: `Bound ${phase.id} to a reviewable cleanup slice.`,
       },
       outputs: {
-        success_conditions: [
-          'Phase plan is explicit about files, verification, and boundaries.',
-          'Phase plan carries forward gotchas and dependency edges instead of rediscovering them later.',
-        ],
+        success_conditions: detailerGuidance.successConditions,
       },
       contextSnapshot: buildPlanningDetailerContextSnapshot(bundle, phase),
       resultArtifacts: buildPlanningRoleResultArtifacts(project, 'detailer', phase.id),
@@ -6339,7 +6746,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
         primary_refs: bundle.primary_refs,
         write_scope: phase.write_scope_allowed_files,
       },
-      nextAction: 'Hand completed phase plans to checker and auditor for cross-plan review.',
+      nextAction: detailerGuidance.nextAction,
     });
     const capsulePaths = writeRoleCapsule(paths, detailerCapsule);
     updateCapsuleRefs(orchestration, 'detailer', detailerCapsule.plan_id, capsulePaths);
@@ -6357,6 +6764,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
   }
 
   if (roleConfig.roles.checker.enabled) {
+    const checkerGuidance = buildPlanningRoleGuidance('checker');
     const checkerCapsule = buildRoleCapsule({
       project,
       planId: rootPlan.plan_id,
@@ -6372,24 +6780,15 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
         ...bundle.phase_blueprints.map((phase) => `.smike/${project}/phases/${phase.id}/${phase.id}-PLAN.json`),
       ],
       additionalPaths: [...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      readOrder: [
-        'Read the phase graph before individual phase plans so dependency checks stay global.',
-        'Look for overlap, missing edges, and discovery notes that should propagate downstream.',
-      ],
-      questions: [
-        'Do any plans overlap in scope or omit a required dependency edge?',
-        'What discoveries should be propagated to downstream plans before execution?',
-      ],
+      readOrder: checkerGuidance.readOrder,
+      questions: checkerGuidance.questions,
       boundaries: {
         allowed_files: [`.smike/${project}/**`],
         blocked_files: rootPlan.blocked_files,
         reason: 'Checker reviews planning artifacts only.',
       },
       outputs: {
-        success_conditions: [
-          'Cross-plan mismatches and blast-radius conflicts are surfaced before execution.',
-          'Checker notes are specific enough to feed downstream plans instead of creating noise.',
-        ],
+        success_conditions: checkerGuidance.successConditions,
       },
       evidence: {
         phase_graph: bundle.phase_blueprints.map((phase) => ({
@@ -6398,7 +6797,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
           allowed_files: phase.allowed_files,
         })),
       },
-      nextAction: 'Pass any concrete discoveries to the auditor and downstream phase plans.',
+      nextAction: checkerGuidance.nextAction,
     });
     const capsulePaths = writeRoleCapsule(paths, checkerCapsule);
     updateCapsuleRefs(orchestration, 'checker', checkerCapsule.plan_id, capsulePaths);
@@ -6416,6 +6815,7 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
   }
 
   if (roleConfig.roles.auditor.enabled) {
+    const auditorGuidance = buildPlanningRoleGuidance('auditor');
     const auditorCapsule = buildRoleCapsule({
       project,
       planId: rootPlan.plan_id,
@@ -6431,31 +6831,22 @@ function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
         ...bundle.phase_blueprints.map((phase) => `.smike/${project}/phases/${phase.id}/${phase.id}-PLAN.json`),
       ],
       additionalPaths: [...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      readOrder: [
-        'Read the spec and required deliverables before looking at the phase plans.',
-        'Map each promised behavior or deliverable to a concrete phase before declaring coverage.',
-      ],
-      questions: [
-        'Which deliverables or promises are not yet traced to a concrete phase?',
-        'Are any coverage matches weak or based on wording instead of behavior?',
-      ],
+      readOrder: auditorGuidance.readOrder,
+      questions: auditorGuidance.questions,
       boundaries: {
         allowed_files: [`.smike/${project}/**`],
         blocked_files: rootPlan.blocked_files,
         reason: 'Auditor reviews planning artifacts and spec context only.',
       },
       outputs: {
-        success_conditions: [
-          'Coverage gaps are concrete and traceable back to the spec.',
-          'Ambiguous prose is called out as ambiguous instead of silently promoted to a hard requirement.',
-        ],
+        success_conditions: auditorGuidance.successConditions,
       },
       evidence: {
         deliverables: bundle.deliverables,
         protected_areas: bundle.protected_areas,
         phase_index: bundle.phase_blueprints.map((phase) => ({ id: phase.id, title: phase.title })),
       },
-      nextAction: 'If coverage is sound, hand the first execution slice to the executor.',
+      nextAction: auditorGuidance.nextAction,
     });
     const capsulePaths = writeRoleCapsule(paths, auditorCapsule);
     updateCapsuleRefs(orchestration, 'auditor', auditorCapsule.plan_id, capsulePaths);
@@ -6556,7 +6947,7 @@ function buildPlanningRootPlan(project, specRel, contextFiles, bundle, planningM
     owner: 'runtime_orchestrator',
     runtime_roles: ['strategist', 'detailer'],
     dispatch_artifacts: [
-      `.smike/${project}/RUNTIME-DELEGATION.json`,
+      `.smike/${project}/STATE.json`,
     ],
     result_artifacts: [
       `.smike/${project}/STRATEGY.md`,
@@ -6632,7 +7023,7 @@ function buildPhasePlan(project, specRel, bundle, phase) {
       owner: isResearch ? 'runtime_orchestrator' : 'smike_runner',
       runtime_roles: isResearch ? ['executor', 'judge', ...(reviewerRequired ? ['reviewer'] : [])] : ['executor'],
       dispatch_artifacts: [
-        `.smike/${project}/RUNTIME-DELEGATION.json`,
+        `.smike/${project}/STATE.json`,
       ],
       result_artifacts: isResearch && researchResults
         ? [researchResults.jsonRel]
@@ -6705,6 +7096,8 @@ function buildPlanningState(project, specRel, contextFiles, plan, bundle, planni
     mode: bundle.mode,
     spec_path: specRel,
     spec_hash: bundle.spec_hash,
+    intake_prompt: bundle.intake_prompt || null,
+    clarifying_questions: bundle.clarifying_questions,
     context_files: contextFiles,
     input_snapshot: inputSnapshot,
     primary_refs: bundle.primary_refs,
@@ -7056,32 +7449,6 @@ function syncPlanningState(project, state, plan) {
   return { transitioned: true, currentHash };
 }
 
-function printResumeSummary(project, specRel, state, extraLines = []) {
-  console.log(`smike resume: ${project}`);
-  if (specRel) {
-    console.log(`spec: ${specRel}`);
-  }
-  console.log(`status: ${state.lifecycle?.status || 'unknown'}`);
-  console.log(`next: ${state.lifecycle?.next_action || 'unknown'}`);
-  const nextCommand = getLifecycleNextCommand(state);
-  if (nextCommand) {
-    console.log(`next_command: ${nextCommand}`);
-  }
-  if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
-    console.log('runtime_requirement: host runtime must execute next_command before treating this project state as complete.');
-  }
-  for (const line of getRuntimeDispatchSummaryLines(project, state)) {
-    console.log(line);
-  }
-  console.log(`planning_handoff: .smike/${project}/PLANNING-HANDOFF.md`);
-  for (const line of getPlanningDraftNoticeLines(state)) {
-    console.log(line);
-  }
-  for (const line of extraLines) {
-    console.log(line);
-  }
-}
-
 function getRuntimeDispatchSummaryLines(project, state) {
   const paths = getProjectPaths(project);
   if (!fs.existsSync(paths.planJsonPath)) {
@@ -7109,6 +7476,59 @@ function getQualitySummaryLines(state) {
   return lines;
 }
 
+function getOperatorGuidanceLines(project, state) {
+  const nextCommand = getLifecycleNextCommand(state) || 'none';
+  const advanceCommand = buildAdvanceCommand(project);
+  const lines = [
+    `handoff: .smike/${project}/STATE.md`,
+    `inspect_command: ./smike status ${project}`,
+    `advance_command: ${advanceCommand}`,
+  ];
+
+  if (isPlanningDraftState(state)) {
+    lines.push('operator_requirement: planning_draft is spec-driven; update the spec, not .smike/**.');
+    return lines;
+  }
+
+  if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
+    lines.push(`operator_requirement: run ${nextCommand} now, then mark each finished dispatch with ./smike dispatch ${project} completed <dispatch-id>.`);
+    return lines;
+  }
+
+  if (state.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
+    lines.push(`operator_requirement: stop in this session, start a fresh session, then run ${nextCommand}.`);
+    return lines;
+  }
+
+  lines.push(`operator_requirement: inspection is read-only; use ${advanceCommand} to execute the next legal step.`);
+  return lines;
+}
+
+function printProjectInspectionSummary(commandLabel, project, specRel, state, extraLines = []) {
+  console.log(`smike ${commandLabel}: ${project}`);
+  if (specRel) {
+    console.log(`spec: ${specRel}`);
+  }
+  console.log(`status: ${state.lifecycle?.status || 'unknown'}`);
+  console.log(`next: ${state.lifecycle?.next_action || 'unknown'}`);
+  const nextCommand = getLifecycleNextCommand(state);
+  if (nextCommand) {
+    console.log(`next_command: ${nextCommand}`);
+  }
+  for (const line of getOperatorGuidanceLines(project, state)) {
+    console.log(line);
+  }
+  for (const line of getRuntimeDispatchSummaryLines(project, state)) {
+    console.log(line);
+  }
+  for (const line of getPlanningDraftNoticeLines(state)) {
+    console.log(line);
+  }
+  for (const line of extraLines) {
+    console.log(line);
+  }
+}
+
 function getStaleActiveProjectMissingPath(paths) {
   if (!fs.existsSync(paths.projectDir)) {
     return `.smike/${path.basename(paths.projectDir)}`;
@@ -7122,34 +7542,136 @@ function getStaleActiveProjectMissingPath(paths) {
   return null;
 }
 
-function printStaleActiveProject(active, paths, { nextLine = 'next: run `./smike activate <project>` or `./smike <spec.md>`' } = {}) {
+function getProjectRecoveryArgs(project, active = null) {
+  const paths = getProjectPaths(project);
+  const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : null;
+  const plan = fs.existsSync(paths.planJsonPath) ? readJson(paths.planJsonPath) : null;
+  const state = fs.existsSync(paths.statePath) ? readJson(paths.statePath) : null;
+  const specPath =
+    (active?.project === project ? active.spec_path : null)
+    || projectMeta?.spec_path
+    || plan?.spec
+    || state?.planning?.spec_path
+    || null;
+  const contextFiles = normalizePathList(
+    (active?.project === project ? active.context_files : null)
+    || projectMeta?.context_files
+    || state?.planning?.context_files
+    || [],
+  );
+  const specArgs = specPath ? [specPath, ...contextFiles] : [];
+  const recoverable = specArgs.length > 0
+    && specArgs.every((entry) => {
+      try {
+        resolveExistingPath(entry);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+  return {
+    specArgs,
+    recoverable,
+  };
+}
+
+function printNoSelectedProject() {
+  console.log('smike: no active project');
+  console.log('hint: run `./smike list` or start one with `./smike <spec.md>`');
+}
+
+function printStaleProject(project, paths, active = null, { noun = 'project' } = {}) {
   const missing = getStaleActiveProjectMissingPath(paths);
-  console.log(`smike: active project is stale (${active.project})`);
+  const recovery = getProjectRecoveryArgs(project, active);
+  console.log(`smike: ${noun} is stale (${project})`);
   if (missing) {
     console.log(`missing: ${missing}`);
   }
-  console.log(nextLine);
-}
-
-function runStatus() {
-  const active = readActiveProject();
-  if (!active) {
-    console.log('smike: no active project');
+  if (recovery.recoverable) {
+    console.log(`next: run \`${buildAdvanceCommand(project)}\` to recover from the recorded spec inputs.`);
     return;
   }
+  console.log(`next: run \`./smike doctor ${project}\`, \`./smike activate ${project}\`, or recreate the project from spec.`);
+}
 
-  const paths = getProjectPaths(active.project);
-  if (getStaleActiveProjectMissingPath(paths)) {
-    printStaleActiveProject(active, paths);
-    return;
+function readProjectInspection(project, active = null) {
+  const paths = getProjectPaths(project);
+  const stalePath = getStaleActiveProjectMissingPath(paths);
+  if (stalePath) {
+    return {
+      project,
+      paths,
+      stale: true,
+      stalePath,
+    };
   }
 
   const state = readJson(paths.statePath);
-  const specRel = active.spec_path || state?.planning?.spec_path || null;
-  printResumeSummary(active.project, specRel, state, [
-    `plan: .smike/${active.project}/PLAN.md`,
-    `contract: .smike/${active.project}/PLAN.json`,
-    ...getQualitySummaryLines(state),
+  const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : null;
+  const plan = fs.existsSync(paths.planJsonPath) ? readJson(paths.planJsonPath) : null;
+  const specRel =
+    (active?.project === project ? active.spec_path : null)
+    || projectMeta?.spec_path
+    || state?.planning?.spec_path
+    || plan?.spec
+    || null;
+
+  return {
+    project,
+    paths,
+    stale: false,
+    state,
+    specRel,
+  };
+}
+
+function runList() {
+  const active = readActiveProject();
+  const projects = listProjectDirs().sort((left, right) => left.localeCompare(right));
+  if (projects.length === 0) {
+    console.log('smike list: no projects');
+    return;
+  }
+
+  console.log('smike list');
+  for (const project of projects) {
+    const inspection = readProjectInspection(project, active);
+    const activeMarker = active?.project === project ? '*' : '-';
+    if (inspection.stale) {
+      console.log(`${activeMarker} ${project}: stale (${inspection.stalePath})`);
+      continue;
+    }
+
+    const state = inspection.state;
+    const nextCommand = getLifecycleNextCommand(state) || 'none';
+    console.log(`${activeMarker} ${project}: ${state.lifecycle?.status || 'unknown'} :: ${nextCommand}`);
+  }
+}
+
+function runStatus(projectSelector = null) {
+  const selectedProject = typeof projectSelector === 'string' && projectSelector.trim()
+    ? (resolveProjectSelector(projectSelector) || projectSelector.trim())
+    : null;
+  const active = readActiveProject();
+  const project = selectedProject || active?.project || null;
+  if (!project) {
+    printNoSelectedProject();
+    return;
+  }
+
+  const inspection = readProjectInspection(project, active);
+  if (inspection.stale) {
+    printStaleProject(project, inspection.paths, active, {
+      noun: active?.project === project ? 'active project' : 'project',
+    });
+    return;
+  }
+
+  printProjectInspectionSummary('status', project, inspection.specRel, inspection.state, [
+    `plan: .smike/${project}/PLAN.md`,
+    `contract: .smike/${project}/PLAN.json`,
+    ...getQualitySummaryLines(inspection.state),
   ]);
 }
 
@@ -7211,33 +7733,27 @@ function collectDoctorIssues(project, paths, state, active = null) {
     });
   }
 
-  const runtimeDelegation = fs.existsSync(paths.runtimeDelegationJsonPath) ? readJson(paths.runtimeDelegationJsonPath) : null;
-  if (!runtimeDelegation) {
+  const runtimeDispatchView = state?.orchestration?.runtime_dispatch_view;
+  if (!runtimeDispatchView || typeof runtimeDispatchView !== 'object' || Array.isArray(runtimeDispatchView)) {
     issues.push({
       severity: 'error',
-      id: 'missing-runtime-delegation',
-      message: `Missing derived artifact: .smike/${project}/RUNTIME-DELEGATION.json`,
+      id: 'missing-runtime-dispatch-view',
+      message: 'STATE.json is missing orchestration.runtime_dispatch_view.',
     });
   } else {
-    if ((runtimeDelegation.lifecycle?.status || null) !== (state.lifecycle?.status || null)) {
+    const actionablePlanId = runtimeDispatchView.actionable_plan?.plan_id || null;
+    if (actionablePlanId && actionablePlanId !== (state.current_plan?.plan_id || null)) {
       issues.push({
         severity: 'error',
-        id: 'runtime-delegation-status-mismatch',
-        message: `RUNTIME-DELEGATION.json status ${runtimeDelegation.lifecycle?.status || 'null'} does not match STATE.json status ${state.lifecycle?.status || 'null'}.`,
+        id: 'runtime-dispatch-view-plan-mismatch',
+        message: `orchestration.runtime_dispatch_view.actionable_plan.plan_id ${actionablePlanId} does not match STATE.json current plan ${state.current_plan?.plan_id || 'null'}.`,
       });
     }
-    if ((runtimeDelegation.lifecycle?.next_command || null) !== (nextCommand || null)) {
+    if (state.lifecycle?.status === 'awaiting_runtime_dispatch' && ensureArray(runtimeDispatchView.ready_dispatches).length === 0) {
       issues.push({
         severity: 'error',
-        id: 'runtime-delegation-next-command-mismatch',
-        message: `RUNTIME-DELEGATION.json next_command ${runtimeDelegation.lifecycle?.next_command || 'null'} does not match STATE.json next_command ${nextCommand || 'null'}.`,
-      });
-    }
-    if ((runtimeDelegation.current_plan?.plan_id || null) !== (state.current_plan?.plan_id || null)) {
-      issues.push({
-        severity: 'error',
-        id: 'runtime-delegation-plan-mismatch',
-        message: `RUNTIME-DELEGATION.json current plan ${runtimeDelegation.current_plan?.plan_id || 'null'} does not match STATE.json current plan ${state.current_plan?.plan_id || 'null'}.`,
+        id: 'runtime-dispatch-view-missing-ready-dispatches',
+        message: 'STATE.json is awaiting runtime dispatch but orchestration.runtime_dispatch_view.ready_dispatches is empty.',
       });
     }
   }
@@ -7458,60 +7974,44 @@ async function runStart(specArgs) {
   if (!hasExistingArtifacts || needsPlanningRefresh) {
     await runCycle(project, { maxPhases: 1 });
     const updatedState = readJson(paths.statePath);
-    printResumeSummary(project, spec.relative, updatedState, [
+    printProjectInspectionSummary('resume', project, spec.relative, updatedState, [
       `roadmap: .smike/${project}/ROADMAP.md`,
       `strategy: .smike/${project}/STRATEGY.md`,
     ]);
     return;
   }
 
-  await runResume(null, { suppressHandoffFailure: true });
+  await runEntrypoint();
 }
 
-async function runResume(projectSelector = null, options = {}) {
-  if (typeof projectSelector === 'string' && projectSelector.trim()) {
-    const project = resolveProjectSelector(projectSelector) || projectSelector.trim();
-    runActivate(project);
-  }
+async function runIntake(rawArgs) {
+  const { promptText, specPath, contextFiles } = parseIntakeArgs(rawArgs);
+  const targetSpec = resolveIntakeSpecTarget(specPath, promptText);
+  ensureDir(path.dirname(targetSpec.absolute));
+  fs.writeFileSync(targetSpec.absolute, buildIntakeSpecMarkdown(promptText, contextFiles), 'utf8');
+  await runStart([targetSpec.relative, ...contextFiles]);
+}
 
-  const active = readActiveProject();
-  if (!active) {
-    fail('no active project. Start one with `./smike <spec.md>`.');
-  }
-
-  const project = active.project;
+async function runAdvanceExecution(project, active = null) {
   const paths = getProjectPaths(project);
   if (getStaleActiveProjectMissingPath(paths)) {
-    const specPath = typeof active.spec_path === 'string' && active.spec_path.trim()
-      ? active.spec_path.trim()
-      : null;
-    const specArgs = specPath ? [specPath, ...normalizePathList(active.context_files || [])] : [];
-    const canRecover = specArgs.length > 0
-      && specArgs.every((specPath) => {
-        try {
-          resolveExistingPath(specPath);
-          return true;
-        } catch {
-          return false;
-        }
-      });
-
-    if (!canRecover) {
-      printStaleActiveProject(active, paths);
-      return;
+    const recovery = getProjectRecoveryArgs(project, active);
+    if (!recovery.recoverable) {
+      fail(`project is stale or missing runtime artifacts: ${project}`);
     }
-
-    printStaleActiveProject(active, paths, {
-      nextLine: `next: recovering from spec ${specArgs[0]}`,
-    });
-    await runStart(specArgs);
+    console.log(`smike advance: recovering ${project} from spec ${recovery.specArgs[0]}`);
+    await runStart(recovery.specArgs);
     return;
   }
 
   const plan = readJson(paths.planJsonPath);
   const { state } = readValidatedState(paths, { persistRepair: true });
 
-  const specRel = active.spec_path || state?.planning?.spec_path || plan?.spec || null;
+  const specRel =
+    (active?.project === project ? active.spec_path : null)
+    || state?.planning?.spec_path
+    || plan?.spec
+    || null;
   const planningSync = syncPlanningState(project, state, plan);
   if (planningSync.transitioned) {
     console.log(`smike: planning changes detected for ${project}; starting execution`);
@@ -7536,19 +8036,23 @@ async function runResume(projectSelector = null, options = {}) {
     state,
     buildRuntimeDispatchPendingState(runtimeContext),
   );
-  const planningRecheck = shouldAutoRecheckPlanning(project, paths, state, specRel, normalizePathList(active.context_files || state?.planning?.context_files || []));
+  const planningRecheck = shouldAutoRecheckPlanning(
+    project,
+    paths,
+    state,
+    specRel,
+    normalizePathList((active?.project === project ? active.context_files : null) || state?.planning?.context_files || []),
+  );
   if (planningRecheck.stale) {
     await runRecheck(project);
     return;
   }
   if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
-    const handoffRecorded = options.suppressHandoffFailure === true
-      ? false
-      : maybeRecordHandoffFailure(project, state);
+    const handoffRecorded = maybeRecordHandoffFailure(project, state);
     if (lifecycleReconciled || handoffRecorded) {
       persistProjectState(project, paths, state, plan, specRel);
     }
-    printResumeSummary(project, specRel, state, [
+    printProjectInspectionSummary('advance', project, specRel, state, [
       `plan: .smike/${project}/PLAN.md`,
       `contract: .smike/${project}/PLAN.json`,
       ...getQualitySummaryLines(state),
@@ -7557,6 +8061,68 @@ async function runResume(projectSelector = null, options = {}) {
   }
 
   await runCycle(project, {});
+}
+
+async function runResume(projectSelector = null) {
+  const selectedProject = typeof projectSelector === 'string' && projectSelector.trim()
+    ? (resolveProjectSelector(projectSelector) || projectSelector.trim())
+    : null;
+  const active = readActiveProject();
+  const project = selectedProject || active?.project || null;
+  if (!project) {
+    printNoSelectedProject();
+    return;
+  }
+
+  const inspection = readProjectInspection(project, active);
+  if (inspection.stale) {
+    printStaleProject(project, inspection.paths, active, {
+      noun: active?.project === project ? 'active project' : 'project',
+    });
+    return;
+  }
+
+  printProjectInspectionSummary('resume', project, inspection.specRel, inspection.state, [
+    `plan: .smike/${project}/PLAN.md`,
+    `contract: .smike/${project}/PLAN.json`,
+    ...getQualitySummaryLines(inspection.state),
+  ]);
+}
+
+async function runEntrypoint(projectSelector = null) {
+  const selectedProject = typeof projectSelector === 'string' && projectSelector.trim()
+    ? (resolveProjectSelector(projectSelector) || projectSelector.trim())
+    : null;
+  if (selectedProject) {
+    runActivate(selectedProject);
+  }
+
+  const active = readActiveProject();
+  const project = selectedProject || active?.project || null;
+  if (!project) {
+    printNoSelectedProject();
+    return;
+  }
+
+  const inspection = readProjectInspection(project, active);
+  if (inspection.stale) {
+    const recovery = getProjectRecoveryArgs(project, active);
+    if (recovery.recoverable) {
+      await runAdvanceExecution(project, active);
+      return;
+    }
+    printStaleProject(project, inspection.paths, active, {
+      noun: active?.project === project ? 'active project' : 'project',
+    });
+    return;
+  }
+
+  if (getLifecycleNextCommand(inspection.state)) {
+    await runAdvance(project);
+    return;
+  }
+
+  await runResume(project);
 }
 
 function parseCanonicalSmikeCommand(commandText) {
@@ -7917,7 +8483,7 @@ async function runAdvance(projectSelector = null) {
   const selectedProject = typeof projectSelector === 'string' && projectSelector.trim()
     ? (resolveProjectSelector(projectSelector) || projectSelector.trim())
     : null;
-  const active = selectedProject ? null : readActiveProject();
+  const active = readActiveProject();
   const project = selectedProject || active?.project || null;
   if (!project) {
     fail('no project selected. Use `./smike advance <project>` or activate a project first.');
@@ -7925,7 +8491,8 @@ async function runAdvance(projectSelector = null) {
 
   const paths = getProjectPaths(project);
   if (getStaleActiveProjectMissingPath(paths)) {
-    fail(`project is stale or missing runtime artifacts: ${project}`);
+    await runAdvanceExecution(project, active);
+    return;
   }
 
   const { state } = readValidatedState(paths, { persistRepair: true });
@@ -7950,7 +8517,7 @@ async function runAdvance(projectSelector = null) {
     }
 
     if (state.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
-      await runResume(project);
+      await runAdvanceExecution(project, active);
       return;
     }
   }
@@ -7961,7 +8528,7 @@ async function runAdvance(projectSelector = null) {
   }
 
   if (parsed.command === 'advance' || parsed.command === 'resume') {
-    await runResume(parsed.project || project);
+    await runAdvanceExecution(parsed.project || project, active);
     return;
   }
   if (parsed.command === 'recheck') {
@@ -7989,8 +8556,7 @@ async function runProjectSelector(projectSelector) {
   if (!project) {
     fail(`project not found: ${projectSelector}`);
   }
-  runActivate(project);
-  await runResume();
+  await runEntrypoint(project);
 }
 
 function loadOrInitState(project, paths, rootPlan) {
@@ -8885,7 +9451,7 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
         mode: 'runtime_subagents',
         owner: 'runtime_orchestrator',
         runtime_roles: ['detailer'],
-        dispatch_artifacts: [`.smike/${project}/RUNTIME-DELEGATION.json`],
+        dispatch_artifacts: [`.smike/${project}/STATE.json`],
         result_artifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
       },
       groupOverride || 1,
@@ -9268,16 +9834,6 @@ function buildRuntimeDispatchContract(entry) {
   };
 }
 
-function buildRuntimeDispatchCounts(runtimeContext) {
-  return {
-    tracked: runtimeContext.dispatches.length,
-    ready: runtimeContext.ready_dispatches.length,
-    active: runtimeContext.active_dispatches.length,
-    failed: runtimeContext.failed_dispatches.length,
-    completed: runtimeContext.completed_dispatches.length,
-  };
-}
-
 function currentRuntimeDispatchGroup(runtimeContext) {
   return (
     runtimeContext.ready_dispatches[0]?.group
@@ -9338,10 +9894,40 @@ function syncActionableRuntimeDispatchState(project, paths, state, rootPlan) {
       capsule_json: typeof currentActionableEntry.capsule_json === 'string'
         ? normalizeRel(currentActionableEntry.capsule_json)
         : null,
-      dispatch_surface: `.smike/${project}/RUNTIME-DELEGATION.json`,
     }
     : null;
   orchestration.current_actionable_capsule = orchestration.current_actionable_dispatch?.capsule_json || null;
+  orchestration.runtime_dispatch_view = {
+    actionable_plan: {
+      plan_id: actionable.plan_id || null,
+      plan_ids: ensureArray(actionable.plan_ids),
+      group: currentRuntimeDispatchGroup({
+        actionable,
+        ready_dispatches: readyEntries,
+        active_dispatches: activeEntries,
+        failed_dispatches: failedEntries,
+        dispatches: currentEntries,
+      }),
+      completable_group: currentCompletableRuntimeDispatchGroup({
+        active_dispatches: activeEntries,
+      }),
+      plan_json: actionable.plan_path ? path.resolve(actionable.plan_path) : null,
+      stage: inferPlanStage(project, actionable.plan),
+    },
+    ready_dispatches: readyEntries.map((entry) => buildRuntimeDispatchContract(entry)),
+    dispatch_counts: {
+      tracked: currentEntries.length,
+      ready: readyEntries.length,
+      active: activeEntries.length,
+      failed: failedEntries.length,
+      completed: completedEntries.length,
+    },
+    delegation: {
+      mode: delegation.mode,
+      owner: delegation.owner,
+      result_artifacts: normalizePathList(delegation.result_artifacts || []),
+    },
+  };
 
   return {
     actionable,
@@ -9385,13 +9971,10 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
   const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
   const planningAnalysis = loadPlanningAnalysis(paths);
   const planningFreshness = getPlanningArtifactFreshness(paths);
-  const currentPlanPath = runtimeContext.actionable.plan_path;
-  const currentPlan = runtimeContext.actionable.plan;
   const currentDelegation = runtimeContext.delegation;
   const currentDispatchGroup = currentRuntimeDispatchGroup(runtimeContext);
   const completableDispatchGroup = currentCompletableRuntimeDispatchGroup(runtimeContext);
   const readyDispatches = runtimeContext.ready_dispatches.map((entry) => buildRuntimeDispatchContract(entry));
-  const dispatchCounts = buildRuntimeDispatchCounts(runtimeContext);
   const latestCapsules = Object.fromEntries(
     Object.entries(orchestration.capsules.latest_by_role || {})
       .filter(([, capsulePath]) => typeof capsulePath === 'string' && capsulePath.trim())
@@ -9470,11 +10053,11 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
       active_role: orchestration.active_role,
       last_role: orchestration.last_role,
       next_role: orchestration.next_role,
+      runtime_dispatch_view: orchestration.runtime_dispatch_view,
     },
     delegation: {
       mode: currentDelegation.mode,
       owner: currentDelegation.owner,
-      dispatch_surface: path.resolve(paths.runtimeDelegationJsonPath),
       ready_dispatch_ids: readyDispatches.map((entry) => entry.dispatch_id),
     },
   };
@@ -9528,7 +10111,6 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
       auditor: fs.existsSync(paths.planningAuditorJsonPath) ? path.resolve(paths.planningAuditorJsonPath) : null,
       handoff: path.resolve(paths.implementationHandoffJsonPath),
       planning_handoff: path.resolve(paths.planningHandoffMdPath),
-      runtime_delegation: path.resolve(paths.runtimeDelegationJsonPath),
     },
     orchestration: {
       stage: orchestration.stage,
@@ -9538,36 +10120,6 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     },
     latest_capsules: latestCapsules,
     discovery_log_entries: propagatedDiscoveries.length,
-  };
-
-  const runtimeDelegationJson = {
-    schema_version: '1.0.0',
-    generated_at: nowIso(),
-    project,
-    authoritative_state: authoritativeState,
-    current_plan: {
-      plan_id: runtimeContext.actionable.plan_id || state.current_plan?.plan_id || null,
-      plan_ids: runtimeContext.actionable.plan_ids,
-      group: currentDispatchGroup,
-      completable_group: completableDispatchGroup,
-      plan_json: currentPlanPath ? path.resolve(currentPlanPath) : null,
-      stage: inferPlanStage(project, currentPlan),
-    },
-    lifecycle: {
-      status: state.lifecycle.status,
-      stop_reason: state.lifecycle.stop_reason || null,
-      next_action: state.lifecycle.next_action,
-      next_command: getLifecycleNextCommand(state),
-    },
-    delegation: {
-      mode: currentDelegation.mode,
-      owner: currentDelegation.owner,
-      result_artifacts: currentDelegation.result_artifacts,
-    },
-    dependency_blockers: dependencyBlockers,
-    runtime_guide: RUNTIME_GUIDE_PATH,
-    ready_dispatches: readyDispatches,
-    dispatch_counts: dispatchCounts,
   };
 
   const implementationHandoffJson = {
@@ -9594,7 +10146,6 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
       completable_group: completableDispatchGroup,
       current_dispatch: orchestration.current_actionable_dispatch,
       current_capsule: orchestration.current_actionable_capsule || null,
-      runtime_delegation: path.resolve(paths.runtimeDelegationJsonPath),
     },
     phase_graph: workflowPlanDetails,
     dependency_blockers: dependencyBlockers,
@@ -9602,6 +10153,7 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     protected_areas: parseMarkdownBulletSection(paths.strategyPath, 'Protected Areas'),
   };
 
+  writeJson(paths.statePath, state);
   fs.writeFileSync(paths.notesPath, notesMarkdown, 'utf8');
   writeJson(paths.resumeCapsuleJsonPath, resumeCapsuleJson);
   if (fs.existsSync(paths.resumeCapsuleMdPath)) {
@@ -9616,10 +10168,7 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
   writeJson(paths.indexJsonPath, indexJson);
   writeJson(paths.implementationHandoffJsonPath, implementationHandoffJson);
   fs.writeFileSync(paths.planningHandoffMdPath, renderPlanningHandoffMarkdown(project, implementationHandoffJson), 'utf8');
-  writeJson(paths.runtimeDelegationJsonPath, runtimeDelegationJson);
-  if (fs.existsSync(paths.runtimeDelegationMdPath)) {
-    fs.unlinkSync(paths.runtimeDelegationMdPath);
-  }
+  removeLegacyRuntimeDelegationArtifacts(paths.projectDir);
 }
 
 async function runCycle(project, cycleOptions = {}) {
@@ -9684,7 +10233,7 @@ async function runCycle(project, cycleOptions = {}) {
       state.lifecycle.status = PLANNING_DRAFT_LIFECYCLE_STATUS;
       state.lifecycle.last_result = null;
       setLifecycleStopReason(state, null);
-      setLifecycleNextStep(state, buildPlanningDraftNextAction(project, promotionCheck), buildCycleCommand(project));
+      setLifecycleNextStep(state, buildPlanningDraftNextAction(project, promotionCheck, draftBundle), buildCycleCommand(project));
       state.updated_at = nowIso();
       if (state.planning && typeof state.planning === 'object') {
         state.planning = {
@@ -10560,23 +11109,27 @@ async function main() {
   }
 
   if (args.length === 0) {
-    await runResume();
+    await runEntrypoint();
     return;
   }
 
   const [command, project, ...rest] = args;
   if (!RESERVED_COMMANDS.has(command)) {
     if (args.length === 1) {
-      const specShortcut = resolveSpecShortcut(command);
-      if (specShortcut) {
-        await runStart([specShortcut]);
-        return;
-      }
       const projectMatch = resolveProjectSelector(command);
       if (projectMatch) {
         await runProjectSelector(projectMatch);
         return;
       }
+      const specShortcut = resolveSpecShortcut(command);
+      if (specShortcut) {
+        await runStart([specShortcut]);
+        return;
+      }
+    }
+    if (shouldRouteArgsToIntake(args)) {
+      await runIntake(args);
+      return;
     }
     await runStart(args);
     return;
@@ -10603,6 +11156,10 @@ async function main() {
       }
     }
     await runCycle(project, cycleOptions);
+    return;
+  }
+  if (command === 'intake') {
+    await runIntake(args.slice(1));
     return;
   }
   if (command === 'recheck') {
@@ -10731,10 +11288,17 @@ async function main() {
     return;
   }
   if (command === 'status') {
-    if (args.length > 1) {
-      fail('status does not accept extra arguments');
+    if (rest.length > 0) {
+      fail(`status does not accept extra arguments: ${rest.join(' ')}`);
     }
-    runStatus();
+    runStatus(project || null);
+    return;
+  }
+  if (command === 'list') {
+    if (args.length > 1) {
+      fail(`list does not accept extra arguments: ${args.slice(1).join(' ')}`);
+    }
+    runList();
     return;
   }
 

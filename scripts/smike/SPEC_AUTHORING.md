@@ -2,7 +2,9 @@
 
 A spec handed to `./smike <spec.md> [context.md ...]` is parsed by `cli.mjs` → `buildPlanningBundle` (heading-exact). This guide lists every input the parser reads so your spec ingests cleanly on the first pass.
 
-`./smike <spec...>` now bootstraps new projects in a draft planning state first. Draft bootstrap writes the planning bundle skeleton but skips checker/auditor gating until `./smike cycle <project>` can promote the bundle with concrete summaries and proof commands. Once promoted, the normal planning bundle includes `PLAN.json`, `ROADMAP.md`, `STRATEGY.md`, phase plans, checker + auditor, and runtime delegation.
+`./smike <spec...>` now bootstraps new projects in a draft planning state first. Draft bootstrap writes the planning bundle skeleton but skips checker/auditor gating until `./smike cycle <project>` can promote the bundle with concrete summaries and proof commands. Once promoted, the normal planning bundle includes `PLAN.json`, `ROADMAP.md`, `STRATEGY.md`, phase plans, checker + auditor, and the runtime dispatch view embedded in `STATE.json`.
+
+If you only have a short request, use `./smike "<prompt>" [--context=path1,path2] [--spec=memories/name.md]`. SMIKE auto-routes that into a draft spec, including `## Intake Prompt` and `## Clarifying Questions`, then enters the same `planning_draft` flow described below.
 
 ---
 
@@ -48,7 +50,8 @@ Missing any of these triggers `buildPlanningLintFindings` (cli.mjs ~L3970):
 | `## Required Deliverable From This Loop` **or** `## Planner Must Produce` | medium | bulleted outputs the checker audits against |
 | Legacy aliases accepted: `## Main Deliverable`, `## Required Deliverables From Planning`, `## Required Deliverables From Execution` | note | these now feed the same deliverable extraction path |
 | `## Required Planning Output Shape` **or** `## Priority N:` headings | **high** | phase decomposition — without this SMIKE silently collapses to one generic phase |
-| Legacy planning-shape hint accepted: `## Recommended First Executable Phase` | note | can seed a fallback executable phase, but it does **not** satisfy the required planning-shape lint on its own |
+| `## Required Plan 01 Contract` | note | optional but load-bearing when Plan 01 has a hard scope contract beyond the normal phase graph |
+| Legacy alias accepted: `## Recommended First Executable Phase` | note | treated as a legacy alias for `Required Plan 01 Contract`; avoid “Recommended” because the checker treats these bullets as mandatory for Plan 01 when present |
 
 ---
 
@@ -65,7 +68,8 @@ Each is extracted as a list and forwarded into the planning bundle:
 | `## Scope Out` | `non_goals` | accepted legacy alias |
 | `## Integration Requirements` | `integration_requirements` + `planning_decisions` | bullets are captured; bullets under `The plan must decide:` are split into a separate decision list |
 | `## Risk Hotspots` | `risk_hotspots` | broad/high-risk bundles should usually reflect these in phase-level verification |
-| `## Recommended First Executable Phase` | `recommended_first_phase_items` | still not a substitute for `Required Planning Output Shape`, but the checker now compares Plan 01 against these bullets when present |
+| `## Required Plan 01 Contract` | `first_phase_contract_items` | optional hard contract for Plan 01; when present, the checker compares Plan 01 against these bullets |
+| `## Recommended First Executable Phase` | `first_phase_contract_items` | legacy alias for `Required Plan 01 Contract` |
 | `## Explicit Deferrals` | `explicit_deferrals` | rendered separately from non-goals so deferrals are visible as deliberate follow-on work |
 | `## Protected / High-Collision Areas` | `protected_areas` | narrows inferred write scope; auto-enables full planning analysis |
 | `## Known Current Drift Seeds` | `drift_seeds` | investigation hints (especially useful in research mode) |
@@ -89,7 +93,7 @@ Inside `## Required Planning Output Shape`, each phase is one line (`parsePhaseB
 | `depends` | comma list of `NN` | explicit DAG edges. Omit → auto-chain to prior phase. Empty → runnable in parallel with siblings |
 | `category` | keyword | drives inferred write scope and risk analysis |
 | `write_scope` (alias `scope`) | comma list of globs | overrides category-inferred scope |
-| `verify` | pipe-separated command ids | verify command ids referenced in phase acceptance |
+| `verify` | pipe-separated shell commands | each entry becomes a concrete verify command; use real commands, not symbolic ids |
 
 **Categories** recognized by `categoryWriteScopeGlobs` (cli.mjs ~L3612):
 `permissions`, `route-architecture`, `doc-drift`, `dead-code`, `verification`, `ui-component`, `migration`, `general`.
@@ -98,7 +102,43 @@ Inside `## Required Planning Output Shape`, each phase is one line (`parsePhaseB
 
 Fallback: if neither blueprint lines nor `Priority N:` headings exist, SMIKE emits a single generic `Implementation` phase. This is almost never what you want — include at least two blueprint lines so the planner actually decomposes the work.
 
-The planning checker also blocks broad implementation bundles when every code-bearing phase still has fallback scope text (`Implement ...`) or when all such phases rely only on generic reusable verification (`typecheck`, `unit-tests`, etc.). If your first phase has a special contract in `## Recommended First Executable Phase`, Plan 01 must materially reflect it.
+The planning checker also blocks broad implementation bundles when every code-bearing phase still has fallback scope text (`Implement ...`) or when all such phases rely only on generic reusable verification (`typecheck`, `unit-tests`, etc.). If your first phase has a special contract in `## Required Plan 01 Contract`, Plan 01 must materially reflect it.
+
+### Load-bearing parser contract
+
+These are not hints. They are parser inputs:
+
+- Phase summaries come from `## Priority N:` sections.
+- Inline `verify:` directives on `- Plan NN:` lines are parsed as shell commands.
+- `planning_draft` is spec-driven: edits to `.smike/**` are rebuilt from the spec on the next cycle.
+
+Bad example:
+
+```markdown
+## Required Planning Output Shape
+- Plan 01: Schema slice (category:migration)
+- Plan 02: Route slice (depends:01; category:permissions)
+```
+
+Why it fails:
+
+- no `## Priority 1:` / `## Priority 2:` summaries, so SMIKE falls back to generic `Implement ...` scope text
+- no inline `verify:` commands, so SMIKE falls back to generic `typecheck` / `unit-tests`
+- fixing `.smike/<project>/phases/*` by hand will not stick during `planning_draft`
+
+Good example:
+
+```markdown
+## Required Planning Output Shape
+- Plan 01: Schema slice (category:migration; write_scope:packages/worker/src/db/**, packages/shared/src/**; verify:npx vitest run tests/unit/schema-slice.test.ts)
+- Plan 02: Route slice (depends:01; category:permissions; write_scope:packages/worker/src/routes/**; verify:npx vitest run tests/unit/route-auth.test.ts)
+
+## Priority 1: Schema slice
+Create the schema and shared contracts with an explicit write surface and a phase-specific proof command.
+
+## Priority 2: Route slice
+Add the route/auth surface after the schema lands, with a targeted auth verification command.
+```
 
 ---
 
@@ -150,10 +190,10 @@ On top of the required sections, add:
 Review projects typically decompose as:
 
 ```
-- Plan 01: Truth snapshot / reconciliation (category:doc-drift; verify:research-artifacts)
-- Plan 02: Targeted investigation A (depends:01; category:permissions; verify:research-artifacts)
-- Plan 03: Targeted investigation B (depends:01; category:dead-code; verify:research-artifacts)
-- Plan 04: Findings consolidation + proposed follow-on plan (depends:02,03; category:general; verify:research-artifacts)
+- Plan 01: Truth snapshot / reconciliation (category:doc-drift)
+- Plan 02: Targeted investigation A (depends:01; category:permissions)
+- Plan 03: Targeted investigation B (depends:01; category:dead-code)
+- Plan 04: Findings consolidation + proposed follow-on plan (depends:02,03; category:general)
 ```
 
 The point is: one grounding phase, a few parallel investigations, one synthesis phase that produces the actual recommended plan.
@@ -173,7 +213,7 @@ Before running `./smike <spec.md>`, answer each:
 3. Does each `Plan NN:` line have a `category` or a `write_scope`? Without one, the planner falls back to generic globs.
 4. Are `depends:` edges correct, or are you relying on auto-chain when phases are actually parallelizable?
 5. Are protected/high-collision areas real (active in-flight work, dirty-worktree risk) or just vague caution? Vague caution makes the strategist too conservative.
-6. If you wrote `## Recommended First Executable Phase`, does Plan 01 obviously satisfy most of those bullets, or are you asking the checker to bless a mismatch?
+6. If you wrote `## Required Plan 01 Contract`, does Plan 01 obviously satisfy most of those bullets, or are you asking the checker to bless a mismatch?
 7. For review mode: is your finding schema dictated, or will you get back unstructured prose?
 
 If any answer is "not really," fix the spec. Bad specs either lint-fail fast or — worse — lint-pass and silently produce a weak plan.
@@ -207,8 +247,8 @@ If any answer is "not really," fix the spec. Bad specs either lint-fail fast or 
 1. <concrete output>
 
 ## Required Planning Output Shape
-- Plan 01: First slice (category:worker; write_scope:packages/worker/**; verify:unit-tests)
-- Plan 02: Second slice (depends:01; category:ui-component; write_scope:packages/dashboard/**; verify:typecheck)
+- Plan 01: First slice (category:migration; write_scope:packages/worker/**; verify:npx vitest run tests/unit/first-slice.test.ts)
+- Plan 02: Second slice (depends:01; category:ui-component; write_scope:packages/dashboard/**; verify:npx vitest run tests/unit/second-slice.test.ts)
 ```
 
 ## Minimum viable spec — review / research
@@ -240,10 +280,10 @@ Each finding must carry `high` | `medium` | `low`. Only `high` and strong `mediu
 2. A consolidated recommended follow-on plan in the synthesis phase.
 
 ## Required Planning Output Shape
-- Plan 01: Truth snapshot (category:doc-drift; verify:research-artifacts)
-- Plan 02: Investigation A (depends:01; category:permissions; verify:research-artifacts)
-- Plan 03: Investigation B (depends:01; category:dead-code; verify:research-artifacts)
-- Plan 04: Synthesis and recommended plan (depends:02,03; category:general; verify:research-artifacts)
+- Plan 01: Truth snapshot (category:doc-drift)
+- Plan 02: Investigation A (depends:01; category:permissions)
+- Plan 03: Investigation B (depends:01; category:dead-code)
+- Plan 04: Synthesis and recommended plan (depends:02,03; category:general)
 ```
 
 ---

@@ -2,6 +2,9 @@
   "name": "smike-framework",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "ajv": "8.18.0"
+  },
   "bin": {
     "smike-framework": "./smike"
   },
