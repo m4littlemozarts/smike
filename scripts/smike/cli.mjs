@@ -3463,6 +3463,44 @@ function buildRetryDispatchCommand(project, dispatchId = '<dispatch-id>') {
   return `./smike dispatch ${project} retry ${dispatchId}`;
 }
 
+function isUnchangedSpawnBaselineFailure(entry) {
+  const freshnessStatus = typeof entry?.freshness?.status === 'string' ? entry.freshness.status.trim() : '';
+  if (freshnessStatus === 'unchanged') {
+    return true;
+  }
+  const failureText = [
+    typeof entry?.failure_reason === 'string' ? entry.failure_reason : '',
+    typeof entry?.freshness?.reason === 'string' ? entry.freshness.reason : '',
+  ]
+    .join(' ')
+    .toLowerCase();
+  return failureText.includes('spawn baseline');
+}
+
+function buildFailedRuntimeDispatchNextStep(project, runtimeDispatchPending) {
+  const pendingPlansText = describePendingRuntimePlans(runtimeDispatchPending);
+  const failedEntries = runtimeDispatchPending.failed_dispatches;
+  const failedIds = failedEntries.map((entry) => entry.dispatch_id).join(', ');
+  const retryCommand = buildRetryDispatchCommand(project, failedEntries[0]?.dispatch_id || '<dispatch-id>');
+  const advanceCommand = buildAdvanceCommand(project);
+  if (failedEntries.length === 1 && isUnchangedSpawnBaselineFailure(failedEntries[0])) {
+    return {
+      next_action:
+        `Resolve failed runtime dispatches for ${pendingPlansText}: ${failedIds}. `
+        + `The required result artifacts were unchanged from the spawn baseline, which usually means they were edited before \`spawned\` was recorded. `
+        + `Retry the dispatch with \`${retryCommand}\`, rerun \`${advanceCommand}\` to respawn it, then rewrite the required artifacts after spawn.`,
+      next_command: retryCommand,
+    };
+  }
+
+  return {
+    next_action:
+      `Resolve failed runtime dispatches for ${pendingPlansText}: ${failedIds}. `
+      + `Retry them with \`${retryCommand}\`, then rerun \`${advanceCommand}\`.`,
+    next_command: retryCommand,
+  };
+}
+
 function buildCompleteDispatchGroupCommand(project, group = 'current') {
   return `./smike dispatch ${project} complete-group ${group}`;
 }
@@ -3688,27 +3726,11 @@ function applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPen
   }
 
   const pendingPlansText = describePendingRuntimePlans(runtimeDispatchPending);
-  if (runtimeDispatchPending.ready_dispatches.length > 0) {
-    if (options.readyLifecycle === 'in_progress') {
-      const lifecycle = buildReadyRuntimeDispatchFollowOnState(project, runtimeDispatchPending);
-      state.lifecycle.status = lifecycle.status;
-      setLifecycleStopReason(state, lifecycle.stop_reason);
-      setLifecycleNextStep(state, lifecycle.next_action, lifecycle.next_command);
-    } else {
-      enterAwaitingRuntimeDispatch(state, project, runtimeDispatchPending);
-    }
-    return true;
-  }
-
   setLifecycleStopReason(state, null);
   if (runtimeDispatchPending.failed_dispatches.length > 0) {
     state.lifecycle.status = 'in_progress';
-    const failedIds = runtimeDispatchPending.failed_dispatches.map((entry) => entry.dispatch_id).join(', ');
-    setLifecycleNextStep(
-      state,
-      `Resolve failed runtime dispatches for ${pendingPlansText}: ${failedIds}. Retry them with \`${buildRetryDispatchCommand(project)}\`, then rerun \`${buildCycleCommand(project)}\`.`,
-      buildRetryDispatchCommand(project, runtimeDispatchPending.failed_dispatches[0]?.dispatch_id || '<dispatch-id>'),
-    );
+    const failureNextStep = buildFailedRuntimeDispatchNextStep(project, runtimeDispatchPending);
+    setLifecycleNextStep(state, failureNextStep.next_action, failureNextStep.next_command);
     return true;
   }
 
@@ -3720,6 +3742,18 @@ function applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPen
       `Wait for runtime dispatches to finish for ${pendingPlansText}: ${activeIds}. Then rerun \`${buildCycleCommand(project)}\`.`,
       buildCycleCommand(project),
     );
+    return true;
+  }
+
+  if (runtimeDispatchPending.ready_dispatches.length > 0) {
+    if (options.readyLifecycle === 'in_progress') {
+      const lifecycle = buildReadyRuntimeDispatchFollowOnState(project, runtimeDispatchPending);
+      state.lifecycle.status = lifecycle.status;
+      setLifecycleStopReason(state, lifecycle.stop_reason);
+      setLifecycleNextStep(state, lifecycle.next_action, lifecycle.next_command);
+    } else {
+      enterAwaitingRuntimeDispatch(state, project, runtimeDispatchPending);
+    }
     return true;
   }
 
@@ -10807,16 +10841,25 @@ function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
   }
 
   if (entry.artifact_change_required && artifactSnapshotEquivalent(entry.spawn_baseline, snapshots)) {
+    const retryCommand = buildRetryDispatchCommand(project, dispatchId);
+    const advanceCommand = buildAdvanceCommand(project);
+    const recoveryReason =
+      'Result artifacts did not change after spawn. '
+      + `If they were edited before \`spawned\` was recorded, run \`${retryCommand}\`, rerun \`${advanceCommand}\` to respawn, then rewrite the artifacts after spawn.`;
     entry.freshness = createDispatchFreshness(
       'unchanged',
-      'Result artifacts did not change after the dispatch was spawned.',
+      recoveryReason,
       at,
     );
-    updateRuntimeDispatchStatus(entry, 'failed', 'Result artifacts did not change after spawn.', at);
+    updateRuntimeDispatchStatus(entry, 'failed', recoveryReason, at);
     const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
     applyRuntimeDispatchPendingLifecycle(project, state, buildRuntimeDispatchPendingState(nextRuntimeContext));
     persistProjectState(project, paths, state, rootPlan);
-    fail(`dispatch ${dispatchId} cannot be completed: result artifacts are unchanged from the spawn baseline`);
+    fail(
+      `dispatch ${dispatchId} cannot be completed: result artifacts are unchanged from the spawn baseline\n`
+      + `recovery: if those artifacts were edited before \`spawned\` was recorded, run \`${retryCommand}\`, `
+      + `rerun \`${advanceCommand}\` to respawn, then rewrite the required artifacts after spawn`,
+    );
   }
 
   entry.completion_artifacts = snapshots;
@@ -10965,7 +11008,7 @@ function runDispatch(project, action, dispatchId, options = {}) {
       setLifecycleStopReason(state, null);
       setLifecycleNextStep(
         state,
-        `Runtime dispatch ${dispatchId} failed. Retry it with \`${buildRetryDispatchCommand(project, dispatchId)}\`, then rerun \`${buildCycleCommand(project)}\`.`,
+        `Runtime dispatch ${dispatchId} failed. Retry it with \`${buildRetryDispatchCommand(project, dispatchId)}\`, then rerun \`${buildAdvanceCommand(project)}\`.`,
         buildRetryDispatchCommand(project, dispatchId),
       );
     }

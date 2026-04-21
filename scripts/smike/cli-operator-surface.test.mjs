@@ -48,6 +48,15 @@ function runCli(args, extraEnv = {}) {
   });
 }
 
+function runCliExpectFailure(args, extraEnv = {}) {
+  try {
+    runCli(args, extraEnv);
+  } catch (error) {
+    return `${error.stdout || ''}${error.stderr || ''}`;
+  }
+  assert.fail(`expected command to fail: ${args.join(' ')}`);
+}
+
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(repoRoot, relativePath), 'utf8'));
 }
@@ -61,14 +70,18 @@ function cleanupProject(project, specRel) {
   fs.rmSync(path.join(repoRoot, specRel), { force: true });
 }
 
+function appendStrategistNarrativeArtifacts(project, note) {
+  const strategyPath = path.join(repoRoot, `.smike/${project}/STRATEGY.md`);
+  const roadmapPath = path.join(repoRoot, `.smike/${project}/ROADMAP.md`);
+  fs.appendFileSync(strategyPath, `\n- ${note}\n`, 'utf8');
+  fs.appendFileSync(roadmapPath, `\n- ${note}\n`, 'utf8');
+}
+
 function promotePlanningToAwaitingFreshSession(project) {
   const strategistDispatchId = `${project}-plan-strategist`;
   runCli(['dispatch', project, 'spawned', strategistDispatchId], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
 
-  const strategyPath = path.join(repoRoot, `.smike/${project}/STRATEGY.md`);
-  const roadmapPath = path.join(repoRoot, `.smike/${project}/ROADMAP.md`);
-  fs.appendFileSync(strategyPath, '\n- strategist runtime completion test\n', 'utf8');
-  fs.appendFileSync(roadmapPath, '\n- strategist runtime completion test\n', 'utf8');
+  appendStrategistNarrativeArtifacts(project, 'strategist runtime completion test');
   runCli(['dispatch', project, 'completed', strategistDispatchId], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
 
   runCli(['dispatch', project, 'spawned', '01-detailer'], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
@@ -150,6 +163,59 @@ Define the schema slice with explicit boundaries, concrete proof obligations, an
 
     assert.match(entryOutput, new RegExp(`${strategistDispatchId} -> spawned`));
     assert.equal(state.orchestration.runtime_dispatches.by_id[strategistDispatchId].status, 'spawned');
+  } finally {
+    cleanupProject(project, specRel);
+  }
+});
+
+test('unchanged spawn-baseline failures point to retry plus advance recovery', () => {
+  const specRel = `.smike-test-tmp/smike-operator-${Date.now()}-spawn-baseline.md`;
+  const project = slugifyProjectName(specRel);
+
+  writeSpec(specRel, `# Runtime-Owned Planning
+
+## Objective
+Produce a planning bundle that is concrete enough to pass planning review and queue runtime-owned planning dispatches.
+
+## Required Deliverable From This Loop
+1. A concrete planning bundle with phase-specific verification.
+
+## Required Planning Output Shape
+- Plan 01: Schema slice (category:migration; write_scope:scripts/smike/**; verify:printf phase-01-proof)
+
+## Priority 1: Schema slice
+Define the schema slice with explicit boundaries, concrete proof obligations, and a reviewable write surface.
+`);
+
+  try {
+    runCli([specRel], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
+    const strategistDispatchId = `${project}-plan-strategist`;
+
+    appendStrategistNarrativeArtifacts(project, 'pre-spawn artifact drift');
+    runCli(['dispatch', project, 'spawned', strategistDispatchId], { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' });
+    const failureOutput = runCliExpectFailure(
+      ['dispatch', project, 'completed', strategistDispatchId],
+      { SMIKE_ALLOW_TEST_ACTIVE_PROJECT: '1' },
+    );
+    const state = readJson(`.smike/${project}/STATE.json`);
+
+    assert.match(failureOutput, /unchanged from the spawn baseline/);
+    assert.match(
+      failureOutput,
+      new RegExp(`\\.\\/smike dispatch ${project} retry ${strategistDispatchId}`),
+    );
+    assert.match(
+      failureOutput,
+      new RegExp(`\\.\\/smike advance ${project}`),
+    );
+    assert.equal(state.orchestration.runtime_dispatches.by_id[strategistDispatchId].status, 'failed');
+    assert.equal(state.lifecycle.next_command, `./smike dispatch ${project} retry ${strategistDispatchId}`);
+    assert.match(state.lifecycle.next_action, /edited before `spawned` was recorded/);
+    assert.equal(
+      state.lifecycle.next_action.includes(`rerun \`./smike advance ${project}\` to respawn`),
+      true,
+    );
+    assert.equal(state.lifecycle.next_action.includes('./smike cycle'), false);
   } finally {
     cleanupProject(project, specRel);
   }
