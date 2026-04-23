@@ -2,7 +2,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createDispatchHelpers } from './lib/dispatch.mjs';
 import { createBuildPlanningAuditorRecord } from './lib/auditor.mjs';
@@ -11,12 +10,56 @@ import {
   buildPlanningDraftPromotionCheck,
   planningAnalysisIsExecutionReady,
 } from './lib/planning-readiness.mjs';
+import {
+  buildDependencyNextAction,
+  buildPlanningDraftCorrectionLoop,
+  describeDependencyBlockers,
+  describeDependencyTargets,
+  getActionableDependencyTargets,
+  getDependencyBlockerSummaryLines,
+  getPlanningDraftCorrectionSummaryLines,
+  getPlanningDraftNoticeLines,
+} from './lib/operator-surface.mjs';
 import { createBuildReviewRecord } from './lib/review.mjs';
+import { buildDerivedArtifactPayloads } from './lib/derived-artifacts.mjs';
 import {
   collectCompletionRequirementFailures,
   normalizeDispatchCompletionRequirements,
   verifiedArtifactPathsFromCompletionArtifacts,
 } from './lib/runtime-artifact-surface.mjs';
+import { createStateMarkdownRenderer } from './lib/state-markdown.mjs';
+import {
+  createPortabilityHeuristics,
+  loadRepoPortabilityHeuristicsConfig,
+} from './lib/portability-heuristics.mjs';
+import { createCompatibilityAuditor } from './lib/compatibility-audit.mjs';
+import {
+  compactCapsuleValue,
+  ensureArray,
+  escapeRegex,
+  matchesAnyGlob,
+  normalizeRel,
+  normalizeStringArray,
+  safeSlug,
+  shellEscape,
+  sortByKey,
+  sortObjectKeys,
+  sortStrings,
+  uniqueStrings,
+} from './lib/common-utils.mjs';
+import { createContractVerifier } from './lib/contract-verifier.mjs';
+import { createFileHelpers } from './lib/filesystem.mjs';
+import {
+  createProcessHelpers,
+  looksLikeSmikeProcessCommand,
+  processExists,
+  readProcessMetadata,
+} from './lib/process-helpers.mjs';
+import { createProjectLockHelpers } from './lib/project-locks.mjs';
+import { createPlanningAnalysisStateHelpers } from './lib/planning-analysis-state.mjs';
+import { createPlanningBuilders } from './lib/planning-builders.mjs';
+import { createPlanningCapsuleWriter } from './lib/planning-capsules.mjs';
+import { createPlanningMarkdownRenderers } from './lib/planning-renderers.mjs';
 import { createValidationHelpers } from './lib/validation.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,9 +70,11 @@ const REPO_ROOT = process.env.SMIKE_PROJECT_ROOT
   : process.cwd();
 const SMIKE_ROOT = path.join(REPO_ROOT, '.smike');
 const SMIKE_ARCHIVE_ROOT = path.join(REPO_ROOT, '.smike-archive');
+const SMIKE_SNAPSHOT_ROOT = path.join(REPO_ROOT, '.smike-snapshots');
 const ACTIVE_PROJECT_PATH = path.join(SMIKE_ROOT, 'ACTIVE.json');
 const PLAN_SCHEMA_PATH = path.join(__dirname, 'schemas', 'plan.schema.json');
 const STATE_SCHEMA_PATH = path.join(__dirname, 'schemas', 'state.schema.json');
+const PLAN_QUALITY_FIXTURE_MANIFEST_PATH = path.join(__dirname, 'fixtures', 'plan-quality', 'manifest.json');
 const ROOT_PLAN_SCHEMA_REF = process.env.SMIKE_PLAN_SCHEMA_REF || '../../scripts/smike/schemas/plan.schema.json';
 const PHASE_PLAN_SCHEMA_REF =
   process.env.SMIKE_PHASE_PLAN_SCHEMA_REF || '../../../../scripts/smike/schemas/plan.schema.json';
@@ -41,6 +86,8 @@ const ADDITIONAL_CONTEXT_LIMIT = 8;
 const STATE_GOTCHA_LIMIT = 50;
 const OPERATOR_NOTES_START = '<!-- SMIKE:OPERATOR-NOTES:START -->';
 const OPERATOR_NOTES_END = '<!-- SMIKE:OPERATOR-NOTES:END -->';
+const MANAGED_CONTRACT_START = '<!-- SMIKE:CONTRACT:START -->';
+const MANAGED_CONTRACT_END = '<!-- SMIKE:CONTRACT:END -->';
 const DEFAULT_OPERATOR_NOTES_PROMPT =
   '- Add manual follow-ups here when SMIKE surfaces something subtle that the automatic pass missed.';
 const SMIKE_PARENT_TEST_RUNNER_ENV = 'SMIKE_PARENT_TEST_RUNNER';
@@ -50,6 +97,7 @@ const SMIKE_NESTED_TEST_SKIP_STDOUT = 'smike-nested-test-run-skipped';
 const FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON = 'fresh-session-for-implementation';
 const AWAITING_FRESH_SESSION_LIFECYCLE_STATUS = 'awaiting_fresh_session';
 const PLANNING_DRAFT_LIFECYCLE_STATUS = 'planning_draft';
+const DEFAULT_FRESH_SESSION_GATE = 'initial_only';
 const TEST_RUNNER_ENV_HINTS = [
   'VITEST',
   'VITEST_POOL_ID',
@@ -73,14 +121,20 @@ const SMIKE_FEEDBACK_SYNC_MODE = (() => {
   return raw === 'planning_complete' ? 'planning_complete' : 'full';
 })();
 const KNOWN_PHASE_REFRESH_MODES = new Set(['lightweight', 'auto_detailer_on_drift', 'always_detailer']);
+const THIN_EXECUTOR_FIRST_IMPLEMENTATION_PROFILE = 'thin_executor_first';
+const RESEARCH_FINDINGS_RUNTIME_PROFILE = 'research_findings_runtime_chain';
+const KNOWN_FRESH_SESSION_GATES = new Set(['initial_only', 'never']);
 const DEFAULT_FEEDBACK_NOTES_PROMPT =
   '- Add durable workflow follow-ups here when a SMIKE run reveals something worth keeping in repo memory.';
-const RESERVED_COMMANDS = new Set(['advance', 'cycle', 'recheck', 'doctor', 'validate', 'generate', 'activate', 'resume', 'status', 'list', 'dispatch', 'archive', 'restore', 'gc', 'intake']);
+const DEFAULT_RUNTIME_DISPATCH_LEASE_MS = (() => {
+  const raw = Number.parseInt(process.env.SMIKE_RUNTIME_DISPATCH_LEASE_MS || '', 10);
+  return Number.isInteger(raw) && raw >= 1 ? raw : 30 * 60 * 1000;
+})();
+const RUNTIME_SESSION_ID = crypto.randomUUID();
+const RESERVED_COMMANDS = new Set(['advance', 'cycle', 'recheck', 'doctor', 'validate', 'generate', 'activate', 'resume', 'status', 'list', 'dispatch', 'archive', 'restore', 'reset-planning', 'gc', 'intake', 'fresh']);
 const DEFAULT_SHELL_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SHELL_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const MANAGED_CHILD_REAP_GRACE_MS = 500;
-const MANAGED_CHILDREN = new Map();
-let managedChildCleanupHooksInstalled = false;
 const DEFAULT_REVIEW_ANTI_PATTERNS = [
   'Do not treat executor output as proof; rerun verification in JUDGE.',
   'Do not mark a plan complete on exit codes alone when ACs need behavioral evidence.',
@@ -89,6 +143,97 @@ const DEFAULT_REVIEW_ANTI_PATTERNS = [
   'Do not treat broad write scope as harmless; call out blast radius when it appears.',
   'Do not rubber-stamp a pass when acceptance coverage is weaker than the stated objective.',
 ];
+const PLAN_SCHEMA_TOP_LEVEL_KEYS = [
+  '$schema',
+  'schema_version',
+  'profile',
+  'plan_id',
+  'phase',
+  'spec',
+  'objective',
+  'scope',
+  'depends_on',
+  'feature_flags',
+  'notes',
+  'risks',
+  'allowed_files',
+  'blocked_files',
+  'write_scope',
+  'preflight',
+  'verify_commands',
+  'acceptance_criteria',
+  'postflight',
+  'planning_context',
+  'workflow',
+  'execution_policy',
+  'delegation',
+  'orchestration',
+  'quality_gates',
+];
+const PLANNING_CONTEXT_ALLOWED_KEYS = [
+  'truth_sources',
+  'explicit_deferrals',
+  'protected_areas',
+  'production_gate',
+  'optional_phase',
+  'phase_order_notes',
+  'parallel_groups',
+  'operator_checkpoints',
+  'collision_matrix',
+  'risk_controls',
+];
+const PHASE_PLAN_MUTABLE_KEYS = [
+  'objective',
+  'scope',
+  'depends_on',
+  'notes',
+  'risks',
+  'allowed_files',
+  'blocked_files',
+  'write_scope',
+  'preflight',
+  'verify_commands',
+  'acceptance_criteria',
+  'postflight',
+  'feature_flags',
+  'workflow',
+  'execution_policy',
+  'delegation',
+  'orchestration',
+  'quality_gates',
+];
+
+function quoteKeyList(keys) {
+  return keys.map((key) => `"${key}"`).join(', ');
+}
+
+function buildPlanningSchemaContract(role) {
+  if (role === 'strategist') {
+    return {
+      allowed_plan_keys: PLAN_SCHEMA_TOP_LEVEL_KEYS,
+      allowed_planning_context_keys: PLANNING_CONTEXT_ALLOWED_KEYS,
+      guidance: [
+        `Stay inside existing PLAN.json top-level keys only: ${quoteKeyList(PLAN_SCHEMA_TOP_LEVEL_KEYS)}.`,
+        `If you add structured planning metadata under planning_context, only use: ${quoteKeyList(PLANNING_CONTEXT_ALLOWED_KEYS)}.`,
+        'Put plan-wide sequencing, operator checkpoints, and collision notes into notes, risks, or allowed planning_context keys; do not invent ad hoc top-level fields such as "phase_blueprints".',
+      ],
+    };
+  }
+
+  if (role === 'detailer') {
+    return {
+      allowed_phase_plan_keys: PLAN_SCHEMA_TOP_LEVEL_KEYS,
+      preferred_sharpening_keys: PHASE_PLAN_MUTABLE_KEYS,
+      guidance: [
+        `Stay inside the phase PLAN.json schema and sharpen existing keys only: ${quoteKeyList(PHASE_PLAN_MUTABLE_KEYS)}.`,
+        'Do not invent ad hoc phase fields or copy root-only planning metadata into a phase plan.',
+      ],
+    };
+  }
+
+  return {};
+}
+
 const ROLE_DEFINITIONS = {
   strategist: {
     stage: 'planning',
@@ -103,8 +248,8 @@ const ROLE_DEFINITIONS = {
       'Do not jump into implementation before decomposing the spec.',
       'Do not ignore required references or repo invariants named by the spec.',
       'Do not create broad write scopes when the work can be sliced more narrowly.',
+      'Do not invent new PLAN.json top-level keys or unsupported planning_context keys; use notes, risks, or the allowed planning_context schema instead.',
     ],
-    expected_outputs: ['STRATEGY.md', 'ROADMAP.md', 'PLAN.json', 'phase plans'],
   },
   detailer: {
     stage: 'planning',
@@ -119,8 +264,8 @@ const ROLE_DEFINITIONS = {
       'Do not over-decompose into a long tail of tiny tasks.',
       'Do not omit verification or leave acceptance criteria vague.',
       'Do not assume sibling interfaces without naming the dependency explicitly.',
+      'Do not invent new phase PLAN.json keys when the schema already has a place for the information.',
     ],
-    expected_outputs: ['phase PLAN.json'],
   },
   checker: {
     stage: 'planning',
@@ -136,7 +281,6 @@ const ROLE_DEFINITIONS = {
       'Do not escalate speculative conflicts that lack evidence from the actual plan graph.',
       'Do not request code changes when the issue is only documentation or planning phrasing.',
     ],
-    expected_outputs: ['cross-plan discovery notes', 'routing corrections'],
   },
   auditor: {
     stage: 'planning',
@@ -152,7 +296,6 @@ const ROLE_DEFINITIONS = {
       'Do not invent dependencies or workstreams not supported by the spec.',
       'Do not confuse ambiguous prose with a mandatory hard requirement.',
     ],
-    expected_outputs: ['coverage notes', 'scope-gap guidance'],
   },
   executor: {
     stage: 'execution',
@@ -168,7 +311,6 @@ const ROLE_DEFINITIONS = {
       'Do not hide partial work or verification shortcuts in the execution summary.',
       'Do not rely on files outside the declared write scope without surfacing the need.',
     ],
-    expected_outputs: ['EXEC-REPORT.md', 'code changes inside write scope'],
   },
   judge: {
     stage: 'execution',
@@ -180,7 +322,6 @@ const ROLE_DEFINITIONS = {
       'Check boundaries, scope drift, and whether baseline issues were called out honestly.',
     ],
     anti_patterns: DEFAULT_REVIEW_ANTI_PATTERNS,
-    expected_outputs: ['VERDICT.md'],
   },
   reviewer: {
     stage: 'execution',
@@ -192,7 +333,6 @@ const ROLE_DEFINITIONS = {
       'Surface weak evidence, contract gaps, and risky blast radius patterns.',
     ],
     anti_patterns: DEFAULT_REVIEW_ANTI_PATTERNS,
-    expected_outputs: ['REVIEW.md'],
   },
   fixer: {
     stage: 'execution',
@@ -208,7 +348,6 @@ const ROLE_DEFINITIONS = {
       'Do not “fix” speculative issues that are not in the failure capsule.',
       'Do not expand file scope without proving the reported issue cannot be solved locally.',
     ],
-    expected_outputs: ['FIX capsule or targeted repair work'],
   },
 };
 const KNOWN_ROLES = Object.keys(ROLE_DEFINITIONS);
@@ -238,16 +377,22 @@ function usage() {
   smike <spec.md|spec-slug> [context.md ...]
   smike "<freeform prompt...>" [--context=path1,path2] [--spec=memories/name.md]
   smike <project>
+  smike fresh <spec.md|spec-slug> [context.md ...]
   smike advance [project]
   smike cycle <project> [--no-auto-continue] [--max-phases=<n>]
   smike recheck <project>
   smike doctor [project]
   smike dispatch <project> <spawned|completed|failed|retry> <dispatch-id> [--reason=<text>]
   smike dispatch <project> complete-group <current|group-number>
-  smike archive <project> [--mode=compact|full] [--force]
+  smike archive <project> [--mode=compact|full] [--force] [--abandon-live-dispatches]
   smike restore <project>
+  smike reset-planning <project>
   smike gc
   smike validate <project>
+  smike validate --contracts
+  smike validate --compatibility
+  smike validate --plan-quality <spec.md> [context.md ...] [--json]
+  smike validate --plan-quality-fixtures
   smike generate <project>
   smike activate <project>
   smike resume [project]
@@ -264,251 +409,155 @@ function fail(message, code = 1) {
   process.exit(code);
 }
 
+const {
+  ensureDir,
+  isPathInside,
+  readJson,
+  removeIfExists,
+  writeJson,
+} = createFileHelpers({ fail });
+
+let portabilityHeuristics;
+try {
+  portabilityHeuristics = createPortabilityHeuristics(loadRepoPortabilityHeuristicsConfig({ repoRoot: REPO_ROOT }));
+} catch (error) {
+  fail(error.message);
+}
+
+const {
+  cleanupManagedChildrenSync,
+  guardTestVerifyCommand,
+  inferNestedTestGuardStdoutToken,
+  isParentTestRunnerContext,
+  resolveRuntimeOwnerPid,
+  runShell,
+  runShellSync,
+} = createProcessHelpers({
+  repoRoot: REPO_ROOT,
+  testRunnerEnvHints: TEST_RUNNER_ENV_HINTS,
+  smikeParentTestRunnerEnv: SMIKE_PARENT_TEST_RUNNER_ENV,
+  smikeAllowNestedTestRunsEnv: SMIKE_ALLOW_NESTED_TEST_RUNS_ENV,
+  smikeAllowTestActiveProjectEnv: SMIKE_ALLOW_TEST_ACTIVE_PROJECT_ENV,
+  smikeNestedTestSkipStdout: SMIKE_NESTED_TEST_SKIP_STDOUT,
+  defaultShellTimeoutMs: DEFAULT_SHELL_TIMEOUT_MS,
+  defaultShellOutputLimit: DEFAULT_SHELL_OUTPUT_LIMIT,
+  managedChildReapGraceMs: MANAGED_CHILD_REAP_GRACE_MS,
+  isTestLikeCommand,
+  shellEscape,
+});
+
+const {
+  acquireProjectLock,
+  pruneStaleProjectLocks,
+} = createProjectLockHelpers({
+  smikeRoot: SMIKE_ROOT,
+  repoRoot: REPO_ROOT,
+  getProjectPaths,
+  ensureDir,
+  normalizeRel,
+  fail,
+  nowIso,
+  cleanupManagedChildrenSync,
+  processExists,
+  readProcessMetadata,
+  looksLikeSmikeProcessCommand,
+});
+
+const renderStateMarkdown = createStateMarkdownRenderer({
+  repoRoot: REPO_ROOT,
+  buildDependencyGroups,
+  buildDependencyNextAction,
+  buildImplementationProfileSurface,
+  buildCycleCommand,
+  describeDependencyBlockers,
+  describeDependencyTargets,
+  ensureDiscoveryLog,
+  ensureOrchestrationState,
+  getCurrentRuntimeDispatchEntriesFromState,
+  getLifecycleNextCommand,
+  getOperatorGuidanceLines,
+  getPlanningDraftNoticeLines,
+  getRuntimeDispatchLeaseExpiry,
+  summarizeRuntimeDispatchOwner,
+  summarizeRuntimeDispatchState,
+});
+
+const {
+  renderPlanningPlanMarkdown,
+  renderProjectMarkdown,
+} = createPlanningMarkdownRenderers({
+  buildPlanningContextFromBundle,
+});
+
+const {
+  writePlanningRoleCapsules,
+} = createPlanningCapsuleWriter({
+  capsuleRefLimit: CAPSULE_REF_LIMIT,
+  buildPlanningSchemaContract,
+  buildPlanningRoleResultArtifacts,
+  buildRoleCapsule,
+  ensureOrchestrationState,
+  normalizePathList,
+  recordRoleHistory,
+  resolveOrchestrationConfig,
+  updateCapsuleRefs,
+  writeRoleCapsule,
+});
+
+const {
+  resolvePlanningAnalysisForMode,
+  buildPlanningRootPlan,
+  buildPhasePlan,
+  buildPlanningState,
+  buildPlanningPhaseContracts,
+} = createPlanningBuilders({
+  rootPlanSchemaRef: ROOT_PLAN_SCHEMA_REF,
+  phasePlanSchemaRef: PHASE_PLAN_SCHEMA_REF,
+  rootStateSchemaRef: ROOT_STATE_SCHEMA_REF,
+  defaultFreshSessionGate: DEFAULT_FRESH_SESSION_GATE,
+  defaultMaxPhasesPerRun: DEFAULT_MAX_PHASES_PER_RUN,
+  stateGotchaLimit: STATE_GOTCHA_LIMIT,
+  planningDraftLifecycleStatus: PLANNING_DRAFT_LIFECYCLE_STATUS,
+  thinExecutorFirstImplementationProfile: THIN_EXECUTOR_FIRST_IMPLEMENTATION_PROFILE,
+  researchFindingsRuntimeProfile: RESEARCH_FINDINGS_RUNTIME_PROFILE,
+  repoRoot: REPO_ROOT,
+  portabilityHeuristics,
+  readTemplateJson,
+  normalizePathList,
+  normalizeStringArray,
+  buildPlanningContextFromBundle,
+  buildPlanningBundleCheckCommand,
+  buildPlanningReportCheckCommand,
+  buildPhaseVerifyCommands,
+  buildAcceptanceCriteria,
+  getResearchResultPaths,
+  buildCycleCommand,
+  hashPlanContract,
+  hashPlanningContext,
+  trimStateGotchas,
+  nowIso,
+});
+
+const {
+  loadPlanningAnalysis,
+  getPlanningPhasePlanPaths,
+  getPlanningSourceArtifactPaths,
+  getPlanningVerificationArtifactPaths,
+  getPlanningArtifactFreshness,
+  buildPlanningVerificationState,
+  syncPlanningVerificationState,
+  buildPlanningBlockedNextAction,
+} = createPlanningAnalysisStateHelpers({
+  repoRoot: REPO_ROOT,
+  readOptionalJson,
+  walkRelativeFiles,
+  ensureArray,
+  buildRecheckCommand,
+  nowIso,
+});
+
 function nowIso() {
   return new Date().toISOString();
-}
-
-function normalizeRel(p) {
-  return p.replaceAll('\\\\', '/').replace(/^\.\//, '').trim();
-}
-
-function compactCapsuleValue(value) {
-  if (value === null || value === undefined) {
-    return undefined;
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
-  }
-  if (Array.isArray(value)) {
-    const compacted = value
-      .map((entry) => compactCapsuleValue(entry))
-      .filter((entry) => entry !== undefined);
-    return compacted.length > 0 ? compacted : undefined;
-  }
-  if (typeof value === 'object') {
-    const compacted = Object.fromEntries(
-      Object.entries(value)
-        .map(([key, entry]) => [key, compactCapsuleValue(entry)])
-        .filter(([, entry]) => entry !== undefined),
-    );
-    return Object.keys(compacted).length > 0 ? compacted : undefined;
-  }
-  return value;
-}
-
-function shellEscape(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function looksLikeTestRunnerCommand(command) {
-  return /\b(vitest|jest|mocha|ava|tap)\b/i.test(String(command || ''));
-}
-
-function readProcessMetadata(pid) {
-  if (!Number.isInteger(pid) || pid <= 0 || process.platform === 'win32') {
-    return null;
-  }
-
-  const result = spawnSync('ps', ['-o', 'ppid=', '-o', 'command=', '-p', String(pid)], {
-    encoding: 'utf8',
-    timeout: 5_000,
-    maxBuffer: 64 * 1024,
-  });
-  if (result.status !== 0) {
-    return null;
-  }
-
-  const line = String(result.stdout || '')
-    .split('\n')
-    .map((entry) => entry.trim())
-    .find(Boolean);
-  if (!line) {
-    return null;
-  }
-
-  const match = line.match(/^(\d+)\s+(.*)$/);
-  if (!match) {
-    return null;
-  }
-
-  return {
-    ppid: Number.parseInt(match[1], 10),
-    command: match[2],
-  };
-}
-
-function looksLikeSmikeProcessCommand(command) {
-  return /(?:^|[\s/])smike(?:[\s]|$)|scripts[\\/]+smike[\\/]+cli\.mjs/i.test(String(command || ''));
-}
-
-function processExists(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === 'ESRCH') {
-      return false;
-    }
-    return true;
-  }
-}
-
-function readLockMtimeMs(lockPath) {
-  try {
-    return fs.statSync(lockPath).mtimeMs;
-  } catch {
-    return null;
-  }
-}
-
-function inspectProjectLock(lockPath) {
-  if (!fs.existsSync(lockPath)) {
-    return {
-      stale: false,
-      reason: null,
-      record: null,
-    };
-  }
-
-  const lockInfoPath = path.join(lockPath, 'lock.json');
-  const lockAgeMs = (() => {
-    const mtimeMs = readLockMtimeMs(lockPath);
-    return typeof mtimeMs === 'number' ? Math.max(0, Date.now() - mtimeMs) : null;
-  })();
-
-  if (!fs.existsSync(lockInfoPath)) {
-    return {
-      stale: lockAgeMs === null || lockAgeMs >= 5_000,
-      reason: 'lock directory is missing lock.json',
-      record: null,
-    };
-  }
-
-  let record;
-  try {
-    record = JSON.parse(fs.readFileSync(lockInfoPath, 'utf8'));
-  } catch {
-    return {
-      stale: lockAgeMs === null || lockAgeMs >= 5_000,
-      reason: 'lock.json is unreadable',
-      record: null,
-    };
-  }
-
-  const pid = Number.parseInt(String(record?.pid ?? ''), 10);
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return {
-      stale: lockAgeMs === null || lockAgeMs >= 5_000,
-      reason: 'lock.json is missing a valid pid',
-      record,
-    };
-  }
-
-  if (!processExists(pid)) {
-    return {
-      stale: true,
-      reason: `pid ${pid} is not running`,
-      record,
-    };
-  }
-
-  const metadata = readProcessMetadata(pid);
-  if (metadata && !looksLikeSmikeProcessCommand(metadata.command)) {
-    return {
-      stale: true,
-      reason: `pid ${pid} does not look like an active SMIKE process`,
-      record,
-    };
-  }
-
-  return {
-    stale: false,
-    reason: null,
-    record,
-  };
-}
-
-function clearProjectLock(lockPath) {
-  fs.rmSync(lockPath, { recursive: true, force: true });
-}
-
-function pruneStaleProjectLocks() {
-  if (!fs.existsSync(SMIKE_ROOT)) {
-    return;
-  }
-
-  for (const entry of fs.readdirSync(SMIKE_ROOT, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-
-    const lockPath = path.join(SMIKE_ROOT, entry.name, '.lock');
-    const inspection = inspectProjectLock(lockPath);
-    if (inspection.stale) {
-      clearProjectLock(lockPath);
-    }
-  }
-}
-
-function parentProcessLooksLikeTestRunner(maxDepth = 2) {
-  let pid = process.ppid;
-  let depth = 0;
-
-  while (Number.isInteger(pid) && pid > 0 && depth < maxDepth) {
-    const metadata = readProcessMetadata(pid);
-    if (!metadata) {
-      return false;
-    }
-    if (looksLikeTestRunnerCommand(metadata.command)) {
-      return true;
-    }
-    pid = metadata.ppid;
-    depth += 1;
-  }
-
-  return false;
-}
-
-function isParentTestRunnerContext(env = process.env) {
-  if (env[SMIKE_PARENT_TEST_RUNNER_ENV] === '1') {
-    return true;
-  }
-
-  if (env[SMIKE_ALLOW_NESTED_TEST_RUNS_ENV] === '1') {
-    return false;
-  }
-
-  if (TEST_RUNNER_ENV_HINTS.some((name) => typeof env[name] === 'string' && env[name].trim().length > 0)) {
-    return true;
-  }
-
-  const lifecycle = `${env.npm_lifecycle_event || ''} ${env.npm_lifecycle_script || ''}`;
-  return /\b(vitest|jest|mocha|ava|tap)\b/i.test(lifecycle) || parentProcessLooksLikeTestRunner();
-}
-
-function buildManagedCommandEnv(baseEnv = process.env) {
-  const managedEnv = {
-    ...baseEnv,
-  };
-  delete managedEnv[SMIKE_ALLOW_TEST_ACTIVE_PROJECT_ENV];
-
-  if (
-    managedEnv[SMIKE_ALLOW_NESTED_TEST_RUNS_ENV] === '1'
-    || managedEnv[SMIKE_PARENT_TEST_RUNNER_ENV] === '1'
-    || !isParentTestRunnerContext(managedEnv)
-  ) {
-    return managedEnv;
-  }
-
-  return {
-    ...managedEnv,
-    [SMIKE_PARENT_TEST_RUNNER_ENV]: '1',
-  };
 }
 
 function isTestLikeCommand(command) {
@@ -516,432 +565,7 @@ function isTestLikeCommand(command) {
   if (!normalized) {
     return false;
   }
-
-  return (
-    /\b(vitest|jest|mocha|ava|tap)\b/i.test(normalized)
-    || /\b(?:npm|pnpm|yarn|bun)\b[^\n]*\btest(?:[:\w-]+)?\b/i.test(normalized)
-  );
-}
-
-function guardNestedTestCommand(command, options = {}) {
-  const stdoutToken = typeof options.stdoutToken === 'string' && options.stdoutToken.trim().length > 0
-    ? options.stdoutToken.trim()
-    : SMIKE_NESTED_TEST_SKIP_STDOUT;
-
-  return `if [ "\${${SMIKE_ALLOW_NESTED_TEST_RUNS_ENV}:-}" = "1" ] || [ "\${${SMIKE_PARENT_TEST_RUNNER_ENV}:-0}" != "1" ]; then ( ${command} ); else printf '%s\\n' ${shellEscape(stdoutToken)}; fi`;
-}
-
-function guardTestVerifyCommand(command, options = {}) {
-  return isTestLikeCommand(command) ? guardNestedTestCommand(command, options) : command;
-}
-
-function inferNestedTestGuardStdoutToken(expectation = {}) {
-  const stdoutIncludes = Array.isArray(expectation?.stdout_includes)
-    ? expectation.stdout_includes
-      .filter((value) => typeof value === 'string')
-      .map((value) => value.trim())
-      .filter(Boolean)
-    : [];
-  return stdoutIncludes.length === 1 ? stdoutIncludes[0] : null;
-}
-
-function readJson(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch (error) {
-    fail(`invalid JSON at ${filePath}: ${error.message}`);
-  }
-}
-
-function writeJson(filePath, value) {
-  ensureDir(path.dirname(filePath));
-  const tempPath = path.join(
-    path.dirname(filePath),
-    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`,
-  );
-  try {
-    fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    fs.renameSync(tempPath, filePath);
-  } finally {
-    if (fs.existsSync(tempPath)) {
-      fs.rmSync(tempPath, { force: true });
-    }
-  }
-}
-
-function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function acquireProjectLock(project, commandName) {
-  const paths = getProjectPaths(project);
-  ensureDir(paths.projectDir);
-  const lockPath = path.join(paths.projectDir, '.lock');
-  const lockRel = normalizeRel(path.relative(REPO_ROOT, lockPath));
-  let acquired = false;
-
-  try {
-    fs.mkdirSync(lockPath);
-    acquired = true;
-  } catch (error) {
-    if (error && error.code === 'EEXIST') {
-      const inspection = inspectProjectLock(lockPath);
-      if (!inspection.stale) {
-        fail(`project ${project} is locked by another SMIKE command: ${lockRel}`);
-      }
-
-      try {
-        clearProjectLock(lockPath);
-        fs.mkdirSync(lockPath);
-        acquired = true;
-      } catch (retryError) {
-        if (retryError && retryError.code === 'EEXIST') {
-          fail(`project ${project} is locked by another SMIKE command: ${lockRel}`);
-        }
-        fail(`failed to clear stale project lock for ${project}: ${retryError.message}`);
-      }
-    } else {
-      fail(`failed to acquire project lock for ${project}: ${error.message}`);
-    }
-  }
-
-  if (!acquired) {
-    fail(`failed to acquire project lock for ${project}: unknown lock acquisition state`);
-  }
-
-  fs.writeFileSync(
-    path.join(lockPath, 'lock.json'),
-    `${JSON.stringify({
-      project,
-      command: commandName || 'unknown',
-      pid: process.pid,
-      acquired_at: nowIso(),
-    }, null, 2)}\n`,
-    'utf8',
-  );
-
-  let released = false;
-  const cleanup = () => {
-    if (released) {
-      return;
-    }
-    released = true;
-    try {
-      fs.rmSync(lockPath, { recursive: true, force: true });
-    } catch {
-      // Best-effort cleanup only.
-    }
-  };
-  const exitHandler = () => cleanup();
-  const sigintHandler = () => {
-    cleanupManagedChildrenSync('SIGINT');
-    cleanup();
-    process.exit(130);
-  };
-  const sigtermHandler = () => {
-    cleanupManagedChildrenSync('SIGTERM');
-    cleanup();
-    process.exit(143);
-  };
-
-  process.once('exit', exitHandler);
-  process.once('SIGINT', sigintHandler);
-  process.once('SIGTERM', sigtermHandler);
-
-  return () => {
-    cleanup();
-    process.removeListener('exit', exitHandler);
-    process.removeListener('SIGINT', sigintHandler);
-    process.removeListener('SIGTERM', sigtermHandler);
-  };
-}
-
-function isPathInside(rootPath, candidatePath) {
-  const root = path.resolve(rootPath);
-  const candidate = path.resolve(candidatePath);
-  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
-}
-
-function appendShellOutput(current, chunk, limit = DEFAULT_SHELL_OUTPUT_LIMIT) {
-  const text = typeof chunk === 'string' ? chunk : chunk ? chunk.toString('utf8') : '';
-  if (!text || current.length >= limit) {
-    return current;
-  }
-  const next = current + text;
-  return next.length > limit ? next.slice(0, limit) : next;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function runQuietProcessSync(command, args) {
-  try {
-    return spawnSync(command, args, {
-      stdio: 'ignore',
-      encoding: 'utf8',
-    });
-  } catch {
-    return null;
-  }
-}
-
-function signalProcessGroup(pid, signal) {
-  if (process.platform === 'win32' || !Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(-pid, signal);
-    return true;
-  } catch (error) {
-    if (error?.code === 'ESRCH') {
-      return false;
-    }
-    return false;
-  }
-}
-
-function sweepDirectChildrenSync(parentPid, signal = 'TERM') {
-  if (process.platform === 'win32' || !Number.isInteger(parentPid) || parentPid <= 0) {
-    return;
-  }
-  runQuietProcessSync('pkill', [`-${signal}`, '-P', String(parentPid)]);
-}
-
-function processGroupHasMembersSync(groupPid) {
-  if (process.platform === 'win32' || !Number.isInteger(groupPid) || groupPid <= 0) {
-    return false;
-  }
-  const result = runQuietProcessSync('pgrep', ['-g', String(groupPid)]);
-  return Boolean(result && result.status === 0);
-}
-
-function processHasDirectChildrenSync(parentPid) {
-  if (process.platform === 'win32' || !Number.isInteger(parentPid) || parentPid <= 0) {
-    return false;
-  }
-  const result = runQuietProcessSync('pgrep', ['-P', String(parentPid)]);
-  return Boolean(result && result.status === 0);
-}
-
-async function reapManagedChild(info, options = {}) {
-  const graceMs = typeof options.graceMs === 'number' ? options.graceMs : MANAGED_CHILD_REAP_GRACE_MS;
-  if (!info || info.reaped || !Number.isInteger(info.pid) || info.pid <= 0) {
-    return;
-  }
-
-  const hasSurvivors =
-    options.force === true
-    || processGroupHasMembersSync(info.pid)
-    || processHasDirectChildrenSync(info.pid);
-  if (!hasSurvivors) {
-    return;
-  }
-
-  info.reaped = true;
-  if (process.platform === 'win32') {
-    runQuietProcessSync('taskkill', ['/pid', String(info.pid), '/t', '/f']);
-    return;
-  }
-
-  signalProcessGroup(info.pid, 'SIGTERM');
-  sweepDirectChildrenSync(info.pid, 'TERM');
-  await sleep(graceMs);
-
-  if (processGroupHasMembersSync(info.pid) || processHasDirectChildrenSync(info.pid)) {
-    signalProcessGroup(info.pid, 'SIGKILL');
-    sweepDirectChildrenSync(info.pid, 'KILL');
-  }
-}
-
-function reapManagedChildSync(info) {
-  if (!info || !Number.isInteger(info.pid) || info.pid <= 0) {
-    return;
-  }
-  if (process.platform === 'win32') {
-    runQuietProcessSync('taskkill', ['/pid', String(info.pid), '/t', '/f']);
-    return;
-  }
-  signalProcessGroup(info.pid, 'SIGTERM');
-  sweepDirectChildrenSync(info.pid, 'TERM');
-  signalProcessGroup(info.pid, 'SIGKILL');
-  sweepDirectChildrenSync(info.pid, 'KILL');
-}
-
-function cleanupManagedChildrenSync(reason = 'exit') {
-  for (const info of MANAGED_CHILDREN.values()) {
-    info.cleanup_reason = reason;
-    reapManagedChildSync(info);
-  }
-  sweepDirectChildrenSync(process.pid, 'TERM');
-  sweepDirectChildrenSync(process.pid, 'KILL');
-}
-
-function ensureManagedChildCleanupHooks() {
-  if (managedChildCleanupHooksInstalled) {
-    return;
-  }
-  managedChildCleanupHooksInstalled = true;
-
-  process.on('exit', () => {
-    cleanupManagedChildrenSync('exit');
-  });
-  process.on('uncaughtExceptionMonitor', () => {
-    cleanupManagedChildrenSync('uncaughtException');
-  });
-}
-
-function runShellSync(command, options = {}) {
-  const cwd = options.cwd || REPO_ROOT;
-  const timeoutMs = options.timeoutMs || DEFAULT_SHELL_TIMEOUT_MS;
-  const start = Date.now();
-  const result = spawnSync(command, {
-    cwd,
-    shell: true,
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    maxBuffer: DEFAULT_SHELL_OUTPUT_LIMIT,
-    env: buildManagedCommandEnv(process.env),
-  });
-  const durationMs = Date.now() - start;
-  const status = result.status ?? -1;
-  const stdout = result.stdout || '';
-  const stderr = result.stderr || '';
-  const timedOut = Boolean(result.error && result.error.code === 'ETIMEDOUT');
-  return {
-    command,
-    cwd,
-    durationMs,
-    status,
-    stdout,
-    stderr,
-    timedOut,
-    error: result.error ? String(result.error.message || result.error) : null,
-    ok: status === 0 && !timedOut,
-  };
-}
-
-async function runShell(command, options = {}) {
-  ensureManagedChildCleanupHooks();
-
-  const cwd = options.cwd || REPO_ROOT;
-  const timeoutMs = options.timeoutMs || DEFAULT_SHELL_TIMEOUT_MS;
-  const start = Date.now();
-  const shell = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh';
-  const shellArgs =
-    process.platform === 'win32'
-      ? ['/d', '/s', '/c', command]
-      : ['-lc', command];
-
-  return await new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    let spawnError = null;
-    let settled = false;
-    let timeoutHandle = null;
-
-    const child = spawn(shell, shellArgs, {
-      cwd,
-      detached: process.platform !== 'win32',
-      env: buildManagedCommandEnv(process.env),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-
-    const info = {
-      pid: child.pid,
-      command,
-      cwd,
-      child,
-      reaped: false,
-    };
-    if (Number.isInteger(child.pid) && child.pid > 0) {
-      MANAGED_CHILDREN.set(child.pid, info);
-    }
-
-    const finalize = async (code, signal) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeoutHandle);
-      MANAGED_CHILDREN.delete(info.pid);
-      await reapManagedChild(info, { graceMs: MANAGED_CHILD_REAP_GRACE_MS });
-
-      const durationMs = Date.now() - start;
-      const status = typeof code === 'number' ? code : -1;
-      resolve({
-        command,
-        cwd,
-        durationMs,
-        status,
-        stdout,
-        stderr,
-        signal: signal || null,
-        timedOut,
-        error:
-          spawnError
-            ? String(spawnError.message || spawnError)
-            : timedOut ? `Command timed out after ${timeoutMs}ms` : null,
-        ok: status === 0 && !timedOut,
-      });
-    };
-
-    if (child.stdout) {
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk) => {
-        stdout = appendShellOutput(stdout, chunk);
-      });
-    }
-    if (child.stderr) {
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk) => {
-        stderr = appendShellOutput(stderr, chunk);
-      });
-    }
-
-    child.once('error', async (error) => {
-      spawnError = error;
-      await finalize(null, null);
-    });
-    child.once('close', async (code, signal) => {
-      await finalize(code, signal);
-    });
-
-    timeoutHandle = setTimeout(async () => {
-      timedOut = true;
-      await reapManagedChild(info, {
-        force: true,
-        graceMs: MANAGED_CHILD_REAP_GRACE_MS,
-      });
-    }, timeoutMs);
-  });
-}
-
-function uniqueStrings(values) {
-  return [...new Set(values.map((value) => String(value)))];
-}
-
-function ensureArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function normalizeStringArray(values) {
-  return uniqueStrings(
-    ensureArray(values)
-      .map((value) => String(value).trim())
-      .filter(Boolean),
-  );
-}
-
-function safeSlug(value) {
-  return String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'item';
+  return portabilityHeuristics.looksLikeTestVerificationCommand({ run: normalized });
 }
 
 function inferPlanStage(project, plan) {
@@ -988,7 +612,6 @@ function normalizeRoleConfig(stage, role, config = {}) {
     independent: false,
     focus_areas: [],
     anti_patterns: [],
-    expected_outputs: [],
   };
   const roleConfig =
     config && typeof config === 'object' && !Array.isArray(config)
@@ -1016,7 +639,6 @@ function normalizeRoleConfig(stage, role, config = {}) {
         : definition.anti_patterns,
     ),
     additional_context: normalizeStringArray(roleConfig.additional_context || []),
-    expected_outputs: normalizeStringArray(definition.expected_outputs || []),
   };
 }
 
@@ -1048,20 +670,23 @@ function normalizeDelegationConfig(plan = {}) {
       : {};
   const mode = KNOWN_DELEGATION_MODES.has(raw.mode) ? raw.mode : 'local_only';
   const owner = KNOWN_DELEGATION_OWNERS.has(raw.owner) ? raw.owner : 'smike_runner';
+  const executionPolicy = normalizeExecutionPolicy(plan);
 
   return {
     mode,
     owner,
-    runtime_roles: normalizeStringArray(raw.runtime_roles || []),
-    dispatch_artifacts: normalizePathList(raw.dispatch_artifacts || []),
+    runtime_roles: normalizeStringArray(
+      raw.runtime_roles && raw.runtime_roles.length > 0
+        ? raw.runtime_roles
+        : executionPolicy.runtime.roles,
+    ),
     result_artifacts: normalizePathList(raw.result_artifacts || []),
   };
 }
 
 function defaultAutoRuntimeRoles(plan = {}) {
-  const preferred = normalizeStringArray(plan?.delegation?.runtime_roles || [])
-    .filter((role) => role === 'executor');
-  return preferred.length > 0 ? preferred : ['executor'];
+  const executionPolicy = normalizeExecutionPolicy(plan);
+  return constrainRuntimeRolesForExecutionProfile(plan, executionPolicy.runtime.roles, ['executor']);
 }
 
 function normalizePhaseRefreshMode(plan = {}) {
@@ -1083,6 +708,186 @@ function normalizePhaseRefreshMode(plan = {}) {
   return 'lightweight';
 }
 
+function normalizeExecutionPolicy(plan = {}) {
+  const rawPolicy =
+    plan?.execution_policy && typeof plan.execution_policy === 'object' && !Array.isArray(plan.execution_policy)
+      ? plan.execution_policy
+      : {};
+  const rawRuntime =
+    rawPolicy.runtime && typeof rawPolicy.runtime === 'object' && !Array.isArray(rawPolicy.runtime)
+      ? rawPolicy.runtime
+      : {};
+  const rawQuality =
+    rawPolicy.quality && typeof rawPolicy.quality === 'object' && !Array.isArray(rawPolicy.quality)
+      ? rawPolicy.quality
+      : {};
+  const rawQualityGates =
+    plan?.quality_gates && typeof plan.quality_gates === 'object' && !Array.isArray(plan.quality_gates)
+      ? plan.quality_gates
+      : {};
+  const rawJudge =
+    rawQualityGates.judge && typeof rawQualityGates.judge === 'object' && !Array.isArray(rawQualityGates.judge)
+      ? rawQualityGates.judge
+      : {};
+  const rawReview =
+    rawQualityGates.review && typeof rawQualityGates.review === 'object' && !Array.isArray(rawQualityGates.review)
+      ? rawQualityGates.review
+      : {};
+
+  return {
+    profile: typeof rawPolicy.profile === 'string' && rawPolicy.profile.trim()
+      ? rawPolicy.profile.trim()
+      : null,
+    runtime: {
+      promotion: typeof rawRuntime.promotion === 'string' && rawRuntime.promotion.trim()
+        ? rawRuntime.promotion.trim()
+        : null,
+      roles: normalizeStringArray(
+        rawRuntime.roles
+        || plan?.delegation?.runtime_roles
+        || [],
+      ),
+      follow_on_roles: typeof rawRuntime.follow_on_roles === 'string' && rawRuntime.follow_on_roles.trim()
+        ? rawRuntime.follow_on_roles.trim()
+        : null,
+    },
+    quality: {
+      judge_rerun_verify: typeof rawQuality.judge_rerun_verify === 'boolean'
+        ? rawQuality.judge_rerun_verify
+        : rawJudge.rerun_verify !== false,
+      review_focus_areas: normalizeStringArray(rawQuality.review_focus_areas || rawReview.focus_areas || []),
+      review_anti_patterns: normalizeStringArray(
+        rawQuality.review_anti_patterns && rawQuality.review_anti_patterns.length > 0
+          ? rawQuality.review_anti_patterns
+          : rawReview.anti_patterns && rawReview.anti_patterns.length > 0
+            ? rawReview.anti_patterns
+            : DEFAULT_REVIEW_ANTI_PATTERNS,
+      ),
+    },
+  };
+}
+
+function resolveExecutionProfile(plan = {}) {
+  const stage = inferPlanStage('', plan);
+  const executionPolicy = normalizeExecutionPolicy(plan);
+  const rawFlags =
+    plan?.feature_flags && typeof plan.feature_flags === 'object' && !Array.isArray(plan.feature_flags)
+      ? plan.feature_flags
+      : {};
+  if (stage !== 'execution') {
+    return {
+      profile: null,
+      runtime_promotion: 'not_applicable',
+      runtime_follow_on_roles: 'not_applicable',
+      allowed_runtime_roles: null,
+    };
+  }
+
+  const requestedProfile = executionPolicy.profile || (
+    typeof rawFlags.implementation_profile === 'string'
+      ? rawFlags.implementation_profile.trim()
+      : ''
+  );
+  if (requestedProfile === RESEARCH_FINDINGS_RUNTIME_PROFILE) {
+    return {
+      profile: RESEARCH_FINDINGS_RUNTIME_PROFILE,
+      runtime_promotion: executionPolicy.runtime.promotion || (
+        typeof rawFlags.implementation_runtime_promotion === 'string'
+        && rawFlags.implementation_runtime_promotion.trim()
+          ? rawFlags.implementation_runtime_promotion.trim()
+          : 'declared_runtime_roles'
+      ),
+      runtime_follow_on_roles: executionPolicy.runtime.follow_on_roles || (
+        typeof rawFlags.implementation_runtime_follow_on_roles === 'string'
+        && rawFlags.implementation_runtime_follow_on_roles.trim()
+          ? rawFlags.implementation_runtime_follow_on_roles.trim()
+          : 'allow_declared_runtime_roles'
+      ),
+      allowed_runtime_roles: null,
+    };
+  }
+
+  return {
+    profile: THIN_EXECUTOR_FIRST_IMPLEMENTATION_PROFILE,
+    runtime_promotion: executionPolicy.runtime.promotion || (
+      typeof rawFlags.implementation_runtime_promotion === 'string'
+      && rawFlags.implementation_runtime_promotion.trim()
+        ? rawFlags.implementation_runtime_promotion.trim()
+        : 'complexity_gated_executor_only'
+    ),
+    runtime_follow_on_roles: executionPolicy.runtime.follow_on_roles || (
+      typeof rawFlags.implementation_runtime_follow_on_roles === 'string'
+      && rawFlags.implementation_runtime_follow_on_roles.trim()
+        ? rawFlags.implementation_runtime_follow_on_roles.trim()
+        : 'local_only'
+    ),
+    allowed_runtime_roles: new Set(['executor']),
+  };
+}
+
+function constrainRuntimeRolesForExecutionProfile(plan = {}, roles = [], fallbackRoles = []) {
+  const policy = resolveExecutionProfile(plan);
+  const normalizedRoles = normalizeStringArray(roles);
+  if (!(policy.allowed_runtime_roles instanceof Set)) {
+    return normalizedRoles;
+  }
+
+  const filteredRoles = normalizedRoles.filter((role) => policy.allowed_runtime_roles.has(role));
+  if (filteredRoles.length > 0) {
+    return filteredRoles;
+  }
+
+  return normalizeStringArray(fallbackRoles)
+    .filter((role) => policy.allowed_runtime_roles.has(role));
+}
+
+function readCurrentPlanForOperatorSurface(state) {
+  const planJsonRel = typeof state?.current_plan?.plan_json === 'string'
+    ? state.current_plan.plan_json.trim()
+    : '';
+  if (!planJsonRel) {
+    return null;
+  }
+  const planJsonPath = path.resolve(REPO_ROOT, planJsonRel);
+  if (!fs.existsSync(planJsonPath)) {
+    return null;
+  }
+  try {
+    return readJson(planJsonPath);
+  } catch {
+    return null;
+  }
+}
+
+function buildImplementationProfileSurface(project, state) {
+  const currentPlan = readCurrentPlanForOperatorSurface(state);
+  if (!currentPlan || inferPlanStage(project, currentPlan) !== 'execution') {
+    return null;
+  }
+
+  const executionProfile = resolveExecutionProfile(currentPlan);
+  const resolvedDelegation = resolveExecutionDelegation(project, state, { plan: currentPlan });
+  return {
+    profile: executionProfile.profile || THIN_EXECUTOR_FIRST_IMPLEMENTATION_PROFILE,
+    runtime_promotion: executionProfile.runtime_promotion || 'unknown',
+    runtime_follow_on_roles: executionProfile.runtime_follow_on_roles || 'unknown',
+    runtime_roles: normalizeStringArray(resolvedDelegation.runtime_roles || []),
+  };
+}
+
+function getImplementationProfileSummaryLines(project, state) {
+  const surface = buildImplementationProfileSurface(project, state);
+  if (!surface) {
+    return [];
+  }
+  return [
+    `execution_profile: ${surface.profile}`,
+    `runtime_promotion: ${surface.runtime_promotion}`,
+    `runtime_follow_on_roles: ${surface.runtime_follow_on_roles}`,
+    `runtime_roles: ${surface.runtime_roles.join(', ') || 'none'}`,
+  ];
+}
+
 function createDispatchFreshness(status = 'pending', reason = null, checkedAt = null) {
   const normalizedStatus = KNOWN_RUNTIME_DISPATCH_FRESHNESS.has(status) ? status : 'pending';
   return {
@@ -1090,6 +895,154 @@ function createDispatchFreshness(status = 'pending', reason = null, checkedAt = 
     checked_at: checkedAt,
     reason: typeof reason === 'string' && reason.trim() ? reason.trim() : null,
   };
+}
+
+function normalizeRuntimeDispatchOwner(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const sessionId = typeof value.session_id === 'string' && value.session_id.trim()
+    ? value.session_id.trim()
+    : null;
+  const command = typeof value.command === 'string' && value.command.trim()
+    ? value.command.trim()
+    : null;
+  const claimedAt = typeof value.claimed_at === 'string' && value.claimed_at.trim()
+    ? value.claimed_at.trim()
+    : null;
+  const leaseDurationMs = Number.isInteger(value.lease_duration_ms) && value.lease_duration_ms >= 1
+    ? value.lease_duration_ms
+    : DEFAULT_RUNTIME_DISPATCH_LEASE_MS;
+  const leaseExpiresAt = typeof value.lease_expires_at === 'string' && value.lease_expires_at.trim()
+    ? value.lease_expires_at.trim()
+    : (claimedAt ? new Date(Date.parse(claimedAt) + leaseDurationMs).toISOString() : null);
+
+  if (!sessionId && !command && !claimedAt && !leaseExpiresAt) {
+    return null;
+  }
+
+  return {
+    session_id: sessionId,
+    pid: Number.isInteger(value.pid) && value.pid >= 1 ? value.pid : null,
+    host: typeof value.host === 'string' && value.host.trim() ? value.host.trim() : 'smike_runner',
+    command,
+    claimed_at: claimedAt,
+    lease_duration_ms: leaseDurationMs,
+    lease_expires_at: leaseExpiresAt,
+  };
+}
+
+function buildRuntimeDispatchOwner(command, at = nowIso()) {
+  const claimedAt = typeof at === 'string' && at.trim() ? at : nowIso();
+  const ownerPid = resolveRuntimeOwnerPid();
+  return normalizeRuntimeDispatchOwner({
+    session_id: RUNTIME_SESSION_ID,
+    pid: ownerPid,
+    host: 'smike_runner',
+    command,
+    claimed_at: claimedAt,
+    lease_duration_ms: DEFAULT_RUNTIME_DISPATCH_LEASE_MS,
+    lease_expires_at: new Date(Date.parse(claimedAt) + DEFAULT_RUNTIME_DISPATCH_LEASE_MS).toISOString(),
+  });
+}
+
+function moveActiveRuntimeDispatchOwnerToHistory(entry) {
+  const activeOwner = normalizeRuntimeDispatchOwner(entry?.active_owner);
+  if (activeOwner) {
+    entry.last_owner = activeOwner;
+  }
+  entry.active_owner = null;
+}
+
+function setActiveRuntimeDispatchOwner(entry, owner) {
+  moveActiveRuntimeDispatchOwnerToHistory(entry);
+  entry.active_owner = normalizeRuntimeDispatchOwner(owner);
+}
+
+function getRuntimeDispatchLeaseExpiry(entry) {
+  const activeOwner = normalizeRuntimeDispatchOwner(entry?.active_owner);
+  if (activeOwner?.lease_expires_at) {
+    return activeOwner.lease_expires_at;
+  }
+
+  const lastSpawnedAt = typeof entry?.last_spawned_at === 'string' && entry.last_spawned_at.trim()
+    ? entry.last_spawned_at.trim()
+    : null;
+  if (!lastSpawnedAt) {
+    return null;
+  }
+  const leaseDurationMs = activeOwner?.lease_duration_ms || DEFAULT_RUNTIME_DISPATCH_LEASE_MS;
+  return new Date(Date.parse(lastSpawnedAt) + leaseDurationMs).toISOString();
+}
+
+function isRuntimeDispatchLeaseExpired(entry, now = nowIso()) {
+  if (entry?.status !== 'spawned') {
+    return false;
+  }
+  const leaseExpiresAt = getRuntimeDispatchLeaseExpiry(entry);
+  if (!leaseExpiresAt) {
+    return false;
+  }
+  const expiryTime = Date.parse(leaseExpiresAt);
+  const nowTime = Date.parse(now);
+  return Number.isFinite(expiryTime) && Number.isFinite(nowTime) && expiryTime <= nowTime;
+}
+
+function inspectRuntimeDispatchOwnerHealth(entry) {
+  if (entry?.status !== 'spawned') {
+    return { orphaned: false, reason: null };
+  }
+
+  const activeOwner = normalizeRuntimeDispatchOwner(entry?.active_owner);
+  if (!activeOwner) {
+    return {
+      orphaned: true,
+      reason: 'Runtime dispatch is marked spawned but has no active owner.',
+    };
+  }
+
+  if (activeOwner.host && activeOwner.host !== 'smike_runner') {
+    return { orphaned: false, reason: null };
+  }
+
+  const pid = Number.parseInt(String(activeOwner.pid ?? ''), 10);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return {
+      orphaned: true,
+      reason: 'Runtime dispatch owner is missing a valid pid.',
+    };
+  }
+
+  if (!processExists(pid)) {
+    return {
+      orphaned: true,
+      reason: `Runtime dispatch owner pid ${pid} exited before completing the dispatch.`,
+    };
+  }
+
+  return { orphaned: false, reason: null };
+}
+
+function buildRuntimeDispatchLeaseExpiredReason(entry, now = nowIso()) {
+  const leaseExpiresAt = getRuntimeDispatchLeaseExpiry(entry);
+  if (!leaseExpiresAt) {
+    return 'Runtime dispatch lease expired.';
+  }
+  return `Runtime dispatch lease expired at ${leaseExpiresAt}; the previous owner did not reconcile completion before ${now}.`;
+}
+
+function summarizeRuntimeDispatchOwner(owner) {
+  const normalizedOwner = normalizeRuntimeDispatchOwner(owner);
+  if (!normalizedOwner) {
+    return 'unclaimed';
+  }
+
+  const sessionText = normalizedOwner.session_id || 'unknown-session';
+  const commandText = normalizedOwner.command || 'unknown-command';
+  const pidText = normalizedOwner.pid || 'unknown-pid';
+  const leaseText = normalizedOwner.lease_expires_at || 'unknown-lease';
+  return `${sessionText} / pid ${pidText} / ${commandText} / lease ${leaseText}`;
 }
 
 function normalizeArtifactSnapshotList(value) {
@@ -1156,6 +1109,8 @@ function ensureRuntimeDispatchState(orchestration) {
     rawEntry.failure_reason = typeof rawEntry.failure_reason === 'string' && rawEntry.failure_reason.trim()
       ? rawEntry.failure_reason.trim()
       : null;
+    rawEntry.active_owner = normalizeRuntimeDispatchOwner(rawEntry.active_owner);
+    rawEntry.last_owner = normalizeRuntimeDispatchOwner(rawEntry.last_owner);
     rawEntry.spawn_baseline = normalizeArtifactSnapshotList(rawEntry.spawn_baseline);
     rawEntry.completion_artifacts = normalizeArtifactSnapshotList(rawEntry.completion_artifacts);
     rawEntry.freshness =
@@ -1579,30 +1534,9 @@ function appendPropagatedDiscoveries(state, sourcePlanId, targetPlanIds, discove
   }
 }
 
-function sortStrings(values) {
-  return [...normalizeStringArray(values)].sort((left, right) => left.localeCompare(right));
-}
-
-function sortByKey(values, buildKey) {
-  return [...ensureArray(values)].sort((left, right) => buildKey(left).localeCompare(buildKey(right)));
-}
-
-function sortObjectKeys(value) {
-  if (Array.isArray(value)) {
-    return value.map((entry) => sortObjectKeys(entry));
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort((left, right) => left.localeCompare(right))
-      .map((key) => [key, sortObjectKeys(value[key])]),
-  );
-}
-
 function buildPlanHashInput(plan) {
+  const executionPolicy = normalizeExecutionPolicy(plan);
+  const qualityGateConfig = getQualityGateConfig(plan);
   return sortObjectKeys({
     profile: plan?.profile || null,
     feature_flags: plan?.feature_flags || null,
@@ -1660,7 +1594,28 @@ function buildPlanHashInput(plan) {
         (command) => String(command?.id || ''),
       ),
     },
-    quality_gates: plan?.quality_gates || null,
+    execution_policy: {
+      profile: executionPolicy.profile,
+      runtime: {
+        promotion: executionPolicy.runtime.promotion,
+        roles: sortStrings(executionPolicy.runtime.roles),
+        follow_on_roles: executionPolicy.runtime.follow_on_roles,
+      },
+      quality: {
+        judge_rerun_verify: executionPolicy.quality.judge_rerun_verify,
+        review_focus_areas: sortStrings(executionPolicy.quality.review_focus_areas),
+        review_anti_patterns: sortStrings(executionPolicy.quality.review_anti_patterns),
+      },
+    },
+    quality_gates: {
+      judge: {
+        rerun_verify: qualityGateConfig.judge.rerun_verify,
+      },
+      review: {
+        focus_areas: sortStrings(qualityGateConfig.review.focus_areas),
+        anti_patterns: sortStrings(qualityGateConfig.review.anti_patterns),
+      },
+    },
   });
 }
 
@@ -1672,53 +1627,20 @@ function hashPlanContract(plan) {
   return crypto.createHash('sha256').update(JSON.stringify(buildPlanHashInput(plan))).digest('hex');
 }
 
-function escapeRegex(input) {
-  return input.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
-}
-
-function globToRegex(glob) {
-  const normalized = normalizeRel(glob);
-  let regex = '';
-
-  for (let index = 0; index < normalized.length; index += 1) {
-    const char = normalized[index];
-
-    if (char === '*') {
-      const nextChar = normalized[index + 1];
-      const afterNextChar = normalized[index + 2];
-      if (nextChar === '*') {
-        if (afterNextChar === '/') {
-          regex += '(?:.*/)?';
-          index += 2;
-        } else {
-          regex += '.*';
-          index += 1;
-        }
-      } else {
-        regex += '[^/]*';
-      }
-      continue;
-    }
-
-    if (char === '?') {
-      regex += '[^/]';
-      continue;
-    }
-
-    regex += escapeRegex(char);
-  }
-
-  return new RegExp(`^${regex}$`);
-}
-
-function matchesAnyGlob(filePath, globs) {
+function isSmikeManagedWorkspacePath(filePath) {
   const normalized = normalizeRel(filePath);
-  return globs.some((glob) => globToRegex(glob).test(normalized));
+  return normalized === '.smike'
+    || normalized.startsWith('.smike/')
+    || normalized === '.smike-archive'
+    || normalized.startsWith('.smike-archive/')
+    || normalized === '.smike-snapshots'
+    || normalized.startsWith('.smike-snapshots/');
 }
 
-function getDirtyPaths() {
+function readGitWorkspaceStatus() {
   const tracked = runShellSync('git diff --name-only --relative HEAD', { timeoutMs: 20_000 });
   const untracked = runShellSync('git ls-files --others --exclude-standard', { timeoutMs: 20_000 });
+  const head = runShellSync('git rev-parse HEAD', { timeoutMs: 20_000 });
   if (tracked.status !== 0 || untracked.status !== 0) {
     fail('unable to read git workspace status; ensure this is a git repository with git installed');
   }
@@ -1726,11 +1648,25 @@ function getDirtyPaths() {
   const trackedPaths = tracked.stdout
     .split(/\r?\n/)
     .map(normalizeRel)
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((filePath) => !isSmikeManagedWorkspacePath(filePath));
   const untrackedPaths = untracked.stdout
     .split(/\r?\n/)
     .map(normalizeRel)
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((filePath) => !isSmikeManagedWorkspacePath(filePath));
+
+  return {
+    head_commit: head.status === 0 ? String(head.stdout || '').trim() || null : null,
+    tracked_paths: trackedPaths,
+    untracked_paths: untrackedPaths,
+  };
+}
+
+function getDirtyPaths() {
+  const workspaceStatus = readGitWorkspaceStatus();
+  const trackedPaths = workspaceStatus.tracked_paths;
+  const untrackedPaths = workspaceStatus.untracked_paths;
 
   return new Set([...trackedPaths, ...untrackedPaths]);
 }
@@ -1743,8 +1679,6 @@ function getProjectPaths(project) {
     capsulesDir: path.join(projectDir, 'capsules'),
     projectMetaPath: path.join(projectDir, 'PROJECT.json'),
     projectMdPath: path.join(projectDir, 'PROJECT.md'),
-    roadmapPath: path.join(projectDir, 'ROADMAP.md'),
-    strategyPath: path.join(projectDir, 'STRATEGY.md'),
     notesPath: path.join(projectDir, 'SMIKE-NOTES.md'),
     planJsonPath: path.join(projectDir, 'PLAN.json'),
     planMdPath: path.join(projectDir, 'PLAN.md'),
@@ -1754,28 +1688,12 @@ function getProjectPaths(project) {
     verdictReportPath: path.join(projectDir, 'VERDICT.md'),
     reviewReportPath: path.join(projectDir, 'REVIEW.md'),
     planningCheckerJsonPath: path.join(projectDir, 'CHECKER.json'),
-    planningCheckerMdPath: path.join(projectDir, 'CHECKER.md'),
     planningAuditorJsonPath: path.join(projectDir, 'AUDITOR.json'),
-    planningAuditorMdPath: path.join(projectDir, 'AUDITOR.md'),
-    planningAuditJsonPath: path.join(projectDir, 'AUDIT.json'),
-    planningAuditMdPath: path.join(projectDir, 'AUDIT.md'),
-    planningHandoffMdPath: path.join(projectDir, 'PLANNING-HANDOFF.md'),
     resumeCapsuleJsonPath: path.join(projectDir, 'RESUME-CAPSULE.json'),
-    resumeCapsuleMdPath: path.join(projectDir, 'RESUME-CAPSULE.md'),
     implementationHandoffJsonPath: path.join(projectDir, 'IMPLEMENTATION-HANDOFF.json'),
     planGraphJsonPath: path.join(projectDir, 'PLAN-GRAPH.json'),
-    planGraphMdPath: path.join(projectDir, 'PLAN-GRAPH.md'),
     indexJsonPath: path.join(projectDir, 'INDEX.json'),
   };
-}
-
-function removeLegacyRuntimeDelegationArtifacts(projectDir) {
-  for (const fileName of ['RUNTIME-DELEGATION.json', 'RUNTIME-DELEGATION.md']) {
-    const filePath = path.join(projectDir, fileName);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  }
 }
 
 function getArchivePaths(project) {
@@ -1785,6 +1703,18 @@ function getArchivePaths(project) {
     manifestPath: path.join(archiveDir, 'MANIFEST.json'),
     inputsDir: path.join(archiveDir, 'inputs'),
     runtimeDir: path.join(archiveDir, 'project'),
+  };
+}
+
+function getPlanningSnapshotPaths(project) {
+  const projectDir = path.join(SMIKE_SNAPSHOT_ROOT, project);
+  const snapshotDir = path.join(projectDir, 'planning-ready');
+  return {
+    projectDir,
+    snapshotDir,
+    manifestPath: path.join(snapshotDir, 'MANIFEST.json'),
+    runtimeDir: path.join(snapshotDir, 'project'),
+    workspaceDir: path.join(snapshotDir, 'workspace'),
   };
 }
 
@@ -1853,6 +1783,20 @@ function copyTreeFiles(srcRoot, destRoot) {
     copiedFiles.push(normalizeRel(relPath));
   }
   return copiedFiles;
+}
+
+function snapshotWorkspacePaths(filePaths, destinationRoot) {
+  const copiedFiles = [];
+  ensureDir(destinationRoot);
+  for (const relPath of uniqueStrings(filePaths).map(normalizeRel).filter(Boolean)) {
+    const sourcePath = path.join(REPO_ROOT, relPath);
+    if (!isPathInside(REPO_ROOT, sourcePath) || !fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+      continue;
+    }
+    copyRelativeFile(REPO_ROOT, destinationRoot, relPath);
+    copiedFiles.push(normalizeRel(relPath));
+  }
+  return copiedFiles.sort();
 }
 
 function copyProjectRuntimeForArchive(project, state, archivePaths, mode = 'compact') {
@@ -2033,6 +1977,91 @@ function buildArchiveManifest(project, archiveMode, state, rootPlan, projectMeta
   };
 }
 
+function buildPlanningSnapshotManifest(project, state, rootPlan, projectMeta, workspaceStatus, runtimeFiles, workspaceFiles) {
+  const latest = ensureArray(state?.history).at(-1) || null;
+  return {
+    schema_version: '1.0.0',
+    snapshot_kind: 'planning-ready',
+    created_at: nowIso(),
+    project,
+    lifecycle_status: state?.lifecycle?.status || null,
+    last_result: state?.lifecycle?.last_result || latest?.result || null,
+    spec_path: projectMeta?.spec_path || rootPlan?.spec || state?.planning?.spec_path || null,
+    context_files: normalizePathList(projectMeta?.context_files || []),
+    head_commit: workspaceStatus.head_commit || null,
+    workspace_baseline: {
+      mode: 'git_head_plus_untracked',
+      note: 'Baseline is measured against the current git HEAD plus untracked files. No commit is required to use this snapshot.',
+      tracked_paths: normalizePathList(workspaceStatus.tracked_paths || []),
+      untracked_paths: normalizePathList(workspaceStatus.untracked_paths || []),
+    },
+    runtime_files: normalizePathList(runtimeFiles || []),
+    workspace_files: normalizePathList(workspaceFiles || []),
+  };
+}
+
+function writePlanningReadySnapshot(project, paths, state, rootPlan) {
+  if (state?.lifecycle?.status !== AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
+    return null;
+  }
+
+  const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : {};
+  const snapshotPaths = getPlanningSnapshotPaths(project);
+  const tempDir = path.join(
+    snapshotPaths.projectDir,
+    `.planning-ready.${process.pid}.${Date.now()}.tmp`,
+  );
+  const workspaceStatus = readGitWorkspaceStatus();
+  const workspaceBaselinePaths = uniqueStrings([
+    ...workspaceStatus.tracked_paths,
+    ...workspaceStatus.untracked_paths,
+  ]).filter((filePath) => !isSmikeManagedWorkspacePath(filePath));
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  ensureDir(tempDir);
+
+  try {
+    const tempRuntimeDir = path.join(tempDir, 'project');
+    const tempWorkspaceDir = path.join(tempDir, 'workspace');
+    const runtimeFiles = copyTreeFiles(paths.projectDir, tempRuntimeDir);
+    const workspaceFiles = snapshotWorkspacePaths(workspaceBaselinePaths, tempWorkspaceDir);
+    const manifest = buildPlanningSnapshotManifest(
+      project,
+      state,
+      rootPlan,
+      projectMeta,
+      workspaceStatus,
+      runtimeFiles,
+      workspaceFiles,
+    );
+    writeJson(path.join(tempDir, 'MANIFEST.json'), manifest);
+
+    ensureDir(snapshotPaths.projectDir);
+    fs.rmSync(snapshotPaths.snapshotDir, { recursive: true, force: true });
+    fs.renameSync(tempDir, snapshotPaths.snapshotDir);
+    return manifest;
+  } catch (error) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function planningSnapshotExists(project) {
+  return fs.existsSync(getPlanningSnapshotPaths(project).manifestPath);
+}
+
+function buildPlanningSnapshotSummaryLines(project) {
+  if (!planningSnapshotExists(project)) {
+    return [];
+  }
+
+  return [
+    `planning_snapshot: .smike-snapshots/${project}/planning-ready`,
+    `planning_reset: run \`./smike reset-planning ${project}\` to restore the post-planning handoff and workspace baseline.`,
+    'workspace_baseline: measured against current git HEAD plus untracked files at the planning handoff; no commit is required.',
+  ];
+}
+
 function removeTempFiles(rootDir) {
   if (!fs.existsSync(rootDir)) {
     return 0;
@@ -2180,6 +2209,16 @@ const { validatePlan, validateState } = createValidationHelpers({
   ensureArray,
   uniqueStrings,
   validateDependencyReferenceValue,
+});
+const { auditCompatibility } = createCompatibilityAuditor({
+  repoRoot: REPO_ROOT,
+  validatePlan,
+  validateState,
+});
+const { verifyContracts } = createContractVerifier({
+  frameworkRoot: FRAMEWORK_ROOT,
+  validatePlan,
+  validateState,
 });
 
 function extractPlanningNotes(plan, planMdPath, state) {
@@ -2383,7 +2422,7 @@ function deriveImprovementCandidates(planningNotes, loopFindings) {
     } else if (finding.type === 'review' && finding.severity !== 'low') {
       candidates.push(`Review concerns were raised for ${finding.plan_id}. Tighten anti-pattern guidance or add stronger plan-level evidence for the flagged area.`);
     } else if (finding.type === 'contract_change') {
-      candidates.push(`Completed-plan drift was detected for ${finding.plan_id}. Improve plan stability checks or make contract deltas more visible earlier.`);
+      candidates.push(`Plan ${finding.plan_id} changed after an earlier completion mark. Surface contract deltas earlier so refinement reads as expected planning progress instead of mysterious drift.`);
     } else if (finding.type === 'dependency') {
       candidates.push(`Dependency blockers remained for ${finding.plan_id}. Improve dependency visibility and unblock guidance in the orchestrator.`);
     } else if (finding.type === 'failure') {
@@ -2415,7 +2454,7 @@ function deriveFrameworkFrictionCandidates(loopFindings) {
     } else if (finding.type === 'review' && finding.severity !== 'low') {
       candidates.push(`Review concerns were raised for ${finding.plan_id}. Tighten anti-pattern guidance or add stronger plan-level evidence for the flagged area.`);
     } else if (finding.type === 'contract_change') {
-      candidates.push(`Completed-plan drift was detected for ${finding.plan_id}. Improve plan stability checks or make contract deltas more visible earlier.`);
+      candidates.push(`Plan ${finding.plan_id} changed after an earlier completion mark. Surface contract deltas earlier so refinement reads as expected planning progress instead of mysterious drift.`);
     } else if (finding.type === 'dependency') {
       candidates.push(`Dependency blockers remained for ${finding.plan_id}. Improve dependency visibility and unblock guidance in the orchestrator.`);
     } else if (finding.type === 'failure') {
@@ -2424,11 +2463,6 @@ function deriveFrameworkFrictionCandidates(loopFindings) {
   }
 
   return uniqueStrings(candidates);
-}
-
-function extractLegacyOperatorNotes(existingMarkdown) {
-  const match = String(existingMarkdown || '').match(/^## Operator Notes\s*\n([\s\S]*?)(?:\n##\s|\n#\s|$)/m);
-  return match ? match[1].trim() : '';
 }
 
 function readPreservedOperatorNotes(notesPath) {
@@ -2441,14 +2475,7 @@ function readPreservedOperatorNotes(notesPath) {
     `${escapeRegex(OPERATOR_NOTES_START)}\\s*\\n?([\\s\\S]*?)\\n?\\s*${escapeRegex(OPERATOR_NOTES_END)}`,
     'm',
   );
-  const preserved = existingMarkdown.match(preservePattern)?.[1]?.trim() || '';
-  if (preserved) {
-    return preserved;
-  }
-
-  const legacyNotes = extractLegacyOperatorNotes(existingMarkdown);
-  const legacyPrompt = DEFAULT_OPERATOR_NOTES_PROMPT.replace(/^- /, '');
-  return legacyNotes && legacyNotes !== legacyPrompt ? legacyNotes : '';
+  return existingMarkdown.match(preservePattern)?.[1]?.trim() || '';
 }
 
 function durableFeedbackSectionStart(project) {
@@ -2483,6 +2510,8 @@ function readPreservedDurableFeedbackNotes(feedbackPath, project) {
 function isEphemeralFeedbackProject(project, rootPlan) {
   const normalizedProject = String(project || '').trim();
   const normalizedSpec = normalizeRel(rootPlan?.spec || '');
+
+  // Durable feedback is repo memory, not a sink for temporary harness runs.
   if (normalizedSpec.startsWith('.smike-test-tmp/')) {
     return true;
   }
@@ -2491,11 +2520,27 @@ function isEphemeralFeedbackProject(project, rootPlan) {
     return false;
   }
 
-  if (!normalizedSpec && /^(smike-|manual-)/.test(normalizedProject)) {
-    return true;
-  }
+  return !normalizedSpec && /^(smike-|manual-)/.test(normalizedProject);
+}
 
-  return /^(?:smike-(?:search|project-selector(?:-prefix)?|review-(?:heuristics|source)|cross-(?:blocked|complete)|executor-dep-cap|nested-test-guard|planning-lint|legacy-recommended-only|start-resume|stale-resume|walk-excludes|phase-metadata|explicit-deps|lock-stale|restore|archive|gc|fixer-route|manual-guard-debug)|manual-(?:missing-shape|legacy-recommended)-)/.test(normalizedProject);
+function buildExecutionFeedbackPhase(project, state, lifecycleStatus, latest, history) {
+  const actionableDispatch = state?.orchestration?.current_actionable_dispatch;
+  return {
+    phase: 'execution',
+    key: [
+      'execution',
+      project,
+      lifecycleStatus || 'unknown',
+      state?.lifecycle?.last_result || latest?.result || '',
+      state?.lifecycle?.next_command || '',
+      actionableDispatch?.dispatch_id || '',
+      actionableDispatch?.status || '',
+      actionableDispatch?.active_owner || actionableDispatch?.last_owner || '',
+      actionableDispatch?.lease_expires_at || '',
+      state?.updated_at || state?.lifecycle?.last_completed_at || latest?.completed_at || '',
+      String(history.length),
+    ].join(':'),
+  };
 }
 
 function resolveDurableFeedbackPhase(project, state) {
@@ -2506,28 +2551,38 @@ function resolveDurableFeedbackPhase(project, state) {
   const latest = history.at(-1) || null;
   const planningRootPlanId = `${project}-plan`;
   const onlyPlanningHistory = history.length > 0 && history.every((entry) => entry?.plan_id === planningRootPlanId);
+  const executionFeedbackLifecycleStatus = new Set([
+    'awaiting_runtime_dispatch',
+    'in_progress',
+    'complete',
+    'failed',
+    'blocked',
+  ]);
   const planningBoundaryComplete =
     planningStatus === 'complete'
     && (
-      onlyPlanningHistory
+      (onlyPlanningHistory && !executionFeedbackLifecycleStatus.has(lifecycleStatus))
       || lifecycleStatus === 'ready'
       || lifecycleStatus === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS
       || pauseReason === FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON
     );
 
   if (SMIKE_FEEDBACK_SYNC_MODE === 'planning_complete') {
-    if (!planningBoundaryComplete) {
-      return null;
+    if (planningBoundaryComplete) {
+      return {
+        phase: 'planning',
+        key: [
+          'planning',
+          planningStatus,
+          state?.planning?.last_plan_hash || '',
+          state?.planning?.completed_at || state?.lifecycle?.last_completed_at || latest?.completed_at || '',
+        ].join(':'),
+      };
     }
-    return {
-      phase: 'planning',
-      key: [
-        'planning',
-        planningStatus,
-        state?.planning?.last_plan_hash || '',
-        state?.planning?.completed_at || state?.lifecycle?.last_completed_at || latest?.completed_at || '',
-      ].join(':'),
-    };
+    if (planningStatus === 'complete' && executionFeedbackLifecycleStatus.has(lifecycleStatus)) {
+      return buildExecutionFeedbackPhase(project, state, lifecycleStatus, latest, history);
+    }
+    return null;
   }
 
   if (lifecycleStatus === 'planning_blocked' || planningStatus === 'blocked') {
@@ -2566,17 +2621,8 @@ function resolveDurableFeedbackPhase(project, state) {
     };
   }
 
-  if (planningStatus === 'complete' && ['complete', 'failed', 'blocked'].includes(lifecycleStatus) && latest && !onlyPlanningHistory) {
-    return {
-      phase: 'execution',
-      key: [
-        'execution',
-        lifecycleStatus,
-        state?.lifecycle?.last_result || latest?.result || '',
-        state?.lifecycle?.last_completed_at || latest?.completed_at || '',
-        String(ensureArray(state?.history).length),
-      ].join(':'),
-    };
+  if (planningStatus === 'complete' && executionFeedbackLifecycleStatus.has(lifecycleStatus)) {
+    return buildExecutionFeedbackPhase(project, state, lifecycleStatus, latest, history);
   }
 
   return null;
@@ -2653,7 +2699,7 @@ function syncDurableFeedbackMemory(project, rootPlan, state, planningNotes, loop
   const header = [
     '# SMIKE Feedback Log',
     '',
-    'Durable workflow feedback captured from terminal SMIKE runs. Project sections are regenerated; operator-note preserve blocks survive updates.',
+    'Diagnostic feedback target for terminal SMIKE runs. Project sections may be regenerated during diagnostics; durable lessons should be promoted into runtime, schema, or operator docs.',
     '',
   ].join('\n');
 
@@ -2930,13 +2976,18 @@ function evaluateAcceptance(plan, verifyResultsById) {
   return results;
 }
 
-function enforceWriteScope(plan, baselineDirty, modeRequireClean) {
+function enforceWriteScope(plan, baselineDirty, modeRequireClean, options = {}) {
   const afterDirty = getDirtyPaths();
   const observed = [...afterDirty].sort();
 
-  const changedPaths = modeRequireClean
+  const dirtyChangedPaths = modeRequireClean
     ? observed
     : observed.filter((filePath) => !baselineDirty.has(filePath));
+  const supplementalChangedPaths = normalizePathList(options.supplementalChangedPaths || []);
+  const changedPaths = uniqueStrings([
+    ...dirtyChangedPaths,
+    ...supplementalChangedPaths,
+  ]).sort();
 
   const allowedGlobs = uniqueStrings([
     ...ensureArray(plan.allowed_files),
@@ -3015,30 +3066,15 @@ async function runPostflight(plan, projectDir) {
 }
 
 function getQualityGateConfig(plan) {
-  const qualityGates =
-    plan?.quality_gates && typeof plan.quality_gates === 'object' && !Array.isArray(plan.quality_gates)
-      ? plan.quality_gates
-      : {};
-  const judge =
-    qualityGates.judge && typeof qualityGates.judge === 'object' && !Array.isArray(qualityGates.judge)
-      ? qualityGates.judge
-      : {};
-  const review =
-    qualityGates.review && typeof qualityGates.review === 'object' && !Array.isArray(qualityGates.review)
-      ? qualityGates.review
-      : {};
+  const executionPolicy = normalizeExecutionPolicy(plan);
 
   return {
     judge: {
-      rerun_verify: judge.rerun_verify !== false,
+      rerun_verify: executionPolicy.quality.judge_rerun_verify !== false,
     },
     review: {
-      focus_areas: normalizeStringArray(review.focus_areas || []),
-      anti_patterns: normalizeStringArray(
-        review.anti_patterns && review.anti_patterns.length > 0
-          ? review.anti_patterns
-          : DEFAULT_REVIEW_ANTI_PATTERNS,
-      ),
+      focus_areas: normalizeStringArray(executionPolicy.quality.review_focus_areas || []),
+      anti_patterns: normalizeStringArray(executionPolicy.quality.review_anti_patterns || DEFAULT_REVIEW_ANTI_PATTERNS),
     },
   };
 }
@@ -3086,6 +3122,9 @@ async function buildVerdictRecord(contract, cycleRecord, projectDir) {
     if (!result.pass) {
       failures.push(`ac.${result.id}`);
     }
+  }
+  if (cycleRecord.material_evidence?.pass === false) {
+    failures.push('execution.no_material_change');
   }
   if (!cycleRecord.scope.pass) {
     failures.push('scope.enforcement');
@@ -3143,43 +3182,19 @@ function getWorkspaceDirtyCheck(preflight) {
 }
 
 function isLikelyTestPath(filePath) {
-  return /(^|\/)(tests?|__tests__)\/|(?:\.test|\.spec)\.[^/]+$/i.test(filePath);
-}
-
-function isLikelySourcePath(filePath) {
-  if (typeof filePath !== 'string' || !filePath.trim() || filePath.startsWith('.smike/')) {
-    return false;
-  }
-  return /\.(?:[cm]?[jt]sx?|mjs|cjs|mts|cts|swift|py|sql)$/i.test(filePath);
-}
-
-function isLikelyInterfaceSurfacePath(filePath) {
-  if (typeof filePath !== 'string' || !filePath.trim() || filePath.startsWith('.smike/')) {
-    return false;
-  }
-  return (
-    /(^|\/)(index|types)\.[^/]+$/i.test(filePath)
-    || /\.d\.ts$/i.test(filePath)
-    || /(^|\/)package\.json$/i.test(filePath)
-    || /(^|\/)(api|types)\//i.test(filePath)
-    || /(^|\/)schema\.sql$/i.test(filePath)
-  );
-}
-
-function looksLikeVerificationCoverageCommand(command) {
-  const haystack = `${command?.id || ''} ${command?.run || ''}`;
-  return /\b(test|vitest|jest|mocha|ava|tap|typecheck|tsc|build)\b/i.test(haystack);
+  return portabilityHeuristics.isLikelyTestPath(filePath);
 }
 
 const buildReviewRecord = createBuildReviewRecord({
   getQualityGateConfig,
   ensureArray,
   acUsesOnlyExitSignals,
-  isLikelySourcePath,
-  isLikelyInterfaceSurfacePath,
+  isLikelySourcePath: portabilityHeuristics.isLikelySourcePath,
+  isLikelyInterfaceSurfacePath: portabilityHeuristics.isLikelyInterfaceSurfacePath,
   isLikelyTestPath,
   getWorkspaceDirtyCheck,
-  looksLikeVerificationCoverageCommand,
+  looksLikeVerificationCoverageCommand: portabilityHeuristics.looksLikeVerificationCoverageCommand,
+  looksLikeTestVerificationCommand: portabilityHeuristics.looksLikeTestVerificationCommand,
   nowIso,
 });
 
@@ -3231,6 +3246,9 @@ function buildVerdictReport(project, cycleRecord, verdictRecord) {
   lines.push(`- Scope pass: ${verdictRecord.scope.pass ? 'yes' : 'no'}`);
   lines.push(`- Changed files: ${verdictRecord.scope.changed_paths.length === 0 ? 'none' : verdictRecord.scope.changed_paths.join(', ')}`);
   lines.push(`- Violations: ${verdictRecord.scope.violations.length === 0 ? 'none' : verdictRecord.scope.violations.map((item) => `${item.file} (${item.reason})`).join(', ')}`);
+  if (cycleRecord.material_evidence?.required) {
+    lines.push(`- Material evidence: ${cycleRecord.material_evidence.pass ? 'yes' : 'no'}${cycleRecord.material_evidence.reason ? ` — ${cycleRecord.material_evidence.reason}` : ''}`);
+  }
   lines.push('');
   lines.push('## Verdict');
   lines.push(verdictRecord.failures.length === 0 ? '- PASS' : `- FAIL: ${verdictRecord.failures.join(', ')}`);
@@ -3294,16 +3312,12 @@ function readOptionalJson(filePath) {
   }
 }
 
-function parseMarkdownBulletSection(filePath, heading) {
-  if (!fs.existsSync(filePath)) {
-    return [];
-  }
-  const text = fs.readFileSync(filePath, 'utf8');
+function parseMarkdownBulletSectionFromText(text, heading) {
   const escapedHeading = escapeRegex(String(heading || '').trim());
   if (!escapedHeading) {
     return [];
   }
-  const match = text.match(new RegExp(`^## ${escapedHeading}\\r?\\n([\\s\\S]*?)(?=^## |\\Z)`, 'm'));
+  const match = String(text || '').match(new RegExp(`^#{2,6} ${escapedHeading}\\r?\\n([\\s\\S]*?)(?=^#{1,6} |(?![\\s\\S]))`, 'm'));
   if (!match) {
     return [];
   }
@@ -3312,133 +3326,297 @@ function parseMarkdownBulletSection(filePath, heading) {
     .map((line) => line.trim())
     .filter((line) => /^-\s+/.test(line))
     .map((line) => line.replace(/^-\s+/, '').trim())
-    .filter(Boolean);
+    .filter((line) => Boolean(line) && line !== 'none' && line !== 'none captured from spec');
 }
 
-function loadPlanningAnalysis(paths) {
-  const checker = readOptionalJson(paths.planningCheckerJsonPath);
-  const auditor = readOptionalJson(paths.planningAuditorJsonPath) || readOptionalJson(paths.planningAuditJsonPath);
-  const normalizeFindings = (report, source) => ensureArray(report?.findings).map((finding) => ({
-    source,
-    id: finding?.id || `${source}-unknown`,
-    severity: finding?.severity || 'low',
-    title: finding?.title || 'Unknown planning finding',
-    details: finding?.details || '',
-  }));
-  const findings = [
-    ...normalizeFindings(checker, 'checker'),
-    ...normalizeFindings(auditor, 'auditor'),
-  ];
-  const blockingFindings = findings.filter((finding) => finding.severity !== 'low');
-
-  return {
-    checker,
-    auditor,
-    findings,
-    blocking_findings: blockingFindings,
-  };
-}
-
-function getExistingMtimeMs(filePath) {
-  try {
-    return fs.statSync(filePath).mtimeMs;
-  } catch {
-    return null;
-  }
-}
-
-function getPlanningPhasePlanPaths(paths, bundle = null) {
-  if (bundle && Array.isArray(bundle.phase_blueprints)) {
-    return bundle.phase_blueprints
-      .map((phase) => path.join(paths.projectDir, 'phases', phase.id, `${phase.id}-PLAN.json`))
-      .filter((filePath) => fs.existsSync(filePath));
-  }
-
-  const phasesDir = path.join(paths.projectDir, 'phases');
-  if (!fs.existsSync(phasesDir)) {
+function parseMarkdownBulletSection(filePath, heading) {
+  if (!fs.existsSync(filePath)) {
     return [];
   }
-
-  return walkRelativeFiles(phasesDir)
-    .filter((relativePath) => /-PLAN\.json$/.test(relativePath))
-    .map((relativePath) => path.join(phasesDir, relativePath))
-    .filter((filePath) => fs.existsSync(filePath));
+  return parseMarkdownBulletSectionFromText(fs.readFileSync(filePath, 'utf8'), heading);
 }
 
-function getPlanningSourceArtifactPaths(paths, bundle = null) {
-  return [
-    paths.planJsonPath,
-    paths.planMdPath,
-    paths.strategyPath,
-    paths.roadmapPath,
-    ...getPlanningPhasePlanPaths(paths, bundle),
-  ].filter((filePath) => fs.existsSync(filePath));
-}
-
-function getPlanningVerificationArtifactPaths(paths) {
-  return [
-    paths.planningCheckerJsonPath,
-    paths.planningAuditorJsonPath,
-    paths.verdictReportPath,
-    paths.reviewReportPath,
-  ].filter((filePath) => fs.existsSync(filePath));
-}
-
-function getPlanningArtifactFreshness(paths, bundle = null) {
-  const sourcePaths = getPlanningSourceArtifactPaths(paths, bundle);
-  const verificationPaths = getPlanningVerificationArtifactPaths(paths);
-  if (sourcePaths.length === 0) {
-    return {
-      stale: false,
-      reason: null,
-      source_paths: [],
-      verification_paths: verificationPaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
-      stale_outputs: [],
-    };
+function parseMarkdownBulletSectionAliasesFromText(text, headings) {
+  for (const heading of ensureArray(headings)) {
+    const items = parseMarkdownBulletSectionFromText(text, heading);
+    if (items.length > 0) {
+      return items;
+    }
   }
+  return [];
+}
 
-  const latestSource = sourcePaths
-    .map((filePath) => ({ filePath, mtimeMs: getExistingMtimeMs(filePath) || 0 }))
-    .sort((left, right) => right.mtimeMs - left.mtimeMs)[0];
-
-  if (verificationPaths.length === 0) {
-    return {
-      stale: true,
-      reason: 'planning verification artifacts are missing',
-      source_paths: sourcePaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
-      verification_paths: [],
-      stale_outputs: [],
-    };
+function parseMarkdownBulletSectionAliases(filePath, headings) {
+  if (!fs.existsSync(filePath)) {
+    return [];
   }
+  return parseMarkdownBulletSectionAliasesFromText(fs.readFileSync(filePath, 'utf8'), headings);
+}
 
-  const staleOutputs = verificationPaths.filter((filePath) => {
-    const mtimeMs = getExistingMtimeMs(filePath);
-    return typeof mtimeMs !== 'number' || mtimeMs < latestSource.mtimeMs;
-  });
+function extractMarkdownLineValue(markdown, prefix) {
+  const escapedPrefix = escapeRegex(String(prefix || '').trim());
+  if (!escapedPrefix) {
+    return null;
+  }
+  const match = String(markdown || '').match(new RegExp(`^${escapedPrefix}\\s*(.+)$`, 'm'));
+  if (!match) {
+    return null;
+  }
+  const value = match[1].trim();
+  return value && value !== 'none' ? value : null;
+}
 
+function extractDispatchIdFromStateMarkdown(markdown) {
+  const value = extractMarkdownLineValue(markdown, 'Dispatch:');
+  if (!value) {
+    return null;
+  }
+  const match = value.match(/^([^\s(]+)/);
+  return match ? match[1] : null;
+}
+
+function stringSetsEqual(left, right) {
+  const leftValues = [...normalizeStringArray(left)].sort();
+  const rightValues = [...normalizeStringArray(right)].sort();
+  return JSON.stringify(leftValues) === JSON.stringify(rightValues);
+}
+
+function formatStringSet(values) {
+  const normalized = normalizeStringArray(values);
+  return normalized.length > 0 ? normalized.join(', ') : 'none';
+}
+
+function firstNonEmptyStringArray(...candidates) {
+  for (const candidate of candidates) {
+    const normalized = normalizeStringArray(candidate || []);
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+  return [];
+}
+
+function firstNonEmptyPathList(...candidates) {
+  for (const candidate of candidates) {
+    const normalized = normalizePathList(candidate || []);
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+  return [];
+}
+
+function normalizePlanningContext(value) {
+  const planningContext = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+  const normalizeParallelGroup = (group) => {
+    if (!group || typeof group !== 'object' || Array.isArray(group)) {
+      return null;
+    }
+    const normalized = {
+      group: Number.isInteger(group.group) ? group.group : null,
+      phases: normalizeStringArray(group.phases || []),
+      note: typeof group.note === 'string' && group.note.trim() ? group.note.trim() : null,
+    };
+    if (Array.isArray(group.write_surfaces)) {
+      normalized.write_surfaces = normalizePathList(group.write_surfaces);
+    } else if (group.write_surfaces && typeof group.write_surfaces === 'object') {
+      const entries = Object.entries(group.write_surfaces)
+        .filter(([key]) => typeof key === 'string' && key.trim())
+        .map(([key, paths]) => [key.trim(), normalizePathList(paths)]);
+      if (entries.length > 0) {
+        normalized.write_surfaces = Object.fromEntries(entries);
+      }
+    }
+    return compactCapsuleValue(normalized);
+  };
+  const normalizeOperatorCheckpoint = (checkpoint) => {
+    if (!checkpoint || typeof checkpoint !== 'object' || Array.isArray(checkpoint)) {
+      return null;
+    }
+    return compactCapsuleValue({
+      phase: typeof checkpoint.phase === 'string' && checkpoint.phase.trim() ? checkpoint.phase.trim() : null,
+      checkpoint: typeof checkpoint.checkpoint === 'string' && checkpoint.checkpoint.trim()
+        ? checkpoint.checkpoint.trim()
+        : null,
+      blocks_final_proof: normalizeStringArray(checkpoint.blocks_final_proof || []),
+    });
+  };
+  const normalizeCollisionMatrixEntry = (entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return null;
+    }
+    const normalized = {
+      shared_paths: normalizePathList(entry.shared_paths || []),
+      rule: typeof entry.rule === 'string' && entry.rule.trim() ? entry.rule.trim() : null,
+    };
+    if (entry.owner_split && typeof entry.owner_split === 'object' && !Array.isArray(entry.owner_split)) {
+      const ownerEntries = Object.entries(entry.owner_split)
+        .filter(([key, value]) => typeof key === 'string' && key.trim() && typeof value === 'string' && value.trim())
+        .map(([key, value]) => [key.trim(), value.trim()]);
+      if (ownerEntries.length > 0) {
+        normalized.owner_split = Object.fromEntries(ownerEntries);
+      }
+    }
+    return compactCapsuleValue(normalized);
+  };
+  const normalizeRiskControl = (entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return null;
+    }
+    return compactCapsuleValue({
+      risk: typeof entry.risk === 'string' && entry.risk.trim() ? entry.risk.trim() : null,
+      control: typeof entry.control === 'string' && entry.control.trim() ? entry.control.trim() : null,
+    });
+  };
   return {
-    stale: staleOutputs.length > 0,
-    reason: staleOutputs.length > 0
-      ? `planning sources changed after verification (${staleOutputs.map((filePath) => path.basename(filePath)).join(', ')})`
+    truth_sources: normalizePathList(planningContext.truth_sources || planningContext.primary_refs || []),
+    explicit_deferrals: normalizeStringArray(planningContext.explicit_deferrals || []),
+    protected_areas: normalizeStringArray(planningContext.protected_areas || []),
+    production_gate: normalizeStringArray(planningContext.production_gate || []),
+    optional_phase: typeof planningContext.optional_phase === 'string' && planningContext.optional_phase.trim()
+      ? planningContext.optional_phase.trim()
       : null,
-    source_paths: sourcePaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
-    verification_paths: verificationPaths.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
-    stale_outputs: staleOutputs.map((filePath) => path.relative(REPO_ROOT, filePath).replaceAll(path.sep, '/')),
+    phase_order_notes: normalizeStringArray(planningContext.phase_order_notes || []),
+    parallel_groups: ensureArray(planningContext.parallel_groups).map(normalizeParallelGroup).filter(Boolean),
+    operator_checkpoints: ensureArray(planningContext.operator_checkpoints).map(normalizeOperatorCheckpoint).filter(Boolean),
+    collision_matrix: ensureArray(planningContext.collision_matrix).map(normalizeCollisionMatrixEntry).filter(Boolean),
+    risk_controls: ensureArray(planningContext.risk_controls).map(normalizeRiskControl).filter(Boolean),
   };
 }
 
-function buildPlanningBlockedNextAction(project, paths, planningAnalysis) {
-  const findingSummary = planningAnalysis.blocking_findings
-    .slice(0, 4)
-    .map((finding) => `${finding.source}:${finding.id}`)
-    .join(', ');
-  const suffix = findingSummary ? ` Top blockers: ${findingSummary}.` : '';
-  const docs = [
-    planningAnalysis.checker ? `.smike/${project}/CHECKER.json` : null,
-    planningAnalysis.auditor ? `.smike/${project}/AUDITOR.json` : null,
-  ].filter(Boolean);
-  const docText = docs.length > 0 ? docs.join(' and ') : `.smike/${project}/PLAN.md`;
-  return `Resolve planning findings in ${docText}, then rerun \`${buildRecheckCommand(project)}\`.${suffix}`;
+function hashPlanningContext(planningContext) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(normalizePlanningContext(planningContext)))
+    .digest('hex');
+}
+
+function buildPlanningContextFromBundle(bundle) {
+  return normalizePlanningContext({
+    truth_sources: bundle?.primary_refs || [],
+    explicit_deferrals: bundle?.explicit_deferrals || [],
+    protected_areas: bundle?.protected_areas || [],
+    production_gate: ensureArray(bundle?.phase_blueprints)
+      .filter((phase) => phase?.gate !== 'optional')
+      .map((phase) => phase?.id),
+    optional_phase: ensureArray(bundle?.phase_blueprints).find((phase) => phase?.gate === 'optional')?.id || null,
+  });
+}
+
+function rootPlanHasPlanningContext(rootPlan) {
+  return Boolean(rootPlan && typeof rootPlan === 'object' && !Array.isArray(rootPlan) && rootPlan.planning_context);
+}
+
+function resolveCanonicalPlanningContext({ rootPlan = null, bundle = null, paths = null } = {}) {
+  if (rootPlanHasPlanningContext(rootPlan)) {
+    return normalizePlanningContext(rootPlan.planning_context);
+  }
+
+  if (bundle) {
+    return buildPlanningContextFromBundle(bundle);
+  }
+
+  return normalizePlanningContext({});
+}
+
+function resolveCurrentActionableRuntimeDispatchEntry(runtimeContext) {
+  if (!runtimeContext) {
+    return null;
+  }
+  return runtimeContext.active_dispatches[0]
+    || runtimeContext.failed_dispatches[0]
+    || runtimeContext.ready_dispatches[0]
+    || runtimeContext.dispatches[0]
+    || null;
+}
+
+function collectHandoffConsistencyIssues(project, paths, state, options = {}) {
+  const issues = [];
+  const canonicalPlanningContext = normalizePlanningContext(options.planningContext);
+  const implementationHandoff = options.implementationHandoff || (
+    fs.existsSync(paths.implementationHandoffJsonPath) ? readJson(paths.implementationHandoffJsonPath) : null
+  );
+  const stateMarkdown = Object.prototype.hasOwnProperty.call(options, 'stateMarkdown')
+    ? options.stateMarkdown
+    : (fs.existsSync(paths.stateMdPath) ? fs.readFileSync(paths.stateMdPath, 'utf8') : null);
+  const expectedTruthSources = canonicalPlanningContext.truth_sources;
+  const expectedDeferredItems = canonicalPlanningContext.explicit_deferrals;
+  const expectedProtectedAreas = canonicalPlanningContext.protected_areas;
+  const expectedPlanningContextHash = hashPlanningContext(canonicalPlanningContext);
+  const implementationTruthSources = normalizePathList(implementationHandoff?.truth_sources || []);
+  const implementationDeferredItems = normalizeStringArray(implementationHandoff?.deferred_items || []);
+  const implementationProtectedAreas = normalizeStringArray(implementationHandoff?.protected_areas || []);
+  const implementationPlanningContextHash = typeof implementationHandoff?.planning_context_hash === 'string'
+    ? implementationHandoff.planning_context_hash.trim()
+    : null;
+  const currentDispatchId = state?.orchestration?.current_actionable_dispatch?.dispatch_id || null;
+  const stateMarkdownDispatchId = extractDispatchIdFromStateMarkdown(stateMarkdown);
+
+  if (
+    implementationHandoff?.actionable_surface?.current_dispatch?.dispatch_id
+    && currentDispatchId
+    && implementationHandoff.actionable_surface.current_dispatch.dispatch_id !== currentDispatchId
+  ) {
+    issues.push({
+      severity: 'error',
+      id: 'current-dispatch-mismatch',
+      message:
+        `IMPLEMENTATION-HANDOFF.json current dispatch ${implementationHandoff.actionable_surface.current_dispatch.dispatch_id} `
+        + `does not match STATE.json current actionable dispatch ${currentDispatchId}.`,
+    });
+  }
+
+  if ((stateMarkdownDispatchId || null) !== (currentDispatchId || null)) {
+    issues.push({
+      severity: 'error',
+      id: 'state-markdown-current-dispatch-mismatch',
+      message:
+        `STATE.md actionable dispatch ${stateMarkdownDispatchId || 'none'} `
+        + `does not match STATE.json current actionable dispatch ${currentDispatchId || 'none'}.`,
+    });
+  }
+
+  if (implementationPlanningContextHash && implementationPlanningContextHash !== expectedPlanningContextHash) {
+    issues.push({
+      severity: 'error',
+      id: 'implementation-handoff-planning-context-hash-mismatch',
+      message:
+        `IMPLEMENTATION-HANDOFF.json planning_context_hash ${implementationPlanningContextHash} `
+        + `does not match canonical planning_context hash ${expectedPlanningContextHash}.`,
+    });
+  } else if (!stringSetsEqual(implementationDeferredItems, expectedDeferredItems)) {
+    issues.push({
+      severity: 'error',
+      id: 'implementation-handoff-deferred-items-mismatch',
+      message:
+        `IMPLEMENTATION-HANDOFF.json deferred items ${formatStringSet(implementationDeferredItems)} `
+        + `do not match the planning bundle deferred items ${formatStringSet(expectedDeferredItems)}.`,
+    });
+  }
+
+  if (!implementationPlanningContextHash && !stringSetsEqual(implementationTruthSources, expectedTruthSources)) {
+    issues.push({
+      severity: 'error',
+      id: 'implementation-handoff-truth-sources-mismatch',
+      message:
+        `IMPLEMENTATION-HANDOFF.json truth sources ${formatStringSet(implementationTruthSources)} `
+        + `do not match the planning bundle truth sources ${formatStringSet(expectedTruthSources)}.`,
+    });
+  }
+
+  if (!implementationPlanningContextHash && !stringSetsEqual(implementationProtectedAreas, expectedProtectedAreas)) {
+    issues.push({
+      severity: 'error',
+      id: 'implementation-handoff-protected-areas-mismatch',
+      message:
+        `IMPLEMENTATION-HANDOFF.json protected areas ${formatStringSet(implementationProtectedAreas)} `
+        + `do not match the planning bundle protected areas ${formatStringSet(expectedProtectedAreas)}.`,
+    });
+  }
+
+  return issues;
 }
 
 function buildCycleCommand(project) {
@@ -3461,6 +3639,14 @@ function buildResumeCommand(project = null) {
 
 function buildRetryDispatchCommand(project, dispatchId = '<dispatch-id>') {
   return `./smike dispatch ${project} retry ${dispatchId}`;
+}
+
+function buildSpawnDispatchCommand(project, dispatchId = '<dispatch-id>') {
+  return `./smike dispatch ${project} spawned ${dispatchId}`;
+}
+
+function buildCompleteDispatchGroupCommand(project, group = 'current') {
+  return `./smike dispatch ${project} complete-group ${group}`;
 }
 
 function isUnchangedSpawnBaselineFailure(entry) {
@@ -3488,7 +3674,8 @@ function buildFailedRuntimeDispatchNextStep(project, runtimeDispatchPending) {
       next_action:
         `Resolve failed runtime dispatches for ${pendingPlansText}: ${failedIds}. `
         + `The required result artifacts were unchanged from the spawn baseline, which usually means they were edited before \`spawned\` was recorded. `
-        + `Retry the dispatch with \`${retryCommand}\`, rerun \`${advanceCommand}\` to respawn it, then rewrite the required artifacts after spawn.`,
+        + `Retry the dispatch with \`${retryCommand}\`, rerun \`${advanceCommand}\` to surface it again, `
+        + `record a fresh claim with \`${buildSpawnDispatchCommand(project)}\`, then rewrite the required artifacts after spawn.`,
       next_command: retryCommand,
     };
   }
@@ -3501,12 +3688,19 @@ function buildFailedRuntimeDispatchNextStep(project, runtimeDispatchPending) {
   };
 }
 
-function buildCompleteDispatchGroupCommand(project, group = 'current') {
-  return `./smike dispatch ${project} complete-group ${group}`;
-}
-
 function isFreshSessionImplementationPauseReason(value) {
   return typeof value === 'string' && value.trim() === FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON;
+}
+
+function hasConsumedFreshSessionImplementationGate(state) {
+  return state?.planning?.fresh_session_gate_consumed === true;
+}
+
+function markFreshSessionImplementationGateConsumed(state) {
+  if (!state.planning || typeof state.planning !== 'object') {
+    state.planning = {};
+  }
+  state.planning.fresh_session_gate_consumed = true;
 }
 
 function applyFreshSessionImplementationGate(state) {
@@ -3515,6 +3709,21 @@ function applyFreshSessionImplementationGate(state) {
   }
   state.workflow.auto_continue = false;
   state.workflow.pause_reason = FRESH_SESSION_FOR_IMPLEMENTATION_PAUSE_REASON;
+  markFreshSessionImplementationGateConsumed(state);
+}
+
+function workflowRequiresFreshSessionImplementationGate(workflowSettings) {
+  return (workflowSettings?.fresh_session_gate || DEFAULT_FRESH_SESSION_GATE) !== 'never';
+}
+
+function shouldApplyFreshSessionImplementationGate(state, planningWasCompleteAtStart, workflowSettings) {
+  if (!workflowRequiresFreshSessionImplementationGate(workflowSettings)) {
+    return false;
+  }
+  if (hasConsumedFreshSessionImplementationGate(state)) {
+    return false;
+  }
+  return true;
 }
 
 function clearFreshSessionImplementationGate(state) {
@@ -3529,7 +3738,10 @@ function clearFreshSessionImplementationGate(state) {
   return true;
 }
 
-function carryForwardFreshSessionImplementationGate(state, previousWorkflow) {
+function carryForwardFreshSessionImplementationGate(state, previousWorkflow, workflowSettings) {
+  if (!workflowRequiresFreshSessionImplementationGate(workflowSettings)) {
+    return false;
+  }
   if (!isFreshSessionImplementationPauseReason(previousWorkflow?.pause_reason)) {
     return false;
   }
@@ -3563,6 +3775,58 @@ function getLifecycleNextCommand(state) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function resolveLifecycleAdvanceBehavior(project, state, runtimeContext = null) {
+  const nextCommand = getLifecycleNextCommand(state);
+  const advanceCommand = buildAdvanceCommand(project);
+  if (!nextCommand || nextCommand !== advanceCommand) {
+    return {
+      code: 'follow_next_command',
+      detail: nextCommand
+        ? `Use \`${nextCommand}\` as authority for this state; \`${advanceCommand}\` is not the canonical next mutation.`
+        : `No mutating advance step is recorded; inspect state before proceeding.`,
+    };
+  }
+
+  if (state?.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
+    return {
+      code: 'stop_at_fresh_session_gate',
+      detail: `Stop in this session. Start a fresh session, then rerun \`${advanceCommand}\` before implementation work.`,
+    };
+  }
+
+  const context = runtimeContext;
+  if (context?.ready_dispatches?.length > 0 && state?.lifecycle?.status === 'awaiting_runtime_dispatch') {
+    return {
+      code: 'spawn_only',
+      detail:
+        `This will surface ready runtime dispatch group ${currentRuntimeDispatchGroup(context) || 1} only; `
+        + 'the host runtime must launch workers first, then mark each dispatch `spawned` explicitly before completion reconciliation can happen.',
+    };
+  }
+
+  if ((context?.active_dispatches?.length || 0) > 0 || (context?.failed_dispatches?.length || 0) > 0) {
+    return {
+      code: 'reconcile_dispatches',
+      detail: `This will reconcile active or failed runtime dispatch state and surface the next actionable step; it will not invent new work.`,
+    };
+  }
+
+  return {
+    code: 'execute_state_machine',
+    detail: `This will execute the next local state-machine step and may run checks, reconciliation, or implementation work.`,
+  };
+}
+
+function syncLifecycleAdvanceBehavior(project, state, runtimeContext = null) {
+  const behavior = resolveLifecycleAdvanceBehavior(project, state, runtimeContext);
+  if (!state.lifecycle || typeof state.lifecycle !== 'object') {
+    state.lifecycle = {};
+  }
+  state.lifecycle.advance_behavior = behavior.code;
+  state.lifecycle.advance_behavior_detail = behavior.detail;
+  return behavior;
+}
+
 function runtimeDispatchPlanFilterFromActionable(actionable) {
   return Array.isArray(actionable?.plan_ids) && actionable.plan_ids.length > 0
     ? actionable.plan_ids
@@ -3576,8 +3840,9 @@ function buildAwaitingRuntimeDispatchState(project, runtimeDispatchPending) {
     status: 'awaiting_runtime_dispatch',
     stop_reason: 'awaiting_runtime_dispatch',
     next_action:
-      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} for ${pendingPlansText}: ${readyIds}. `
-      + `Use \`STATE.json.lifecycle.next_command\` as authority, mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
+      `Launch runtime dispatch group ${runtimeDispatchPending.group || 1} for ${pendingPlansText}: ${readyIds}. `
+      + `After each worker actually starts, record that claim with \`${buildSpawnDispatchCommand(project)}\`. `
+      + `Mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
       + `then rerun \`${buildAdvanceCommand(project)}\`.`,
     next_command: buildAdvanceCommand(project),
   };
@@ -3590,8 +3855,9 @@ function buildReadyRuntimeDispatchFollowOnState(project, runtimeDispatchPending)
     status: 'in_progress',
     stop_reason: null,
     next_action:
-      `Run runtime dispatch group ${runtimeDispatchPending.group || 1} for ${pendingPlansText}: ${readyIds}. `
-      + `Use \`STATE.json.lifecycle.next_command\` as authority, mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
+      `Launch runtime dispatch group ${runtimeDispatchPending.group || 1} for ${pendingPlansText}: ${readyIds}. `
+      + `After each worker actually starts, record that claim with \`${buildSpawnDispatchCommand(project)}\`. `
+      + `Mark completion with \`./smike dispatch ${project} completed <dispatch-id>\`, `
       + 'then follow the updated `next_command`.',
     next_command: buildAdvanceCommand(project),
   };
@@ -3609,7 +3875,7 @@ function buildAwaitingFreshSessionState(project, readyWorkflowPlans, runtimeDisp
     status: AWAITING_FRESH_SESSION_LIFECYCLE_STATUS,
     stop_reason: AWAITING_FRESH_SESSION_LIFECYCLE_STATUS,
     next_action:
-      `Planning complete. Start a fresh session with \`${buildAdvanceCommand(project)}\` before executing implementation work.`
+      `Initial planning bundle complete. Start a fresh session with \`${buildAdvanceCommand(project)}\` before executing implementation work.`
       + actionableDispatchText
       + ` ${describeReadyWorkflowPlans(readyWorkflowPlans)}`,
     next_command: buildAdvanceCommand(project),
@@ -3659,16 +3925,51 @@ function describePendingRuntimePlans(runtimeDispatchPending) {
 }
 
 function summarizeRuntimeDispatchContext(runtimeContext) {
+  const actionableEntry = resolveCurrentActionableRuntimeDispatchEntry(runtimeContext);
   const actionablePlanIds = Array.isArray(runtimeContext?.actionable?.plan_ids) && runtimeContext.actionable.plan_ids.length > 0
     ? runtimeContext.actionable.plan_ids.join(', ')
     : 'none';
   return {
     plan_ids: actionablePlanIds,
+    actionable_id: actionableEntry?.dispatch_id || 'none',
+    actionable_summary: actionableEntry
+      ? `${actionableEntry.dispatch_id} (${actionableEntry.role} / ${actionableEntry.status} / ${actionableEntry.freshness?.status || 'pending'})`
+      : 'none',
     group: currentRuntimeDispatchGroup(runtimeContext) || 'none',
     completable_group: currentCompletableRuntimeDispatchGroup(runtimeContext),
     ready_ids: runtimeContext.ready_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
     active_ids: runtimeContext.active_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
     failed_ids: runtimeContext.failed_dispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
+  };
+}
+
+function getCurrentRuntimeDispatchEntriesFromState(state) {
+  return Object.values(state?.orchestration?.runtime_dispatches?.by_id || {})
+    .filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry) && entry.current !== false)
+    .sort((left, right) => {
+      const leftGroup = typeof left.group === 'number' ? left.group : Number.MAX_SAFE_INTEGER;
+      const rightGroup = typeof right.group === 'number' ? right.group : Number.MAX_SAFE_INTEGER;
+      return leftGroup - rightGroup || String(left.dispatch_id || '').localeCompare(String(right.dispatch_id || ''));
+    });
+}
+
+function summarizeRuntimeDispatchState(state) {
+  const actionablePlan = state?.orchestration?.runtime_dispatch_view?.actionable_plan || {};
+  const readyDispatches = ensureArray(state?.orchestration?.runtime_dispatch_view?.ready_dispatches);
+  const currentDispatches = getCurrentRuntimeDispatchEntriesFromState(state);
+  const actionableDispatch = state?.orchestration?.current_actionable_dispatch || null;
+
+  return {
+    current_dispatches: currentDispatches,
+    plan_ids: ensureArray(actionablePlan.plan_ids).join(', ') || 'none',
+    actionable_summary: actionableDispatch
+      ? `${actionableDispatch.dispatch_id} (${actionableDispatch.role} / ${actionableDispatch.status} / ${actionableDispatch.freshness || 'pending'})`
+      : 'none',
+    group: actionablePlan.group || 'none',
+    completable_group: actionablePlan.completable_group || 'none',
+    ready_ids: readyDispatches.map((entry) => entry.dispatch_id).join(', ') || 'none',
+    active_ids: currentDispatches.filter((entry) => entry.status === 'spawned').map((entry) => entry.dispatch_id).join(', ') || 'none',
+    failed_ids: currentDispatches.filter((entry) => entry.status === 'failed').map((entry) => entry.dispatch_id).join(', ') || 'none',
   };
 }
 
@@ -3678,16 +3979,68 @@ function buildRuntimeDispatchSummaryLines(runtimeContext) {
   }
 
   const summary = summarizeRuntimeDispatchContext(runtimeContext);
+  const actionableEntry = resolveCurrentActionableRuntimeDispatchEntry(runtimeContext);
   const staleEntries = runtimeContext.dispatches.filter(
     (entry) => entry.status === 'stale' || entry.freshness?.status === 'stale',
   );
+  const expiredEntries = runtimeContext.dispatches.filter((entry) => isRuntimeDispatchLeaseExpired(entry));
+  const orphanedEntries = runtimeContext.dispatches
+    .map((entry) => ({ entry, ownerHealth: inspectRuntimeDispatchOwnerHealth(entry) }))
+    .filter(({ ownerHealth }) => ownerHealth.orphaned);
   return [
+    `actionable_dispatch: ${summary.actionable_summary}`,
     `dispatch_plan_ids: ${summary.plan_ids}`,
     `dispatch_group: ${summary.group}`,
     `dispatch_completable_group: ${summary.completable_group}`,
     `dispatch_ready: ${summary.ready_ids}`,
     `dispatch_active: ${summary.active_ids}`,
     `dispatch_failed: ${summary.failed_ids}`,
+    ...(actionableEntry
+      ? [
+          `dispatch_owner: ${actionableEntry.dispatch_id} (${summarizeRuntimeDispatchOwner(actionableEntry.active_owner || actionableEntry.last_owner)})`,
+          `dispatch_lease: ${actionableEntry.dispatch_id} (${getRuntimeDispatchLeaseExpiry(actionableEntry) || 'none'})`,
+        ]
+      : []),
+    ...expiredEntries.slice(0, 4).map((entry) => `dispatch_lease_expired: ${entry.dispatch_id} (${buildRuntimeDispatchLeaseExpiredReason(entry)})`),
+    ...orphanedEntries.slice(0, 4).map(({ entry, ownerHealth }) => `dispatch_owner_orphaned: ${entry.dispatch_id} (${ownerHealth.reason})`),
+    ...staleEntries.slice(0, 4).map((entry) => `dispatch_stale: ${entry.dispatch_id} (${entry.freshness?.reason || 'stale dispatch contract'})`),
+  ];
+}
+
+function buildRuntimeDispatchSummaryLinesFromState(state) {
+  const currentDispatches = getCurrentRuntimeDispatchEntriesFromState(state);
+  if (currentDispatches.length === 0) {
+    return [];
+  }
+
+  const summary = summarizeRuntimeDispatchState(state);
+  const actionableDispatch = state?.orchestration?.current_actionable_dispatch || null;
+  const actionableEntry = actionableDispatch
+    ? currentDispatches.find((entry) => entry.dispatch_id === actionableDispatch.dispatch_id) || actionableDispatch
+    : null;
+  const staleEntries = currentDispatches.filter(
+    (entry) => entry.status === 'stale' || entry.freshness?.status === 'stale',
+  );
+  const expiredEntries = currentDispatches.filter((entry) => isRuntimeDispatchLeaseExpired(entry));
+  const orphanedEntries = currentDispatches
+    .map((entry) => ({ entry, ownerHealth: inspectRuntimeDispatchOwnerHealth(entry) }))
+    .filter(({ ownerHealth }) => ownerHealth.orphaned);
+  return [
+    `actionable_dispatch: ${summary.actionable_summary}`,
+    `dispatch_plan_ids: ${summary.plan_ids}`,
+    `dispatch_group: ${summary.group}`,
+    `dispatch_completable_group: ${summary.completable_group}`,
+    `dispatch_ready: ${summary.ready_ids}`,
+    `dispatch_active: ${summary.active_ids}`,
+    `dispatch_failed: ${summary.failed_ids}`,
+    ...(actionableEntry
+      ? [
+          `dispatch_owner: ${actionableEntry.dispatch_id} (${summarizeRuntimeDispatchOwner(actionableEntry.active_owner || actionableEntry.last_owner)})`,
+          `dispatch_lease: ${actionableEntry.dispatch_id} (${getRuntimeDispatchLeaseExpiry(actionableEntry) || actionableEntry.lease_expires_at || 'none'})`,
+        ]
+      : []),
+    ...expiredEntries.slice(0, 4).map((entry) => `dispatch_lease_expired: ${entry.dispatch_id} (${buildRuntimeDispatchLeaseExpiredReason(entry)})`),
+    ...orphanedEntries.slice(0, 4).map(({ entry, ownerHealth }) => `dispatch_owner_orphaned: ${entry.dispatch_id} (${ownerHealth.reason})`),
     ...staleEntries.slice(0, 4).map((entry) => `dispatch_stale: ${entry.dispatch_id} (${entry.freshness?.reason || 'stale dispatch contract'})`),
   ];
 }
@@ -3704,18 +4057,15 @@ function printDispatchFollowOn(project, state) {
     console.log('fresh_session_requirement: start a fresh session through next_command before executing implementation work.');
   }
 
-  const paths = getProjectPaths(project);
-  if (!fs.existsSync(paths.planJsonPath)) {
-    return;
-  }
-
-  const rootPlan = readJson(paths.planJsonPath);
-  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-  for (const line of buildRuntimeDispatchSummaryLines(runtimeContext)) {
+  const summaryLines = buildRuntimeDispatchSummaryLinesFromState(state);
+  for (const line of summaryLines) {
     console.log(line);
   }
-  if (runtimeContext.active_dispatches.length > 1) {
-    const group = currentRuntimeDispatchGroup(runtimeContext) || 'current';
+  const activeDispatchCount = getCurrentRuntimeDispatchEntriesFromState(state)
+    .filter((entry) => entry.status === 'spawned')
+    .length;
+  if (activeDispatchCount > 1) {
+    const group = state?.orchestration?.runtime_dispatch_view?.actionable_plan?.group || 'current';
     console.log(`dispatch_completion_hint: complete state writes serially, or use \`${buildCompleteDispatchGroupCommand(project, group)}\`.`);
   }
 }
@@ -3726,8 +4076,8 @@ function applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPen
   }
 
   const pendingPlansText = describePendingRuntimePlans(runtimeDispatchPending);
-  setLifecycleStopReason(state, null);
   if (runtimeDispatchPending.failed_dispatches.length > 0) {
+    setLifecycleStopReason(state, null);
     state.lifecycle.status = 'in_progress';
     const failureNextStep = buildFailedRuntimeDispatchNextStep(project, runtimeDispatchPending);
     setLifecycleNextStep(state, failureNextStep.next_action, failureNextStep.next_command);
@@ -3735,12 +4085,13 @@ function applyRuntimeDispatchPendingLifecycle(project, state, runtimeDispatchPen
   }
 
   if (runtimeDispatchPending.active_dispatches.length > 0) {
+    setLifecycleStopReason(state, null);
     state.lifecycle.status = 'in_progress';
     const activeIds = runtimeDispatchPending.active_dispatches.map((entry) => entry.dispatch_id).join(', ');
     setLifecycleNextStep(
       state,
-      `Wait for runtime dispatches to finish for ${pendingPlansText}: ${activeIds}. Then rerun \`${buildCycleCommand(project)}\`.`,
-      buildCycleCommand(project),
+      `Wait for runtime dispatches to finish for ${pendingPlansText}: ${activeIds}. Then rerun \`${buildAdvanceCommand(project)}\`.`,
+      buildAdvanceCommand(project),
     );
     return true;
   }
@@ -3779,9 +4130,13 @@ function maybeRecordHandoffFailure(project, state) {
     return false;
   }
 
-  const dispatchId = extractSpawnDispatchId(getLifecycleNextCommand(state))
-    || state?.orchestration?.current_actionable_dispatch?.dispatch_id
-    || null;
+  const actionableDispatch = state?.orchestration?.current_actionable_dispatch;
+  const readyDispatchId = ensureArray(state?.orchestration?.runtime_dispatch_view?.ready_dispatches)
+    .find((entry) => typeof entry?.dispatch_id === 'string' && entry.dispatch_id.trim())
+    ?.dispatch_id || null;
+  const dispatchId = (actionableDispatch?.status === 'queued' || actionableDispatch?.status === 'stale')
+    ? actionableDispatch.dispatch_id
+    : readyDispatchId || extractSpawnDispatchId(getLifecycleNextCommand(state)) || actionableDispatch?.dispatch_id || null;
   if (!dispatchId) {
     return false;
   }
@@ -3930,6 +4285,7 @@ function shouldAutoPromoteDelegation(state, contract) {
 function resolveExecutionDelegation(project, state, contract) {
   const declaredDelegation = normalizeDelegationConfig(contract?.plan);
   const stage = inferPlanStage(project, contract?.plan || {});
+  const defaultRuntimeRoles = defaultAutoRuntimeRoles(contract?.plan);
   const defaultRuntimeArtifacts = contract?.plan?.plan_id
     ? [getRuntimeExecutionResultPaths(project, contract.plan.plan_id, 'executor').jsonRel]
     : [];
@@ -3955,7 +4311,7 @@ function resolveExecutionDelegation(project, state, contract) {
       declared_mode: 'auto',
       mode: 'runtime_subagents',
       owner: 'runtime_orchestrator',
-      runtime_roles: defaultAutoRuntimeRoles(contract?.plan),
+      runtime_roles: defaultRuntimeRoles,
       result_artifacts: declaredDelegation.result_artifacts.length > 0
         ? declaredDelegation.result_artifacts
         : defaultRuntimeArtifacts,
@@ -3965,8 +4321,17 @@ function resolveExecutionDelegation(project, state, contract) {
   }
 
   if (declaredDelegation.mode === 'runtime_subagents' && declaredDelegation.owner === 'runtime_orchestrator') {
+    const declaredRuntimeRoles = declaredDelegation.runtime_roles.length > 0
+      ? declaredDelegation.runtime_roles
+      : defaultRuntimeRoles;
+    const runtimeRoles = constrainRuntimeRolesForExecutionProfile(
+      contract?.plan,
+      declaredRuntimeRoles,
+      defaultRuntimeRoles,
+    );
     return {
       ...declaredDelegation,
+      runtime_roles,
       result_artifacts: declaredDelegation.result_artifacts.length > 0
         ? declaredDelegation.result_artifacts
         : defaultRuntimeArtifacts,
@@ -4080,9 +4445,7 @@ function buildRoleCapsule({
   const expectedArtifacts = normalizeStringArray(
     outputs?.expected_artifacts && outputs.expected_artifacts.length > 0
       ? outputs.expected_artifacts
-      : normalizedResultArtifacts.length > 0
-        ? normalizedResultArtifacts
-        : roleConfig.expected_outputs || [],
+      : normalizedResultArtifacts,
   );
   return compactCapsuleValue({
     schema_version: '1.0.0',
@@ -4117,6 +4480,8 @@ function buildRoleCapsule({
     outputs: {
       expected_artifacts: expectedArtifacts,
       success_conditions: normalizeStringArray(outputs?.success_conditions || []),
+      verification_commands: normalizeStringArray(outputs?.verification_commands || []),
+      acceptance_criteria: normalizeStringArray(outputs?.acceptance_criteria || []),
     },
     evidence: evidence || {},
     anti_patterns: normalizeStringArray(roleConfig.anti_patterns || []),
@@ -4126,10 +4491,7 @@ function buildRoleCapsule({
 
 function buildPlanningRoleResultArtifacts(project, role, planId) {
   if (role === 'strategist') {
-    return [
-      `.smike/${project}/STRATEGY.md`,
-      `.smike/${project}/ROADMAP.md`,
-    ];
+    return [`.smike/${project}/PLAN.json`];
   }
   if (role === 'detailer') {
     return [`.smike/${project}/phases/${planId}/${planId}-PLAN.json`];
@@ -4143,124 +4505,31 @@ function buildPlanningRoleResultArtifacts(project, role, planId) {
   return [];
 }
 
-function buildPlanningStrategistContextSnapshot(bundle) {
-  return {
-    mode: bundle.mode,
-    title: bundle.title,
-    objective: bundle.objective,
-    deliverables: normalizeStringArray(bundle.deliverables || []),
-    constraints: normalizeStringArray(bundle.constraints || []),
-    integration_requirements: normalizeStringArray(bundle.integration_requirements || []),
-    risk_hotspots: normalizeStringArray(bundle.risk_hotspots || []),
-    primary_refs: normalizePathList(bundle.primary_refs || []),
-    phase_blueprints: ensureArray(bundle.phase_blueprints).map((phase) => ({
-      id: phase.id,
-      title: phase.title,
-      summary: phase.summary,
-      depends_on: normalizeStringArray(phase.depends_on || []),
-      allowed_files: normalizePathList(phase.allowed_files || []),
-      write_scope_allowed_files: normalizePathList(phase.write_scope_allowed_files || []),
-    })),
-  };
-}
-
-function buildPlanningDetailerContextSnapshot(bundle, phase) {
-  return {
-    mode: bundle.mode,
-    title: bundle.title,
-    root_objective: bundle.objective,
-    primary_refs: normalizePathList(bundle.primary_refs || []),
-    phase_blueprint: {
-      id: phase.id,
-      title: phase.title,
-      summary: phase.summary,
-      category: phase.category,
-      depends_on: normalizeStringArray(phase.depends_on || []),
-      allowed_files: normalizePathList(phase.allowed_files || []),
-      blocked_files: normalizePathList(phase.blocked_files || []),
-      write_scope_allowed_files: normalizePathList(phase.write_scope_allowed_files || []),
-      write_scope_reason: phase.write_scope_reason || null,
-      verification_ids: normalizeStringArray(
-        ensureArray(phase.verify_commands).map((command) => command?.id),
-      ),
+function buildExecutionCapsuleContextSnapshot(contract, options = {}) {
+  const plan = contract.plan || {};
+  const resultArtifacts = normalizePathList(
+    options.resultArtifacts
+    || normalizeDelegationConfig(plan).result_artifacts
+    || [],
+  );
+  return compactCapsuleValue({
+    phase_contract: {
+      objective: plan.objective || null,
+      scope: plan.scope || null,
+      depends_on: normalizeStringArray(plan.depends_on || []),
+      verify_commands: normalizeStringArray(ensureArray(plan.verify_commands).map((command) => command?.id)),
+      acceptance_criteria: normalizeStringArray(ensureArray(plan.acceptance_criteria).map((ac) => ac?.id)),
+      result_artifacts: resultArtifacts,
+      write_scope_allowed_files: normalizePathList(plan.write_scope?.allowed_files || plan.allowed_files || []),
+      write_scope_blocked_files: normalizePathList(plan.write_scope?.blocked_files || plan.blocked_files || []),
     },
-  };
-}
-
-function buildPlanningRoleGuidance(role, options = {}) {
-  if (role === 'strategist') {
-    return {
-      readOrder: [
-        'Read the spec first, then the refs that define truth and scope.',
-        'Extract deliverables, constraints, protected areas, and phase boundaries before sequencing work.',
-      ],
-      questions: [
-        'What must this loop deliver before implementation can be considered complete?',
-        'What phase graph keeps the work reviewable and collision-aware?',
-      ],
-      successConditions: [
-        'Strategy captures truth sources, constraints, drift seeds, and bounded phases.',
-        'Planning artifacts keep downstream roles anchored on the same spec context.',
-      ],
-      nextAction: 'Hand bounded phase blueprints to detailers.',
-    };
-  }
-
-  if (role === 'detailer') {
-    return {
-      readOrder: [
-        'Read the root planning artifacts first so this phase inherits the same objective and constraints.',
-        'Use only the refs needed for this phase and make files, checks, and dependencies explicit.',
-      ],
-      questions: [
-        `What is the smallest reviewable slice for Plan ${options.planId || 'this phase'}?`,
-        'What discoveries or dependency edges must be carried forward now?',
-      ],
-      successConditions: [
-        'Phase plan is explicit about files, verification, and boundaries.',
-        'Dependency edges and gotchas are captured now instead of rediscovered later.',
-      ],
-      nextAction: 'Hand completed phase plans to checker and auditor for cross-plan review.',
-    };
-  }
-
-  if (role === 'checker') {
-    return {
-      readOrder: [
-        'Read the phase graph before individual plans so dependency checks stay global.',
-        'Look for overlap, missing edges, and discoveries that should propagate downstream.',
-      ],
-      questions: [
-        'Do any plans overlap in scope or miss a required dependency edge?',
-        'What concrete discoveries should be propagated before execution?',
-      ],
-      successConditions: [
-        'Cross-plan mismatches and blast-radius conflicts are surfaced before execution.',
-        'Checker notes stay specific enough to help later plans instead of creating noise.',
-      ],
-      nextAction: 'Pass any concrete discoveries to the auditor and downstream phase plans.',
-    };
-  }
-
-  return {
-    readOrder: [
-      'Read the spec and required deliverables before looking at the phase plans.',
-      'Map each promised behavior or deliverable to a concrete phase before declaring coverage.',
-    ],
-    questions: [
-      'Which deliverables or promises are not yet traced to a concrete phase?',
-      'Are any coverage matches weak or based on wording instead of behavior?',
-    ],
-    successConditions: [
-      'Coverage gaps are concrete and traceable back to the spec.',
-      'Ambiguous prose stays ambiguous instead of being silently promoted to a hard requirement.',
-    ],
-    nextAction: 'If coverage is sound, hand the first execution slice to the executor.',
-  };
+    execution_surface: compactCapsuleValue(options.executionSurface || {}),
+  });
 }
 
 function buildExecutionRoleGuidance(role, options = {}) {
   const hasDependencies = options.hasDependencies === true;
+  const artifactDriven = options.artifactDriven === true;
 
   if (role === 'detailer') {
     return {
@@ -4281,6 +4550,26 @@ function buildExecutionRoleGuidance(role, options = {}) {
   }
 
   if (role === 'executor') {
+    if (artifactDriven) {
+      return {
+        readOrder: [
+          'Start with STATE.md and the current plan contract so the exact artifact contract is grounded on disk.',
+          'Read the same-plan detailer capsule before touching result artifacts or findings files.',
+          hasDependencies
+            ? 'If dependencies exist, read only their judge/reviewer capsules and propagated discoveries before rewriting artifacts.'
+            : 'Touch broader source only when the declared artifact contract requires it.',
+        ],
+        questions: [
+          'Which exact result artifacts must be written or refreshed for this phase?',
+          'What evidence must those artifacts preserve so JUDGE can verify them fresh?',
+        ],
+        successConditions: [
+          'The declared result artifacts are written or refreshed inside the allowed surface.',
+          'Execution is honest about missing evidence, stale findings, or upstream drift before handing off to JUDGE.',
+        ],
+        nextAction: 'Hand the declared result artifacts and supporting evidence to JUDGE.',
+      };
+    }
     return {
       readOrder: [
         'Start with STATE.md and the current plan contract so execution is grounded on disk.',
@@ -4303,6 +4592,23 @@ function buildExecutionRoleGuidance(role, options = {}) {
   }
 
   if (role === 'judge') {
+    if (artifactDriven) {
+      return {
+        readOrder: [
+          'Read the current plan contract and executor capsule before opening the claimed result artifacts.',
+          'Verify the artifacts against fresh commands or evidence first; use file reads only where contract tracing is required.',
+        ],
+        questions: [
+          'Do the current result artifacts satisfy the declared outputs and acceptance criteria?',
+          'Did the artifact refresh stay inside scope and preserve the required evidence surface?',
+        ],
+        successConditions: [
+          'VERDICT is based on fresh verification and explicit artifact-to-contract tracing.',
+          'Any failures or weak evidence are concrete enough to route into a narrow fix.',
+        ],
+        nextAction: 'Write VERDICT.md, then hand the same artifact surface to REVIEW.',
+      };
+    }
     return {
       readOrder: [
         'Read the current plan contract and executor capsule before opening changed files.',
@@ -4321,6 +4627,25 @@ function buildExecutionRoleGuidance(role, options = {}) {
   }
 
   if (role === 'reviewer') {
+    if (artifactDriven) {
+      return {
+        readOrder: [
+          'Read VERDICT.md and the judge capsule first so review starts from verified artifact evidence.',
+          'Use the declared result artifacts and focus areas to stay on correctness, drift, and follow-on risk.',
+        ],
+        questions: [
+          'Do the result artifacts materially support the stated objective, or is there drift despite passing checks?',
+          'Are any concerns concrete enough to block completion or require a narrow fix route?',
+        ],
+        successConditions: [
+          'REVIEW stays on artifact correctness, invariants, and drift instead of cosmetic commentary.',
+          'Blocking concerns are narrow, actionable, and mapped to the current artifact surface.',
+        ],
+        nextAction: options.verdictPassed
+          ? 'Either clear the phase or route concrete artifact concerns into a fix capsule.'
+          : 'Route verdict failures and review concerns into a narrow fix capsule.',
+      };
+    }
     return {
       readOrder: [
         'Read VERDICT.md and the judge capsule first so review starts from verified evidence.',
@@ -4416,8 +4741,7 @@ function buildExecutionDetailerRefreshCapsule(project, contract, state, cycleNum
       ...collectDependencyCapsulePaths(state, dependencyIds, ['judge', 'reviewer']),
     ],
     additionalPaths: [
-      `.smike/${project}/STRATEGY.md`,
-      `.smike/${project}/ROADMAP.md`,
+      `.smike/${project}/PLAN-GRAPH.json`,
       `.smike/${project}/PROJECT.md`,
       contract.plan.spec,
       ...collectCapsulePathsForPlan(state, contract.plan.plan_id, ['detailer']),
@@ -4451,7 +4775,11 @@ function buildExecutorCapsule(project, contract, state, cycleNumber, delegationO
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
   const dependencyDiscoveries = collectDependencyDiscoveries(state, dependencyIds, contract.plan.plan_id);
   const downstreamPlanIds = findDownstreamPlanIds(state.workflow?.plans, contract.plan.plan_id);
-  const guidance = buildExecutionRoleGuidance('executor', { hasDependencies: dependencyIds.length > 0 });
+  const artifactDriven = delegation.result_artifacts.length > 0;
+  const guidance = buildExecutionRoleGuidance('executor', {
+    hasDependencies: dependencyIds.length > 0,
+    artifactDriven,
+  });
 
   return buildRoleCapsule({
     project,
@@ -4484,7 +4812,16 @@ function buildExecutorCapsule(project, contract, state, cycleNumber, delegationO
     outputs: {
       expected_artifacts: delegation.result_artifacts,
       success_conditions: guidance.successConditions,
+      verification_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
+      acceptance_criteria: ensureArray(contract.plan.acceptance_criteria).map((ac) => ac.id),
     },
+    contextSnapshot: buildExecutionCapsuleContextSnapshot(contract, {
+      resultArtifacts: delegation.result_artifacts,
+      executionSurface: {
+        artifact_mode: artifactDriven ? 'artifact_driven' : 'code_change',
+        downstream_plan_ids: downstreamPlanIds,
+      },
+    }),
     resultArtifacts: delegation.result_artifacts,
     artifactChangeRequired: true,
     evidence: {
@@ -4507,7 +4844,8 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
   const orchestrationConfig = resolveOrchestrationConfig(project, contract.plan);
   const roleConfig = orchestrationConfig.roles.judge;
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
-  const guidance = buildExecutionRoleGuidance('judge');
+  const artifactDriven = normalizeDelegationConfig(contract.plan).result_artifacts.length > 0;
+  const guidance = buildExecutionRoleGuidance('judge', { artifactDriven });
 
   return buildRoleCapsule({
     project,
@@ -4541,7 +4879,15 @@ function buildJudgeCapsule(project, paths, contract, state, cycleRecord) {
     },
     outputs: {
       success_conditions: guidance.successConditions,
+      verification_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
+      acceptance_criteria: ensureArray(contract.plan.acceptance_criteria).map((ac) => ac.id),
     },
+    contextSnapshot: buildExecutionCapsuleContextSnapshot(contract, {
+      executionSurface: {
+        artifact_mode: artifactDriven ? 'artifact_driven' : 'code_change',
+        changed_paths: ensureArray(cycleRecord.scope?.changed_paths),
+      },
+    }),
     resultArtifacts: [
       path.relative(REPO_ROOT, paths.verdictReportPath).replaceAll(path.sep, '/'),
     ],
@@ -4570,7 +4916,11 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
   const roleConfig = orchestrationConfig.roles.reviewer;
   const qualityConfig = getQualityGateConfig(contract.plan);
   const dependencyIds = normalizeStringArray(contract.plan.depends_on);
-  const guidance = buildExecutionRoleGuidance('reviewer', { verdictPassed: verdictRecord.result === 'pass' });
+  const artifactDriven = normalizeDelegationConfig(contract.plan).result_artifacts.length > 0;
+  const guidance = buildExecutionRoleGuidance('reviewer', {
+    verdictPassed: verdictRecord.result === 'pass',
+    artifactDriven,
+  });
 
   return buildRoleCapsule({
     project,
@@ -4606,7 +4956,16 @@ function buildReviewerCapsule(project, paths, contract, state, cycleRecord, verd
     },
     outputs: {
       success_conditions: guidance.successConditions,
+      verification_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
+      acceptance_criteria: ensureArray(contract.plan.acceptance_criteria).map((ac) => ac.id),
     },
+    contextSnapshot: buildExecutionCapsuleContextSnapshot(contract, {
+      executionSurface: {
+        artifact_mode: artifactDriven ? 'artifact_driven' : 'code_change',
+        changed_paths: ensureArray(cycleRecord.scope?.changed_paths),
+        verdict_result: verdictRecord.result,
+      },
+    }),
     resultArtifacts: [
       path.relative(REPO_ROOT, paths.reviewReportPath).replaceAll(path.sep, '/'),
     ],
@@ -4668,7 +5027,16 @@ function buildRuntimeFollowOnCapsule(project, contract, state, role, cycleNumber
     outputs: {
       expected_artifacts: normalizedArtifacts,
       success_conditions: roleSpecific.successConditions,
+      verification_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
+      acceptance_criteria: ensureArray(contract.plan.acceptance_criteria).map((ac) => ac.id),
     },
+    contextSnapshot: buildExecutionCapsuleContextSnapshot(contract, {
+      resultArtifacts: normalizedArtifacts,
+      executionSurface: {
+        artifact_mode: 'artifact_driven',
+        review_surface_role: role,
+      },
+    }),
     resultArtifacts: normalizedArtifacts,
     artifactChangeRequired: false,
     evidence: {
@@ -4720,7 +5088,16 @@ function buildFixerCapsule(project, paths, contract, state, cycleRecord, verdict
     },
     outputs: {
       success_conditions: guidance.successConditions,
+      verification_commands: ensureArray(contract.plan.verify_commands).map((command) => command.id),
+      acceptance_criteria: ensureArray(contract.plan.acceptance_criteria).map((ac) => ac.id),
     },
+    contextSnapshot: buildExecutionCapsuleContextSnapshot(contract, {
+      resultArtifacts: delegation.result_artifacts,
+      executionSurface: {
+        artifact_mode: delegation.result_artifacts.length > 0 ? 'artifact_driven' : 'code_change',
+        blocking_failures: blockingFailures,
+      },
+    }),
     resultArtifacts: delegation.result_artifacts,
     artifactChangeRequired: true,
     evidence: {
@@ -4743,17 +5120,16 @@ function writeRoleCapsule(paths, capsule) {
   const capsulePaths = getRoleCapsulePaths(paths, capsule.plan_id, capsule.role);
   writeJson(capsulePaths.jsonPath, capsule);
   const legacyMdPath = path.join(paths.capsulesDir, `${buildRoleCapsuleBasename(capsule.plan_id, capsule.role)}.md`);
-  if (fs.existsSync(legacyMdPath)) {
-    fs.unlinkSync(legacyMdPath);
-  }
+  removeIfExists(legacyMdPath);
   return capsulePaths;
 }
 
-function summarizeFailures(preflight, verifyResults, acceptanceResults, scopeResult, postflightResults) {
+function summarizeFailures(preflight, verifyResults, acceptanceResults, scopeResult, postflightResults, options = {}) {
   const failures = [];
+  const ignorePreflightFailures = options.ignorePreflightFailures === true;
 
   for (const check of preflight.checks) {
-    if (!check.pass) {
+    if (!check.pass && !ignorePreflightFailures) {
       if (check.type === 'workspace_dirty') {
         failures.push('preflight.workspace_dirty');
       } else if (check.type === 'tool') {
@@ -4787,6 +5163,145 @@ function summarizeFailures(preflight, verifyResults, acceptanceResults, scopeRes
   }
 
   return failures;
+}
+
+function collectChangedPathsFromRuntimeResultArtifact(artifactPath) {
+  if (typeof artifactPath !== 'string' || !artifactPath.trim() || path.extname(artifactPath) !== '.json') {
+    return [];
+  }
+
+  const absolutePath = path.resolve(REPO_ROOT, artifactPath);
+  if (!isPathInside(REPO_ROOT, absolutePath) || !fs.existsSync(absolutePath)) {
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(absolutePath, 'utf8'));
+  } catch {
+    return [];
+  }
+
+  const collectStringPaths = (value) => normalizePathList(
+    ensureArray(value)
+      .filter((entry) => typeof entry === 'string')
+      .map((entry) => normalizeRel(entry)),
+  );
+
+  return uniqueStrings([
+    ...collectStringPaths(parsed?.changed_files),
+    ...collectStringPaths(parsed?.changed_paths),
+    ...collectStringPaths(parsed?.modified_files),
+    ...collectStringPaths(parsed?.files_changed),
+    ...collectStringPaths(parsed?.execution?.changed_files),
+    ...collectStringPaths(parsed?.execution?.changed_paths),
+  ]);
+}
+
+function collectRuntimeExecutorEvidence(state, planId) {
+  const normalizedPlanId = typeof planId === 'string' ? planId.trim() : '';
+  if (!normalizedPlanId) {
+    return null;
+  }
+
+  const entry = getRuntimeDispatchEntry(state, dispatchIdFor(normalizedPlanId, 'executor'));
+  if (entry?.status !== 'completed' || entry?.freshness?.status !== 'fresh') {
+    return null;
+  }
+
+  const resultArtifacts = verifiedArtifactPathsFromCompletionArtifacts(entry);
+  const changedPaths = uniqueStrings(
+    resultArtifacts.flatMap((artifactPath) => collectChangedPathsFromRuntimeResultArtifact(artifactPath)),
+  );
+
+  return {
+    dispatch_id: entry.dispatch_id,
+    completed_fresh: true,
+    result_artifacts: resultArtifacts,
+    changed_paths: changedPaths,
+  };
+}
+
+function evaluateMaterialExecutionEvidence(plan, scopeResult) {
+  const stage = inferPlanStage('', plan || {});
+  if (stage !== 'execution') {
+    return {
+      required: false,
+      pass: true,
+      reason: 'Material-change enforcement applies to execution phases only.',
+    };
+  }
+
+  const changedPaths = ensureArray(scopeResult?.changed_paths);
+  if (changedPaths.length > 0) {
+    return {
+      required: true,
+      pass: true,
+      reason: `Observed ${changedPaths.length} in-scope changed path(s).`,
+    };
+  }
+
+  const scopeTokens = uniqueStrings(
+    ensureArray([
+      ...ensureArray(plan?.allowed_files),
+      ...ensureArray(plan?.write_scope?.allowed_files),
+    ])
+      .filter((entry) => portabilityHeuristics.isLikelySourcePath(entry))
+      .flatMap((entry) => String(entry || '').toLowerCase().split(/[^a-z0-9]+/))
+      .map((token) => token.trim())
+      .filter(Boolean)
+      .filter((token) => !new Set(['src', 'lib', 'app', 'apps', 'packages', 'routes', 'scripts', 'tests', 'smike']).has(token)),
+  );
+  const verifyText = ensureArray(plan?.verify_commands)
+    .flatMap((command) => [command?.id, command?.run])
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+  const verifyCommandsTargetOnlyNonCodeArtifacts = ensureArray(plan?.verify_commands).length > 0
+    && ensureArray(plan?.verify_commands).every((command) => {
+      const references = String(command?.run || '')
+        .split(/\s+/)
+        .map((token) => token.trim().replace(/^['"`(]+|['"`),;:]+$/g, ''))
+        .filter(Boolean)
+        .filter((token) => token.includes('/') || token.includes('.'))
+        .filter((token) => !token.startsWith('-'));
+      if (references.length === 0) {
+        return false;
+      }
+      return references.every((reference) => {
+        if (reference.startsWith('.smike/')) {
+          return true;
+        }
+        if (reference.startsWith('fixtures/')) {
+          return true;
+        }
+        if (reference.endsWith('.md') || reference.endsWith('.json') || reference.endsWith('.txt')) {
+          return !portabilityHeuristics.isLikelySourcePath(reference);
+        }
+        return !portabilityHeuristics.isLikelySourcePath(reference);
+      });
+    });
+  const detachedProof = portabilityHeuristics.planHasCodeScope(plan)
+    && scopeTokens.length > 0
+    && !ensureArray(plan?.verify_commands).some(
+      (command) => portabilityHeuristics.looksLikeVerificationCoverageCommand(command)
+        || portabilityHeuristics.looksLikeTestVerificationCommand(command),
+    )
+    && !scopeTokens.some((token) => verifyText.includes(token));
+  if (!detachedProof && !verifyCommandsTargetOnlyNonCodeArtifacts) {
+    return {
+      required: true,
+      pass: true,
+      reason: 'No fresh in-scope file delta was observed, but the proof surface is not detached from the write scope.',
+    };
+  }
+
+  return {
+    required: true,
+    pass: false,
+    reason: verifyCommandsTargetOnlyNonCodeArtifacts
+      ? 'No fresh in-scope file delta was observed, and verification only inspected planning/doc artifacts instead of code-bearing surfaces.'
+      : 'No fresh in-scope file delta was observed, and verification is detached from the code-bearing write scope.',
+  };
 }
 
 function relativizeInsideRepo(targetPath) {
@@ -4900,6 +5415,17 @@ function resolvePathList(inputPaths) {
     absolute: resolved.absolute,
     relative: normalizeRel(resolved.relative),
   }));
+}
+
+function normalizeStartSpecArgs(specArgs) {
+  const normalized = ensureArray(specArgs).map((value) => String(value));
+  if (normalized.length === 1) {
+    const shortcut = resolveSpecShortcut(normalized[0]);
+    if (shortcut) {
+      return [shortcut];
+    }
+  }
+  return normalized;
 }
 
 function buildDefaultIntakeSpecRel(promptText) {
@@ -5092,11 +5618,439 @@ function buildIntakeSpecMarkdown(promptText, contextFiles = []) {
     '- What is explicitly out of scope for this loop?',
     '- How should the finished work be verified?',
     '',
+    '## Planning Design Prompt',
+    'Use this when converting the intake into a SMIKE-ingestible planning spec:',
+    '> Expand this intake into a single self-contained SMIKE spec that preserves exact parser headings. Attached context docs are refs only and do not satisfy `## Objective`, `## Required Deliverable From This Loop`, `## Required Planning Output Shape`, or `## Priority N:` requirements. SMIKE may refresh a managed `SMIKE:CONTRACT` block, but the main spec still has to carry real repo-aware intent. During `planning_draft`, update the spec file and rerun the cycle; do not patch generated `.smike/**` artifacts. Replace generic phase titles, fallback proof commands, and broad summaries with narrow repo-specific slices. Fill `## What The Planner Must Read First` with canonical repo paths, keep deliverables checker-auditable, add `category:` or `write_scope:` and explicit `depends:` where needed on each `- Plan NN:` line, add phase-specific `verify:` commands for code-bearing work once the surface is concrete, write matching `## Priority N:` summaries for every phase, and keep clarifying questions only for unresolved facts that block promotion.',
+    '',
     '## Notes From Intake',
     `- Raw prompt: ${promptText}`,
     '- Replace generic phase titles, summaries, and verification with concrete repo-aware details before promotion.',
     '',
   ].join('\n');
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripManagedPlanningContractBlock(markdown) {
+  const pattern = new RegExp(
+    `${escapeRegExp(MANAGED_CONTRACT_START)}[\\s\\S]*?${escapeRegExp(MANAGED_CONTRACT_END)}\\s*`,
+    'g',
+  );
+  return String(markdown || '').replace(pattern, '').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+function splitSpecForManagedContract(markdown) {
+  const stripped = stripManagedPlanningContractBlock(markdown);
+  const lines = stripped.split(/\r?\n/);
+  const firstManagedHeadingIndex = lines.findIndex((line, index) => index > 0 && /^##\s+/.test(line));
+  const insertIndex = firstManagedHeadingIndex >= 0 ? firstManagedHeadingIndex : lines.length;
+  return {
+    prelude: lines.slice(0, insertIndex).join('\n').trimEnd(),
+    remainder: lines.slice(insertIndex).join('\n').trim(),
+  };
+}
+
+function extractFirstNarrativeParagraph(markdown) {
+  const lines = String(markdown || '').split(/\r?\n/);
+  const paragraphs = [];
+  let current = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (
+      !line
+      || /^<!--/.test(line)
+      || /^>/.test(line)
+      || /^#{1,6}\s+/.test(line)
+      || /^[-*+]\s+/.test(line)
+      || /^\d+\.\s+/.test(line)
+      || /^```/.test(line)
+    ) {
+      if (current.length > 0) {
+        paragraphs.push(current.join(' ').trim());
+        current = [];
+      }
+      continue;
+    }
+    current.push(line);
+  }
+
+  if (current.length > 0) {
+    paragraphs.push(current.join(' ').trim());
+  }
+
+  return paragraphs.find(Boolean) || '';
+}
+
+function parsePhaseReferenceIds(value) {
+  return uniqueStrings(
+    Array.from(String(value || '').matchAll(/\b(?:plan|phase)\s*(\d{1,2})\b/gi))
+      .map((match) => String(match[1] || '').padStart(2, '0')),
+  );
+}
+
+function extractLegacyPhaseBlueprints(sections) {
+  const phaseSections = ensureArray(sections)
+    .map((section) => {
+      const match = String(section?.title || '').match(/^(?:Phase|Plan)\s+(\d+)\s*(?:[-—–:]\s*|\s+)(.+)$/i);
+      if (!match) {
+        return null;
+      }
+      return {
+        id: String(match[1]).padStart(2, '0'),
+        title: cleanMarkdownInline(match[2]),
+        section,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Number(left.id) - Number(right.id));
+
+  return phaseSections.map(({ id, title, section }, index) => {
+    const text = sectionText(section);
+    const dependsLine = text.split(/\r?\n/).find((line) => /depends on:/i.test(line)) || '';
+    const declaredDepends = /depends on:\s*none/i.test(dependsLine)
+      ? []
+      : parsePhaseReferenceIds(dependsLine);
+    const writeSurfaceLine = text.split(/\r?\n/).find((line) => /main write surface:/i.test(line)) || '';
+    const declaredWriteScope = normalizePathList([
+      ...extractRepoPathsFromText(writeSurfaceLine),
+      ...extractRepoPathsFromText(text),
+    ]);
+    return {
+      id,
+      title,
+      summary: summarizeSection(text, `Implement ${title.toLowerCase()}.`),
+      summary_source: 'legacy_phase_heading',
+      declared_depends_on: declaredDepends,
+      declared_category: inferPhaseCategory(`${title} ${text}`),
+      declared_write_scope: declaredWriteScope,
+      declared_verify_commands: [],
+      dependency_mode: declaredDepends.length > 0 ? 'legacy_explicit' : (index === 0 ? 'legacy_root' : 'legacy_implicit'),
+      legacy_section_text: text,
+    };
+  });
+}
+
+function buildAutoprepFallbackPhases(specRel, sections) {
+  const objective = summarizeSection(
+    sectionText(findSection(sections, /^Objective$/i)),
+    extractFirstNarrativeParagraph(sectionText(sections[0])) || `Implement ${specRel}.`,
+  );
+  return [
+    {
+      id: '01',
+      title: 'Scope and truth-source intake',
+      summary: summarizeSection(objective, 'Turn the spec into a concrete problem statement and gather repo truth sources.'),
+      summary_source: 'autoprep_fallback',
+      declared_depends_on: [],
+      declared_category: 'general',
+      declared_write_scope: [],
+      declared_verify_commands: [],
+      dependency_mode: 'fallback',
+      legacy_section_text: objective,
+    },
+    {
+      id: '02',
+      title: 'First executable slice',
+      summary: 'Define the first bounded implementation slice once the target interfaces and files are concrete.',
+      summary_source: 'autoprep_fallback',
+      declared_depends_on: ['01'],
+      declared_category: 'general',
+      declared_write_scope: [],
+      declared_verify_commands: [],
+      dependency_mode: 'fallback',
+      legacy_section_text: objective,
+    },
+    {
+      id: '03',
+      title: 'Follow-on slice and verification',
+      summary: 'Define the follow-on implementation work and attach explicit verification to each code-bearing slice.',
+      summary_source: 'autoprep_fallback',
+      declared_depends_on: ['02'],
+      declared_category: 'verification',
+      declared_write_scope: [],
+      declared_verify_commands: [],
+      dependency_mode: 'fallback',
+      legacy_section_text: objective,
+    },
+  ];
+}
+
+function buildAutoprepVerifyCommand(specRel, phase, fallbackText = '') {
+  const sourceItems = [
+    phase?.title,
+    phase?.summary,
+    ...extractListItems(fallbackText).slice(0, 4),
+  ]
+    .map((value) => cleanMarkdownInline(value))
+    .map((value) => value.replace(/\s+/g, ' ').trim())
+    .filter((value) => value && value.length >= 4)
+    .slice(0, 4);
+  const needles = uniqueStrings(sourceItems.length > 0 ? sourceItems : [phase?.title || `Plan ${phase?.id || '01'}`]);
+  const stdoutToken = `plan-${phase?.id || '00'}-spec-ready`;
+  const probes = needles.map((needle) => `-e ${JSON.stringify(needle)}`).join(' ');
+  return `test -f ${specRel} && rg -n -F ${probes} ${specRel} && printf '%s' '${stdoutToken}'`;
+}
+
+function sanitizeAutoprepVerifyCommands(specRel, phase, commands, fallbackText = '') {
+  const safeCommands = normalizeStringArray(commands)
+    .filter((command) => !looksLikeTruncatedShellCommand(command))
+    .filter((command) => {
+      const missingTargets = extractVerifyCommandPathCandidates(command)
+        .filter((candidate) => {
+          const absolute = path.isAbsolute(candidate)
+            ? candidate
+            : path.resolve(REPO_ROOT, candidate);
+          return !fs.existsSync(absolute);
+        });
+      return missingTargets.length === 0;
+    });
+
+  if (safeCommands.length > 0) {
+    return safeCommands;
+  }
+
+  return [buildAutoprepVerifyCommand(specRel, phase, fallbackText)];
+}
+
+function deriveAutoprepObjective(specRel, sections, markdown) {
+  const explicitObjective = summarizeSection(sectionText(findSection(sections, /^Objective$/i)), '');
+  if (explicitObjective) {
+    return explicitObjective;
+  }
+  const firstParagraph = extractFirstNarrativeParagraph(markdown);
+  if (firstParagraph) {
+    return summarizeSection(firstParagraph, '');
+  }
+  return `Implement ${specRel}.`;
+}
+
+function deriveAutoprepPrimaryRefs(specRel, contextFiles, sections, markdown) {
+  const explicitReadFirst = extractListItems(sectionText(findSection(sections, /^What The Planner Must Read First$/i)))
+    .map((value) => normalizeRel(value))
+    .filter(looksLikeRepoPath);
+  const refs = normalizePathList([
+    ...extractPrimaryRefs(markdown),
+    ...explicitReadFirst,
+    ...contextFiles,
+    ...extractRepoPathsFromText(markdown),
+    specRel,
+  ]);
+  return refs.slice(0, 12);
+}
+
+function deriveAutoprepDeliverables(sections) {
+  const explicitDeliverables = extractListItemsFromSectionPatterns(sections, DELIVERABLE_SECTION_PATTERNS);
+  if (explicitDeliverables.length > 0) {
+    return explicitDeliverables;
+  }
+  return [
+    'A bounded implementation plan with reviewable execution slices.',
+    'Clarified assumptions, constraints, and repo truth sources needed before execution begins.',
+    'Phase-specific verification commands for each code-bearing slice.',
+  ];
+}
+
+function deriveAutoprepPhaseBlueprints(specRel, sections, markdown) {
+  const planningShapeSection = findSectionByPatterns(sections, PLANNING_SHAPE_SECTION_PATTERNS);
+  const declaredPhases = [];
+  for (const line of sectionText(planningShapeSection).split(/\r?\n/)) {
+    const phase = parsePhaseBlueprintLine(line);
+    if (phase) {
+      declaredPhases.push({
+        ...phase,
+        summary: '',
+        summary_source: 'declared_blueprint',
+        legacy_section_text: '',
+      });
+    }
+  }
+
+  const phases = declaredPhases.length > 0
+    ? declaredPhases
+    : extractLegacyPhaseBlueprints(sections);
+
+  const fallbackPhases = phases.length > 0 ? phases : buildAutoprepFallbackPhases(specRel, sections);
+  const prioritySections = ensureArray(sections)
+    .filter((section) => /^Priority\s+\d+:/i.test(section.title))
+    .map((section) => {
+      const match = section.title.match(/^Priority\s+(\d+):/i);
+      return {
+        id: match ? String(match[1]).padStart(2, '0') : null,
+        summary: summarizeSection(sectionText(section), ''),
+      };
+    })
+    .filter((entry) => entry.id && entry.summary);
+  const priorityById = new Map(prioritySections.map((entry) => [entry.id, entry.summary]));
+
+  return fallbackPhases.map((phase, index) => {
+    const explicitSummary = priorityById.get(phase.id) || '';
+    const summary = explicitSummary
+      || phase.summary
+      || summarizeSection(phase.legacy_section_text || markdown, `Implement ${phase.title.toLowerCase()}.`);
+    const verifyCommands = sanitizeAutoprepVerifyCommands(
+      specRel,
+      phase,
+      phase.declared_verify_commands,
+      `${phase.legacy_section_text || ''}\n${summary}`,
+    );
+    return {
+      ...phase,
+      summary,
+      summary_source: explicitSummary ? 'priority' : (phase.summary_source || 'autoprep'),
+      declared_category: phase.declared_category || inferPhaseCategory(`${phase.title} ${summary}`),
+      declared_depends_on:
+        normalizePathList(phase.declared_depends_on).length > 0
+          ? normalizePathList(phase.declared_depends_on)
+          : index === 0 ? [] : [fallbackPhases[index - 1].id],
+      declared_verify_commands: verifyCommands,
+    };
+  });
+}
+
+function renderManagedContractMarkdown(specRel, contextFiles, markdown) {
+  const stripped = stripManagedPlanningContractBlock(markdown);
+  const sections = parseMarkdownSections(stripped);
+  const objective = deriveAutoprepObjective(specRel, sections, stripped);
+  const refs = deriveAutoprepPrimaryRefs(specRel, contextFiles, sections, stripped);
+  const deliverables = deriveAutoprepDeliverables(sections);
+  const constraints = extractListItems(sectionText(findSection(sections, /^Critical Constraints$/i)));
+  const integrationRequirementsText = sectionText(findSection(sections, /^Integration Requirements$/i));
+  const integrationRequirements = extractListItems(integrationRequirementsText);
+  const riskHotspots = extractListItems(sectionText(findSection(sections, /^Risk Hotspots$/i)));
+  const firstPhaseContractItems = extractListItems(sectionText(findFirstPhaseContractSection(sections)));
+  const nonGoals = extractListItemsFromSectionPatterns(sections, NON_GOAL_SECTION_PATTERNS);
+  const explicitDeferrals = extractListItems(sectionText(findSection(sections, /^Explicit Deferrals$/i)));
+  const protectedAreas = extractListItems(sectionText(findSection(sections, /^Protected \/ High-Collision Areas$/i)));
+  const phases = deriveAutoprepPhaseBlueprints(specRel, sections, stripped);
+
+  const lines = [];
+  lines.push('## Objective');
+  lines.push('');
+  lines.push(objective);
+  lines.push('');
+  lines.push('## What The Planner Must Read First');
+  lines.push('');
+  for (const [index, ref] of refs.entries()) {
+    lines.push(`${index + 1}. \`${ref}\``);
+  }
+  lines.push('');
+  lines.push('## Planner Must Produce');
+  lines.push('');
+  for (const item of deliverables) {
+    lines.push(`- ${item}`);
+  }
+  if (constraints.length > 0) {
+    lines.push('');
+    lines.push('## Critical Constraints');
+    lines.push('');
+    for (const item of constraints) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (integrationRequirements.length > 0) {
+    lines.push('');
+    lines.push('## Integration Requirements');
+    lines.push('');
+    for (const item of integrationRequirements) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (riskHotspots.length > 0) {
+    lines.push('');
+    lines.push('## Risk Hotspots');
+    lines.push('');
+    for (const item of riskHotspots) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (firstPhaseContractItems.length > 0) {
+    lines.push('');
+    lines.push('## Required Plan 01 Contract');
+    lines.push('');
+    for (const item of firstPhaseContractItems) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (nonGoals.length > 0) {
+    lines.push('');
+    lines.push('## Explicit Non-Goals');
+    lines.push('');
+    for (const item of nonGoals) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (explicitDeferrals.length > 0) {
+    lines.push('');
+    lines.push('## Explicit Deferrals');
+    lines.push('');
+    for (const item of explicitDeferrals) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (protectedAreas.length > 0) {
+    lines.push('');
+    lines.push('## Protected / High-Collision Areas');
+    lines.push('');
+    for (const item of protectedAreas) {
+      lines.push(`- ${item}`);
+    }
+  }
+  lines.push('');
+  lines.push('## Required Planning Output Shape');
+  lines.push('');
+  for (const phase of phases) {
+    const directives = [];
+    if (phase.declared_depends_on.length > 0) {
+      directives.push(`depends:${phase.declared_depends_on.join(',')}`);
+    }
+    if (phase.declared_category) {
+      directives.push(`category:${phase.declared_category}`);
+    }
+    if (phase.declared_write_scope.length > 0) {
+      directives.push(`write_scope:${phase.declared_write_scope.join(',')}`);
+    }
+    if (phase.declared_verify_commands.length > 0) {
+      directives.push(`verify:${phase.declared_verify_commands.join(' | ')}`);
+    }
+    lines.push(`- Plan ${phase.id}: ${phase.title}${directives.length > 0 ? ` (${directives.join('; ')})` : ''}`);
+  }
+
+  for (const phase of phases) {
+    lines.push('');
+    lines.push(`## Priority ${Number.parseInt(phase.id, 10)}: ${phase.title}`);
+    lines.push('');
+    lines.push(phase.summary || `Implement ${phase.title.toLowerCase()}.`);
+  }
+
+  return lines.join('\n');
+}
+
+function ensurePreparedPlanningSpec(specRel, contextFiles = []) {
+  const specPath = path.join(REPO_ROOT, specRel);
+  const original = fs.readFileSync(specPath, 'utf8');
+  const managedContract = renderManagedContractMarkdown(specRel, contextFiles, original);
+  const { prelude, remainder } = splitSpecForManagedContract(original);
+  const nextMarkdown = [
+    prelude,
+    `${MANAGED_CONTRACT_START}\n${managedContract}\n${MANAGED_CONTRACT_END}`,
+    remainder,
+  ]
+    .filter((part) => String(part || '').trim())
+    .join('\n\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd() + '\n';
+
+  if (nextMarkdown !== original) {
+    fs.writeFileSync(specPath, nextMarkdown, 'utf8');
+  }
+
+  return {
+    changed: nextMarkdown !== original,
+    text: nextMarkdown,
+  };
 }
 
 function resolveSpecShortcut(input) {
@@ -5763,9 +6717,8 @@ function buildResearchArtifactCheckCommand(project, phase) {
 function buildPlanningBundleCheckCommand(project, phaseIds, planningAnalysis = {}) {
   const artifacts = [
     `.smike/${project}/PROJECT.md`,
+    `.smike/${project}/PLAN.json`,
     `.smike/${project}/PLAN.md`,
-    `.smike/${project}/ROADMAP.md`,
-    `.smike/${project}/STRATEGY.md`,
     `.smike/${project}/PLAN-GRAPH.json`,
     `.smike/${project}/STATE.json`,
     ...phaseIds.map((phaseId) => `.smike/${project}/phases/${phaseId}/${phaseId}-PLAN.json`),
@@ -5816,10 +6769,95 @@ function buildPlanningReportCheckCommand(project, reportName) {
   return `node -e ${JSON.stringify(script)}`;
 }
 
+function inferExplicitVerifyStdoutSignal(run) {
+  const normalizedRun = String(run || '').trim();
+  if (!normalizedRun) {
+    return null;
+  }
+
+  let match = normalizedRun.match(/^(?:printf|echo)\s+(['"])([^'"\\]+)\1\s*$/);
+  if (match) {
+    return match[2];
+  }
+
+  match = normalizedRun.match(/^(?:printf|echo)\s+([A-Za-z0-9._:-]+)\s*$/);
+  if (match) {
+    return match[1];
+  }
+
+  match = normalizedRun.match(/process\.stdout\.write\((['"])([^'"\\]+)\1\)/);
+  if (match) {
+    return match[2];
+  }
+
+  match = normalizedRun.match(/console\.(?:log|error)\((['"])([^'"\\]+)\1\)/);
+  if (match) {
+    return match[2];
+  }
+
+  return null;
+}
+
+function splitShellDirectiveCommands(value) {
+  const input = String(value || '');
+  const parts = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    const next = index + 1 < input.length ? input[index + 1] : '';
+
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      current += char;
+      escaped = true;
+      continue;
+    }
+
+    if (quote) {
+      current += char;
+      if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === '\'' || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+
+    if (char === '|' && next !== '|') {
+      if (current.trim()) {
+        parts.push(current.trim());
+      }
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current.trim()) {
+    parts.push(current.trim());
+  }
+
+  return parts;
+}
+
 function buildCustomVerifyCommand(run, index) {
   const normalizedRun = String(run || '').trim();
   const commandId = `verify-${index + 1}`;
-  const timeoutMs = /\b(test|vitest|jest|tsc|typecheck|build)\b/i.test(normalizedRun) ? 600000 : 120000;
+  const timeoutMs = portabilityHeuristics.looksLikeVerificationCoverageCommand({ run: normalizedRun }) ? 600000 : 120000;
+  const stdoutSignal = inferExplicitVerifyStdoutSignal(normalizedRun);
   return {
     id: commandId,
     run: normalizedRun,
@@ -5827,6 +6865,7 @@ function buildCustomVerifyCommand(run, index) {
     timeout_ms: timeoutMs,
     expect: {
       exit_code: 0,
+      ...(stdoutSignal ? { stdout_includes: [stdoutSignal] } : {}),
     },
   };
 }
@@ -5834,7 +6873,7 @@ function buildCustomVerifyCommand(run, index) {
 function buildPhaseVerifyCommands(project, phase, primaryRefs, mode = 'implementation') {
   const commands = [];
   const explicitVerifyCommands = normalizeStringArray(phase.declared_verify_commands || []);
-  const hasCodeScope = phase.allowed_files.some((filePath) => /^(packages|tests|scripts)\//.test(filePath));
+  const hasCodeScope = portabilityHeuristics.planHasCodeScope(phase);
   const docsToCheck = primaryRefs
     .filter((ref) => ref.endsWith('.md') || ref === 'AGENTS.md')
     .slice(0, 6);
@@ -5860,30 +6899,22 @@ function buildPhaseVerifyCommands(project, phase, primaryRefs, mode = 'implement
     const category = phase.category || 'general';
     const shouldAddTypecheck = hasCodeScope || ['permissions', 'route-architecture', 'verification', 'ui-component', 'migration'].includes(category);
     const shouldAddUnitTests = hasCodeScope || ['permissions', 'route-architecture', 'verification', 'ui-component', 'migration'].includes(category);
-
-    if (shouldAddTypecheck) {
-      commands.push({
-        id: 'typecheck',
-        run: 'npm run typecheck',
-        cwd: '../..',
-        timeout_ms: 600000,
-        expect: {
-          exit_code: 0,
-        },
-      });
-    }
-
-    if (shouldAddUnitTests) {
-      commands.push({
-        id: 'unit-tests',
-        run: guardTestVerifyCommand('npm run test:unit'),
-        cwd: '../..',
-        timeout_ms: 600000,
-        expect: {
-          exit_code: 0,
-        },
-      });
-    }
+    const defaultVerifyCommands = portabilityHeuristics.buildDefaultVerifyCommands({
+      repoRoot: REPO_ROOT,
+      plan: phase,
+      includeTypecheck: shouldAddTypecheck,
+      includeTests: shouldAddUnitTests,
+      guardTestCommand: guardTestVerifyCommand,
+    });
+    commands.push(...defaultVerifyCommands.map((command) => ({
+      id: command.id,
+      run: command.run,
+      cwd: '../..',
+      timeout_ms: portabilityHeuristics.looksLikeVerificationCoverageCommand(command) ? 600000 : 120000,
+      expect: {
+        exit_code: 0,
+      },
+    })));
   }
 
   if (docsToCheck.length > 0 && (mode === 'research' || commands.length === 0 || phase.category === 'doc-drift')) {
@@ -5973,10 +7004,7 @@ function parsePhaseBlueprintLine(line) {
         .filter(Boolean),
     ),
     declared_verify_commands: normalizeStringArray(
-      String(directives.verify || '')
-        .split('|')
-        .map((value) => value.trim())
-        .filter(Boolean),
+      splitShellDirectiveCommands(directives.verify || ''),
     ),
   };
 }
@@ -6000,11 +7028,9 @@ const REQUIRED_PLAN_01_CONTRACT_PATTERNS = [
   /^Required Plan 01 Contract$/i,
   /^Plan 01 Contract$/i,
 ];
-const LEGACY_RECOMMENDED_EXECUTABLE_PATTERN = /^Recommended First Executable Phase$/i;
 
 const NON_GOAL_SECTION_PATTERNS = [
   /^Explicit Non-Goals$/i,
-  /^Scope Out$/i,
 ];
 
 function findSectionByPatterns(sections, patterns) {
@@ -6022,10 +7048,7 @@ function extractListItemsFromSectionPatterns(sections, patterns) {
 }
 
 function findFirstPhaseContractSection(sections) {
-  return findSectionByPatterns(sections, [
-    ...REQUIRED_PLAN_01_CONTRACT_PATTERNS,
-    LEGACY_RECOMMENDED_EXECUTABLE_PATTERN,
-  ]);
+  return findSectionByPatterns(sections, REQUIRED_PLAN_01_CONTRACT_PATTERNS);
 }
 
 function buildPlanningLintFindings(sections) {
@@ -6034,7 +7057,6 @@ function buildPlanningLintFindings(sections) {
   const hasDeliverables = extractListItemsFromSectionPatterns(sections, DELIVERABLE_SECTION_PATTERNS).length > 0;
   const hasPlanningShape = Boolean(findSectionByPatterns(sections, PLANNING_SHAPE_SECTION_PATTERNS))
     || sections.some((section) => /^Priority\s+\d+:/i.test(section.title));
-  const hasLegacyRecommendedExecutable = Boolean(findSection(sections, LEGACY_RECOMMENDED_EXECUTABLE_PATTERN));
 
   if (!hasObjective) {
     findings.push({
@@ -6063,13 +7085,205 @@ function buildPlanningLintFindings(sections) {
     });
   }
 
-  if (!hasPlanningShape && hasLegacyRecommendedExecutable) {
-    findings.push({
-      id: 'spec-legacy-recommended-phase-only',
-      severity: 'high',
-      title: 'The spec only provides a legacy recommended executable phase hint',
-      details: '`## Recommended First Executable Phase` is now treated as a legacy alias. Prefer `## Required Plan 01 Contract`, and still add `## Required Planning Output Shape` or `## Priority N:` sections so the planner has a real decomposition.',
-    });
+  return {
+    result: findings.some((finding) => finding.severity !== 'low') ? 'concerns' : 'pass',
+    findings,
+  };
+}
+
+function hasBalancedShellQuotes(command) {
+  let singleQuotes = 0;
+  let doubleQuotes = 0;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    const previous = index > 0 ? command[index - 1] : '';
+    if (char === '\'' && previous !== '\\' && doubleQuotes % 2 === 0) {
+      singleQuotes += 1;
+    } else if (char === '"' && previous !== '\\' && singleQuotes % 2 === 0) {
+      doubleQuotes += 1;
+    }
+  }
+
+  return singleQuotes % 2 === 0 && doubleQuotes % 2 === 0;
+}
+
+function looksLikeTruncatedShellCommand(command) {
+  const normalized = String(command || '').trim();
+  if (!normalized) {
+    return true;
+  }
+  if (!hasBalancedShellQuotes(normalized)) {
+    return true;
+  }
+  return /(?:&&|\|\||\||;|\\)$/.test(normalized) || /(?:\(|\{)\s*$/.test(normalized);
+}
+
+function commandHasObservableSignal(command) {
+  const normalized = String(command || '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return /(?:^|[;&|]\s*)(printf|echo)\s+/.test(normalized)
+    || /process\.stdout\.write|console\.(?:log|error)/.test(command)
+    || /\bgrep\b(?!.*\s-q(?:\s|$))/.test(normalized)
+    || /\brg\b(?!.*\s-q(?:\s|$))/.test(normalized);
+}
+
+function extractVerifyCommandTokens(command) {
+  return String(command || '').match(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]+/g) || [];
+}
+
+function stripShellTokenQuotes(token) {
+  const normalized = String(token || '').trim();
+  if (
+    (normalized.startsWith('"') && normalized.endsWith('"'))
+    || (normalized.startsWith('\'') && normalized.endsWith('\''))
+  ) {
+    return normalized.slice(1, -1);
+  }
+  return normalized;
+}
+
+function isLikelyLocalVerifyTarget(token) {
+  const normalized = stripShellTokenQuotes(token);
+  if (!normalized || normalized.startsWith('-')) {
+    return false;
+  }
+  if (
+    normalized.startsWith('$')
+    || normalized.includes('${')
+    || normalized.includes('$(')
+    || normalized.includes('*')
+    || normalized.includes('?')
+    || normalized.includes('|')
+    || normalized.includes(';')
+    || normalized.includes('&&')
+    || normalized.includes('||')
+    || normalized.includes('=')
+    || normalized.startsWith('.smike/')
+  ) {
+    return false;
+  }
+  return normalized.includes('/') || /\.[a-z0-9]+$/i.test(normalized);
+}
+
+function extractVerifyCommandPathCandidates(command) {
+  const tokens = extractVerifyCommandTokens(command).map((token) => stripShellTokenQuotes(token));
+  const candidates = [];
+  let previousToken = null;
+  let commandName = null;
+
+  for (const token of tokens) {
+    if (!commandName && token && !token.startsWith('-')) {
+      commandName = path.posix.basename(token).toLowerCase();
+    }
+
+    const skipAsPatternArg =
+      ['rg', 'ripgrep', 'grep', 'egrep', 'fgrep'].includes(commandName || '')
+      && ['-e', '--regexp'].includes(previousToken || '');
+    const skipAsInlineScriptArg =
+      ['node', 'python', 'python3', 'ruby', 'perl', 'php', 'sh', 'bash', 'zsh'].includes(commandName || '')
+      && ['-e', '-c'].includes(previousToken || '');
+
+    if (skipAsPatternArg || skipAsInlineScriptArg) {
+      previousToken = token;
+      continue;
+    }
+
+    if (token.startsWith('/') && !fs.existsSync(token)) {
+      previousToken = token;
+      continue;
+    }
+
+    if (isLikelyLocalVerifyTarget(token)) {
+      candidates.push(token);
+    }
+    previousToken = token;
+  }
+
+  return uniqueStrings(
+    candidates,
+  );
+}
+
+function looksLikeGenericVerificationShellCommand(command) {
+  const normalized = String(command || '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (extractVerifyCommandPathCandidates(normalized).length > 0 || commandHasObservableSignal(normalized)) {
+    return false;
+  }
+
+  return /(?:^| )(npm|pnpm|yarn)\s+(run\s+)?(test|typecheck|lint)(?:\s|$)/.test(normalized)
+    || /(?:^| )npx\s+(vitest|jest|tsx|tsc)(?:\s|$)/.test(normalized)
+    || /(?:^| )(vitest|jest|pytest|go test|cargo (?:test|check)|tsc)(?:\s|$)/.test(normalized);
+}
+
+function buildExplicitVerifyLintFindings(phaseBlueprints) {
+  const findings = [];
+
+  for (const phase of ensureArray(phaseBlueprints)) {
+    const phaseId = phase?.id || '??';
+    const verifyCommands = normalizeStringArray(phase?.declared_verify_commands || []);
+
+    for (const command of verifyCommands) {
+      if (looksLikeTruncatedShellCommand(command)) {
+        findings.push({
+          id: `phase-${phaseId}-verify-command-truncated`,
+          severity: 'high',
+          title: `Plan ${phaseId} has a malformed verify command`,
+          details: `The declared verify command looks truncated or has unmatched shell quoting: ${command}`,
+        });
+        continue;
+      }
+
+      if (/^(?::|true|exit 0)\s*$/i.test(command)) {
+        findings.push({
+          id: `phase-${phaseId}-verify-command-noop`,
+          severity: 'high',
+          title: `Plan ${phaseId} has a no-op verify command`,
+          details: `The declared verify command does not prove any behavior: ${command}`,
+        });
+      }
+
+      if (looksLikeGenericVerificationShellCommand(command)) {
+        findings.push({
+          id: `phase-${phaseId}-verify-command-generic`,
+          severity: 'medium',
+          title: `Plan ${phaseId} uses a generic verify command`,
+          details: `Replace the broad verify command with a phase-specific target or proof surface: ${command}`,
+        });
+      }
+
+      const missingTargets = extractVerifyCommandPathCandidates(command)
+        .filter((candidate) => {
+          const absolute = path.isAbsolute(candidate)
+            ? candidate
+            : path.resolve(REPO_ROOT, candidate);
+          return !fs.existsSync(absolute);
+        });
+      if (missingTargets.length > 0) {
+        findings.push({
+          id: `phase-${phaseId}-verify-command-missing-target`,
+          severity: 'high',
+          title: `Plan ${phaseId} verify command references missing paths`,
+          details: `The declared verify command references path(s) that do not exist yet: ${missingTargets.join(', ')}`,
+        });
+      }
+
+      if (!commandHasObservableSignal(command)) {
+        findings.push({
+          id: `phase-${phaseId}-verify-command-exit-only`,
+          severity: 'low',
+          title: `Plan ${phaseId} verify command relies on exit status only`,
+          details: `Consider emitting a stable stdout token or content probe so planning evidence is stronger than exit=0: ${command}`,
+        });
+      }
+    }
   }
 
   return {
@@ -6142,7 +7356,7 @@ function extractPhaseBlueprints(sections) {
         declared_depends_on: [],
         declared_write_scope: [],
         declared_verify_commands: [],
-        dependency_mode: 'recommended',
+        dependency_mode: 'first_phase_contract',
       },
     ];
   }
@@ -6162,7 +7376,10 @@ function extractPhaseBlueprints(sections) {
   ];
 }
 
-function buildPlanningBundle(project, specRel, contextFiles) {
+function buildPlanningBundle(project, specRel, contextFiles, options = {}) {
+  if (options.autoprep === true) {
+    ensurePreparedPlanningSpec(specRel, contextFiles);
+  }
   const specPath = path.join(REPO_ROOT, specRel);
   const specText = fs.readFileSync(specPath, 'utf8');
   const sections = parseMarkdownSections(specText);
@@ -6187,8 +7404,13 @@ function buildPlanningBundle(project, specRel, contextFiles) {
     ...contextFiles,
   ]);
   const deliverables = normalizePathList(extractListItemsFromSectionPatterns(sections, DELIVERABLE_SECTION_PATTERNS));
-  const lint = buildPlanningLintFindings(sections);
   const extractedPhases = extractPhaseBlueprints(sections);
+  const baseLint = buildPlanningLintFindings(sections);
+  const verifyLint = buildExplicitVerifyLintFindings(extractedPhases);
+  const lint = {
+    result: (baseLint.result === 'concerns' || verifyLint.result === 'concerns') ? 'concerns' : 'pass',
+    findings: [...baseLint.findings, ...verifyLint.findings],
+  };
   const integrationRequirementsText = sectionText(findSection(sections, /^Integration Requirements$/i));
   const planningDecisions = extractLabeledListItems(integrationRequirementsText, /^The plan must decide:?$/i);
   const integrationRequirements = extractListItems(integrationRequirementsText)
@@ -6240,8 +7462,6 @@ function buildPlanningBundle(project, specRel, contextFiles) {
     first_phase_contract_heading: firstPhaseContractSection?.title || null,
     first_phase_contract_summary: summarizeSection(firstPhaseContractText, ''),
     first_phase_contract_items: firstPhaseContractItems,
-    recommended_first_phase_summary: summarizeSection(firstPhaseContractText, ''),
-    recommended_first_phase_items: firstPhaseContractItems,
     explicit_deferrals: explicitDeferrals,
     clarifying_questions: clarifyingQuestions,
     protected_areas: extractListItems(sectionText(findSection(sections, /^Protected \/ High-Collision Areas$/i))),
@@ -6257,938 +7477,73 @@ function buildPlanningBundle(project, specRel, contextFiles) {
 }
 
 function buildPlanningDraftNextAction(project, promotionCheck, bundle = null) {
-  const blockerText = promotionCheck.blockers.slice(0, 6).join('; ');
-  const questionText = ensureArray(bundle?.clarifying_questions).slice(0, 2).join(' / ');
-  const suffixBits = [];
-  if (questionText) {
-    suffixBits.push(`Answer onboarding questions: ${questionText}.`);
-  }
-  if (blockerText) {
-    suffixBits.push(`Missing before promotion: ${blockerText}.`);
-  }
-  const suffix = suffixBits.length > 0 ? ` ${suffixBits.join(' ')}` : '';
+  const correctionLoop = buildPlanningDraftCorrectionLoop(promotionCheck, bundle);
+  const suffix = correctionLoop.summary ? ` Correction loop: ${correctionLoop.summary}.` : '';
   return `Refine the spec-driven planning draft for ${project} (update the spec, not \`.smike/**\`), then rerun \`${buildCycleCommand(project)}\`.${suffix}`;
 }
 
-function getPlanningDraftNoticeLines(state) {
-  if (!isPlanningDraftLifecycleStatus(state?.lifecycle?.status) && state?.planning?.status !== 'draft') {
-    return [];
-  }
-  return [
-    'Planning draft notice: edits to `.smike/**` are rebuilt from the spec on the next cycle.',
-    'Fix surface: update the spec’s `Required Planning Output Shape`, `Priority N:` summaries, and inline `verify:` commands.',
-  ];
-}
+function syncPlanningAnalysisState(state, paths, planningAnalysis = null, planningFreshness = null) {
+  const resolvedPlanningAnalysis = planningAnalysis || loadPlanningAnalysis(paths);
+  const resolvedPlanningFreshness = syncPlanningVerificationState(
+    state,
+    paths,
+    planningFreshness || getPlanningArtifactFreshness(paths),
+  );
 
-function renderProjectMarkdown(project, specRel, contextFiles, bundle) {
-  const lines = [
-    `# ${project}`,
-    '',
-    bundle.objective,
-    '',
-    '## Snapshot',
-    `- Project: ${project}`,
-    `- Spec: ${specRel}`,
-    `- Mode: ${bundle.mode}`,
-    `- Resume: ./smike`,
-  ];
-
-  if (contextFiles.length > 0) {
-    lines.push(`- Context: ${contextFiles.join(', ')}`);
-  }
-
-  if (bundle.intake_prompt) {
-    lines.push('');
-    lines.push('## Intake');
-    lines.push(`- Prompt: ${bundle.intake_prompt}`);
-    if (bundle.clarifying_questions.length === 0) {
-      lines.push('- Clarifying questions: none captured');
-    } else {
-      bundle.clarifying_questions.forEach((question) => lines.push(`- ${question}`));
-    }
-  }
-
-  lines.push('');
-  lines.push('## Refs');
-  if (bundle.primary_refs.length === 0) {
-    lines.push('- none captured from spec');
-  } else {
-    bundle.primary_refs.forEach((ref) => lines.push(`- ${ref}`));
-  }
-
-  lines.push('');
-  lines.push('## Deliverables');
-  if (bundle.deliverables.length === 0) {
-    lines.push('- produce a bounded implementation graph from the spec');
-  } else {
-    bundle.deliverables.forEach((deliverable) => lines.push(`- ${deliverable}`));
-  }
-
-  return `${lines.join('\n')}\n`;
-}
-
-function renderStateMarkdown(project, specRel, state) {
-  const paths = getProjectPaths(project);
-  const rootPlan = fs.existsSync(paths.planJsonPath) ? readJson(paths.planJsonPath) : {};
-  const workflowPlans = ensureArray(state.workflow?.plans);
-  const groups = workflowPlans.length > 0 ? buildDependencyGroups(project, workflowPlans) : { parallel_groups: 0 };
-  const graphSummary = workflowPlans.length > 0
-    ? `Graph ready — ${workflowPlans.length} plans in ${groups.parallel_groups} group${groups.parallel_groups === 1 ? '' : 's'}`
-    : state.lifecycle.status;
-  const orchestration = ensureOrchestrationState(state);
-  const latestCapsules = Object.entries(orchestration.capsules.latest_by_role || {})
-    .filter(([, capsulePath]) => typeof capsulePath === 'string' && capsulePath.trim());
-  const propagatedDiscoveries = ensureDiscoveryLog(state);
-  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-  const actionable = runtimeContext.actionable;
-  const delegation = runtimeContext.delegation;
-  const currentDispatches = runtimeContext.dispatches;
-  const readyDispatches = runtimeContext.ready_dispatches;
-  const dispatchSummary = summarizeRuntimeDispatchContext(runtimeContext);
-  const planningAnalysis = loadPlanningAnalysis(paths);
-  const planningFreshness = getPlanningArtifactFreshness(paths);
-  const actionableDispatch = orchestration.current_actionable_dispatch;
-  const actionableDispatchSummary = actionableDispatch
-    ? `${actionableDispatch.dispatch_id} (${actionableDispatch.role} / ${actionableDispatch.status}${actionableDispatch.freshness ? ` / ${actionableDispatch.freshness}` : ''})`
-    : 'none';
-  const actionableCapsule = orchestration.current_actionable_capsule || 'none';
-  const planningBlockers = planningAnalysis.blocking_findings.slice(0, 3);
-  const planningPrompt = typeof state.planning?.intake_prompt === 'string' ? state.planning.intake_prompt.trim() : '';
-  const planningQuestions = ensureArray(state.planning?.clarifying_questions).slice(0, 5);
-  const recentDiscoveries = propagatedDiscoveries.slice(-5);
-  const operatorGuidance = getOperatorGuidanceLines(project, state);
-
-  return [
-    '# SMIKE State',
-    '',
-    '## Authority',
-    `Canonical state: .smike/${project}/STATE.json`,
-    'Canonical operator handoff: this file (`STATE.md`)',
-    `Supporting views: .smike/${project}/IMPLEMENTATION-HANDOFF.json, .smike/${project}/PLANNING-HANDOFF.md`,
-    '',
-    '## Resume',
-    `Project: ${project}`,
-    `Spec: ${specRel}`,
-    `Plan: ${graphSummary}`,
-    `Current: ${state.current_plan?.plan_id || 'none'}`,
-    `Status: ${state.lifecycle.status}`,
-    `Next: ${state.lifecycle.next_action}`,
-    `Next command: ${getLifecycleNextCommand(state) || 'none'}`,
-    ...(state.lifecycle.stop_reason ? [`Stop reason: ${state.lifecycle.stop_reason}`] : []),
-    `spec_hash: ${state.planning?.spec_hash || '(unknown)'}`,
-    ...getPlanningDraftNoticeLines(state),
-    '',
-    '## Operator',
-    'Read this file first in a fresh Codex session.',
-    ...operatorGuidance.map((line) => `- ${line}`),
-    '',
-    '## Planning Analysis',
-    `Checker: ${planningAnalysis.checker?.result || 'not-generated'}`,
-    `Auditor: ${planningAnalysis.auditor?.result || 'not-generated'}`,
-    `Artifacts fresh: ${planningFreshness.stale ? `no (${planningFreshness.reason})` : 'yes'}`,
-    ...(planningBlockers.length > 0
-      ? planningBlockers.map((finding) => `- ${finding.source}:${finding.id} ${finding.title}`)
-      : ['- none']),
-    ...(planningPrompt
-      ? [
-          '',
-          '## Planning Intake',
-          `Prompt: ${planningPrompt}`,
-          ...(planningQuestions.length > 0
-            ? planningQuestions.map((question) => `- ${question}`)
-            : ['- no clarifying questions captured']),
-        ]
-      : []),
-    '',
-    '## Actionable Surface',
-    `Stage: ${orchestration.stage}`,
-    `Mode: ${delegation.mode}`,
-    `Owner: ${delegation.owner}`,
-    `Actionable plan: ${actionable.plan_id || 'none'}`,
-    `Dispatch: ${actionableDispatchSummary}`,
-    `Capsule: ${actionableCapsule}`,
-    `Command: ${getLifecycleNextCommand(state) || 'none'}`,
-    `Handoff: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
-    `Planning handoff: .smike/${project}/PLANNING-HANDOFF.md`,
-    '',
-    '## Runtime Dispatches',
-    `Dispatch group: ${dispatchSummary.group}`,
-    `Completable group: ${currentCompletableRuntimeDispatchGroup(runtimeContext)}`,
-    `Actionable plan ids: ${dispatchSummary.plan_ids}`,
-    `Ready dispatches: ${readyDispatches.length}`,
-    `Tracked dispatches: ${currentDispatches.length}`,
-    ...(currentDispatches.length > 0
-      ? currentDispatches.map((entry) => {
-          const freshness = entry.freshness?.status || 'pending';
-          return `- ${entry.dispatch_id}: ${entry.role} [group ${entry.group}] ${entry.status} / ${freshness}`;
-        })
-      : ['- none']),
-    '',
-    '## Notes',
-    ...(latestCapsules.length > 0
-      ? [`Latest capsules: ${latestCapsules.map(([role]) => role).join(', ')}`]
-      : ['Latest capsules: none']),
-    ...(ensureArray(state.gotchas).length > 0
-      ? ensureArray(state.gotchas).slice(0, 5).map((gotcha) => `- Gotcha: ${gotcha}`)
-      : ['- Gotcha: none']),
-    ...(recentDiscoveries.length > 0
-      ? recentDiscoveries.map((entry) => {
-          const targets = ensureArray(entry.target_plan_ids).join(', ') || 'none';
-          const discoveries = ensureArray(entry.discoveries).join('; ');
-          return `- Discovery: ${entry.source_plan_id} -> ${targets}: ${discoveries}`;
-        })
-      : ['- Discovery: none']),
-    '',
-  ].join('\n');
-}
-
-function renderPlanningHandoffMarkdown(project, handoff) {
-  const lines = [
-    '# Planning Handoff',
-    '',
-    `Project: ${project}`,
-    `Status: ${handoff.lifecycle?.status || 'unknown'}`,
-    `Next: ${handoff.lifecycle?.next_action || 'unknown'}`,
-    `Next command: ${handoff.lifecycle?.next_command || 'none'}`,
-    '',
-    '## Actionable Surface',
-    `- Plan: ${handoff.actionable_surface?.plan_id || 'none'}`,
-    `- Dispatch group: ${handoff.actionable_surface?.dispatch_group ?? 'none'}`,
-    `- Current dispatch: ${handoff.actionable_surface?.current_dispatch?.dispatch_id || 'none'}`,
-    `- Capsule: ${handoff.actionable_surface?.current_capsule || 'none'}`,
-    `- Handoff: .smike/${project}/IMPLEMENTATION-HANDOFF.json`,
-    '',
-    '## Phase Graph',
-  ];
-
-  for (const phase of ensureArray(handoff.phase_graph)) {
-    lines.push(`- ${phase.plan_id}: depends on ${ensureArray(phase.depends_on).join(', ') || 'none'}`);
-    lines.push(`  Scope: ${ensureArray(phase.write_scope).join(', ') || 'none'}`);
-    lines.push(`  Acceptance: ${ensureArray(phase.acceptance_surface).join('; ') || 'none'}`);
-  }
-
-  lines.push('');
-  lines.push('## Deferred Items');
-  for (const item of ensureArray(handoff.deferred_items)) {
-    lines.push(`- ${item}`);
-  }
-  if (ensureArray(handoff.deferred_items).length === 0) {
-    lines.push('- none');
-  }
-
-  lines.push('');
-  lines.push('## Protected Areas');
-  for (const item of ensureArray(handoff.protected_areas)) {
-    lines.push(`- ${item}`);
-  }
-  if (ensureArray(handoff.protected_areas).length === 0) {
-    lines.push('- none');
-  }
-
-  return `${lines.join('\n')}\n`;
-}
-
-function renderRoadmapMarkdown(project, bundle) {
-  const lines = [
-    '# ROADMAP',
-    '',
-    `Project: ${project}`,
-    `Mode: ${bundle.mode}`,
-    `Objective: ${bundle.objective}`,
-    '',
-    '## Phase Graph',
-    '| Plan | Title | Depends On | Category | Write Scope |',
-    '|---|---|---|---|---|',
-    ...bundle.phase_blueprints.map((phase) => `| ${phase.id} | ${phase.title} | ${phase.depends_on.join(', ') || '—'} | ${phase.category} | ${phase.write_scope_allowed_files.slice(0, 4).join(', ')} |`),
-    '',
-    '## Protected Areas',
-  ];
-
-  if (bundle.protected_areas.length === 0) {
-    lines.push('- none captured from spec');
-  } else {
-    bundle.protected_areas.forEach((area) => lines.push(`- ${area}`));
-  }
-
-  lines.push('');
-  return `${lines.join('\n')}\n`;
-}
-
-function renderStrategyMarkdown(project, bundle) {
-  const lines = [
-    '# STRATEGY',
-    '',
-    `Project: ${project}`,
-    `Mode: ${bundle.mode}`,
-    `Objective: ${bundle.objective}`,
-    '',
-    '## Truth Sources',
-  ];
-
-  if (bundle.primary_refs.length === 0) {
-    lines.push('- none captured from spec');
-  } else {
-    bundle.primary_refs.forEach((ref) => lines.push(`- ${ref}`));
-  }
-
-  lines.push('');
-  lines.push('## Deliverables');
-  if (bundle.deliverables.length === 0) {
-    lines.push('- produce a bounded implementation plan');
-  } else {
-    bundle.deliverables.forEach((deliverable) => lines.push(`- ${deliverable}`));
-  }
-
-  lines.push('');
-  lines.push('## Critical Constraints');
-  if (bundle.constraints.length === 0) {
-    lines.push('- none captured from spec');
-  } else {
-    bundle.constraints.forEach((constraint) => lines.push(`- ${constraint}`));
-  }
-
-  if (bundle.integration_requirements.length > 0) {
-    lines.push('');
-    lines.push('## Integration Requirements');
-    bundle.integration_requirements.forEach((item) => lines.push(`- ${item}`));
-  }
-
-  if (bundle.planning_decisions.length > 0) {
-    lines.push('');
-    lines.push('## Planning Decisions');
-    bundle.planning_decisions.forEach((item) => lines.push(`- ${item}`));
-  }
-
-  if (bundle.risk_hotspots.length > 0) {
-    lines.push('');
-    lines.push('## Risk Hotspots');
-    bundle.risk_hotspots.forEach((item) => lines.push(`- ${item}`));
-  }
-
-  if (bundle.protected_areas.length > 0) {
-    lines.push('');
-    lines.push('## Protected Areas');
-    bundle.protected_areas.forEach((item) => lines.push(`- ${item}`));
-  }
-
-  lines.push('');
-  lines.push('## Drift Seeds');
-  if (bundle.drift_seeds.length === 0) {
-    lines.push('- none captured from spec');
-  } else {
-    bundle.drift_seeds.forEach((seed) => lines.push(`- ${seed}`));
-  }
-
-  lines.push('');
-  lines.push('## Phase Plan');
-  bundle.phase_blueprints.forEach((phase) => {
-    const phaseBits = [
-      `${phase.id}: ${phase.title}`,
-      phase.summary,
-      `depends ${phase.depends_on.join(', ') || 'none'}`,
-      `scope ${phase.write_scope_allowed_files.join(', ') || 'none'}`,
-    ];
-    if (ensureArray(phase.declared_verify_commands).length > 0) {
-      phaseBits.push(`verify ${phase.declared_verify_commands.join(' | ')}`);
-    }
-    lines.push(`- ${phaseBits.join(' | ')}`);
-  });
-  lines.push('');
-
-  if (bundle.first_phase_contract_items.length > 0) {
-    lines.push('## Required Plan 01 Contract');
-    if (bundle.first_phase_contract_summary) {
-      lines.push(`Summary: ${bundle.first_phase_contract_summary}`);
-    }
-    if (bundle.first_phase_contract_heading === 'Recommended First Executable Phase') {
-      lines.push('Legacy heading detected: `Recommended First Executable Phase`.');
-    }
-    bundle.first_phase_contract_items.forEach((item) => lines.push(`- ${item}`));
-    lines.push('');
-  }
-
-  if (bundle.explicit_deferrals.length > 0) {
-    lines.push('## Deferred Items');
-    bundle.explicit_deferrals.forEach((item) => lines.push(`- ${item}`));
-    lines.push('');
-  }
-
-  if (bundle.non_goals.length > 0) {
-    lines.push('## Non-Goals');
-    bundle.non_goals.forEach((item) => lines.push(`- ${item}`));
-    lines.push('');
-  }
-
-  return `${lines.join('\n')}\n`;
-}
-
-function renderPlanningPlanMarkdown(specRel, contextFiles, bundle) {
-  const lines = [
-    '# PLAN',
-    '',
-    `Spec: ${specRel}`,
-    `Mode: ${bundle.mode}`,
-    `Objective: ${bundle.objective}`,
-  ];
-
-  if (contextFiles.length > 0) {
-    lines.push(`Context: ${contextFiles.join(', ')}`);
-  }
-
-  lines.push('');
-  lines.push('## Planning Rules');
-  lines.push('- Produce concrete phase plans from the spec, not a placeholder bundle.');
-  if (bundle.mode === 'research') {
-    lines.push('- This is read-only research: write findings inside `.smike/<project>/` only and leave repo code untouched.');
-  } else {
-    lines.push('- Each implementation phase needs a bounded write scope and explicit verification.');
-  }
-  lines.push('- Planning writes stay inside `.smike/<project>/`.');
-  lines.push('');
-  lines.push('## Deliverables');
-  if (bundle.deliverables.length === 0) {
-    lines.push('- phase graph and execution plan');
-  } else {
-    bundle.deliverables.forEach((deliverable) => lines.push(`- ${deliverable}`));
-  }
-  lines.push('');
-  lines.push('## Delegation');
-  lines.push('- Strategist and detailer may run from runtime-owned capsules.');
-  lines.push('- The runner owns state and contract writing.');
-  if (bundle.planning_analysis.checker_enabled || bundle.planning_analysis.auditor_enabled) {
-    lines.push('- Checker and auditor stay local and re-read the current on-disk plans before planning can pass.');
-  } else {
-    lines.push(`- Checker/auditor are skipped for this bundle: ${bundle.planning_analysis.reason}`);
-  }
-  lines.push('');
-  lines.push('## Phase Guide');
-  lines.push('- Keep each phase to one reviewable surface.');
-  lines.push('- Prefer narrow scopes over speculative future work.');
-  lines.push('');
-  lines.push('## Phase Index');
-  bundle.phase_blueprints.forEach((phase) => lines.push(`- ${phase.id}: ${phase.title}`));
-  lines.push('');
-
-  return `${lines.join('\n')}\n`;
-}
-
-function writePlanningRoleCapsules(project, paths, bundle, rootPlan, state) {
-  const orchestration = ensureOrchestrationState(state);
-  const roleConfig = resolveOrchestrationConfig(project, rootPlan);
-  const rootPlanRel = `.smike/${project}/PLAN.json`;
-
-  orchestration.stage = 'planning';
-  orchestration.discovery_propagation = roleConfig.discovery_propagation;
-  orchestration.active_role = null;
-  orchestration.last_role = null;
-  orchestration.next_role = 'strategist';
-
-  if (roleConfig.roles.strategist.enabled) {
-    const strategistGuidance = buildPlanningRoleGuidance('strategist');
-    const strategistCapsule = buildRoleCapsule({
-      project,
-      planId: rootPlan.plan_id,
-      cycle: 0,
-      stage: 'planning',
-      role: 'strategist',
-      objective: bundle.objective,
-      roleConfig: roleConfig.roles.strategist,
-      primaryPaths: [rootPlan.spec, ...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      additionalPaths: [
-        `.smike/${project}/PROJECT.md`,
-        `.smike/${project}/ROADMAP.md`,
-        `.smike/${project}/STRATEGY.md`,
-        ...bundle.spec_paths.slice(0, CAPSULE_REF_LIMIT),
-      ],
-      readOrder: strategistGuidance.readOrder,
-      questions: strategistGuidance.questions,
-      boundaries: {
-        allowed_files: rootPlan.write_scope.allowed_files,
-        blocked_files: rootPlan.write_scope.blocked_files,
-        reason: rootPlan.write_scope.reason,
-      },
-      outputs: {
-        success_conditions: strategistGuidance.successConditions,
-      },
-      contextSnapshot: buildPlanningStrategistContextSnapshot(bundle),
-      resultArtifacts: buildPlanningRoleResultArtifacts(project, 'strategist', rootPlan.plan_id),
-      artifactChangeRequired: true,
-      evidence: {
-        deliverables: bundle.deliverables,
-        constraints: bundle.constraints,
-        integration_requirements: bundle.integration_requirements,
-        planning_decisions: bundle.planning_decisions,
-        risk_hotspots: bundle.risk_hotspots,
-        recommended_first_phase_items: bundle.recommended_first_phase_items,
-        protected_areas: bundle.protected_areas,
-        drift_seeds: bundle.drift_seeds,
-      },
-      nextAction: strategistGuidance.nextAction,
-    });
-    const capsulePaths = writeRoleCapsule(paths, strategistCapsule);
-    updateCapsuleRefs(orchestration, 'strategist', strategistCapsule.plan_id, capsulePaths);
-    recordRoleHistory(orchestration, {
-      cycle: 0,
-      stage: 'planning',
-      role: 'strategist',
-      plan_id: strategistCapsule.plan_id,
-      status: 'prepared',
-      capsule_json: capsulePaths.jsonRel,
-      generated_at: strategistCapsule.generated_at,
-      summary: 'Strategist context prepared from spec, refs, constraints, and protected areas.',
-    });
-    orchestration.last_role = 'strategist';
-  }
-
-  for (const phase of bundle.phase_blueprints) {
-    if (!roleConfig.roles.detailer.enabled) {
-      break;
-    }
-
-    const detailerGuidance = buildPlanningRoleGuidance('detailer', { planId: phase.id });
-    const detailerCapsule = buildRoleCapsule({
-      project,
-      planId: phase.id,
-      cycle: 0,
-      stage: 'planning',
-      role: 'detailer',
-      objective: phase.summary,
-      roleConfig: roleConfig.roles.detailer,
-      primaryPaths: [
-        rootPlanRel,
-        `.smike/${project}/ROADMAP.md`,
-        `.smike/${project}/STRATEGY.md`,
-        `.smike/${project}/phases/${phase.id}/${phase.id}-PLAN.json`,
-      ],
-      additionalPaths: [...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      readOrder: detailerGuidance.readOrder,
-      questions: detailerGuidance.questions,
-      boundaries: {
-        allowed_files: phase.allowed_files,
-        blocked_files: phase.blocked_files,
-        reason: `Bound ${phase.id} to a reviewable cleanup slice.`,
-      },
-      outputs: {
-        success_conditions: detailerGuidance.successConditions,
-      },
-      contextSnapshot: buildPlanningDetailerContextSnapshot(bundle, phase),
-      resultArtifacts: buildPlanningRoleResultArtifacts(project, 'detailer', phase.id),
-      artifactChangeRequired: true,
-      evidence: {
-        depends_on: phase.depends_on,
-        category: phase.category,
-        primary_refs: bundle.primary_refs,
-        write_scope: phase.write_scope_allowed_files,
-      },
-      nextAction: detailerGuidance.nextAction,
-    });
-    const capsulePaths = writeRoleCapsule(paths, detailerCapsule);
-    updateCapsuleRefs(orchestration, 'detailer', detailerCapsule.plan_id, capsulePaths);
-    recordRoleHistory(orchestration, {
-      cycle: 0,
-      stage: 'planning',
-      role: 'detailer',
-      plan_id: detailerCapsule.plan_id,
-      status: 'prepared',
-      capsule_json: capsulePaths.jsonRel,
-      generated_at: detailerCapsule.generated_at,
-      summary: `Detailer context prepared for Plan ${phase.id}.`,
-    });
-    orchestration.last_role = 'detailer';
-  }
-
-  if (roleConfig.roles.checker.enabled) {
-    const checkerGuidance = buildPlanningRoleGuidance('checker');
-    const checkerCapsule = buildRoleCapsule({
-      project,
-      planId: rootPlan.plan_id,
-      cycle: 0,
-      stage: 'planning',
-      role: 'checker',
-      objective: 'Verify cross-plan consistency before execution begins.',
-      roleConfig: roleConfig.roles.checker,
-      primaryPaths: [
-        rootPlanRel,
-        `.smike/${project}/ROADMAP.md`,
-        `.smike/${project}/STRATEGY.md`,
-        ...bundle.phase_blueprints.map((phase) => `.smike/${project}/phases/${phase.id}/${phase.id}-PLAN.json`),
-      ],
-      additionalPaths: [...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      readOrder: checkerGuidance.readOrder,
-      questions: checkerGuidance.questions,
-      boundaries: {
-        allowed_files: [`.smike/${project}/**`],
-        blocked_files: rootPlan.blocked_files,
-        reason: 'Checker reviews planning artifacts only.',
-      },
-      outputs: {
-        success_conditions: checkerGuidance.successConditions,
-      },
-      evidence: {
-        phase_graph: bundle.phase_blueprints.map((phase) => ({
-          id: phase.id,
-          depends_on: phase.depends_on,
-          allowed_files: phase.allowed_files,
-        })),
-      },
-      nextAction: checkerGuidance.nextAction,
-    });
-    const capsulePaths = writeRoleCapsule(paths, checkerCapsule);
-    updateCapsuleRefs(orchestration, 'checker', checkerCapsule.plan_id, capsulePaths);
-    recordRoleHistory(orchestration, {
-      cycle: 0,
-      stage: 'planning',
-      role: 'checker',
-      plan_id: checkerCapsule.plan_id,
-      status: 'prepared',
-      capsule_json: capsulePaths.jsonRel,
-      generated_at: checkerCapsule.generated_at,
-      summary: 'Checker context prepared for cross-plan dependency and overlap review.',
-    });
-    orchestration.last_role = 'checker';
-  }
-
-  if (roleConfig.roles.auditor.enabled) {
-    const auditorGuidance = buildPlanningRoleGuidance('auditor');
-    const auditorCapsule = buildRoleCapsule({
-      project,
-      planId: rootPlan.plan_id,
-      cycle: 0,
-      stage: 'planning',
-      role: 'auditor',
-      objective: 'Audit planning coverage against the spec and deliverables.',
-      roleConfig: roleConfig.roles.auditor,
-      primaryPaths: [
-        rootPlan.spec,
-        rootPlanRel,
-        `.smike/${project}/ROADMAP.md`,
-        ...bundle.phase_blueprints.map((phase) => `.smike/${project}/phases/${phase.id}/${phase.id}-PLAN.json`),
-      ],
-      additionalPaths: [...bundle.primary_refs.slice(0, CAPSULE_REF_LIMIT)],
-      readOrder: auditorGuidance.readOrder,
-      questions: auditorGuidance.questions,
-      boundaries: {
-        allowed_files: [`.smike/${project}/**`],
-        blocked_files: rootPlan.blocked_files,
-        reason: 'Auditor reviews planning artifacts and spec context only.',
-      },
-      outputs: {
-        success_conditions: auditorGuidance.successConditions,
-      },
-      evidence: {
-        deliverables: bundle.deliverables,
-        protected_areas: bundle.protected_areas,
-        phase_index: bundle.phase_blueprints.map((phase) => ({ id: phase.id, title: phase.title })),
-      },
-      nextAction: auditorGuidance.nextAction,
-    });
-    const capsulePaths = writeRoleCapsule(paths, auditorCapsule);
-    updateCapsuleRefs(orchestration, 'auditor', auditorCapsule.plan_id, capsulePaths);
-    recordRoleHistory(orchestration, {
-      cycle: 0,
-      stage: 'planning',
-      role: 'auditor',
-      plan_id: auditorCapsule.plan_id,
-      status: 'prepared',
-      capsule_json: capsulePaths.jsonRel,
-      generated_at: auditorCapsule.generated_at,
-      summary: 'Auditor context prepared for deliverable-to-plan coverage review.',
-    });
-    orchestration.last_role = 'auditor';
-  }
-}
-
-function resolvePlanningAnalysisForMode(bundle, planningMode = 'active') {
-  const planningAnalysis = bundle.planning_analysis || { checker_enabled: true, auditor_enabled: true };
-  if (planningMode === 'draft') {
-    return {
-      ...planningAnalysis,
-      checker_enabled: false,
-      auditor_enabled: false,
-      reason: 'Draft bootstrap skips checker/auditor until promotion.',
-    };
-  }
-  return planningAnalysis;
-}
-
-function buildPlanningRootPlan(project, specRel, contextFiles, bundle, planningMode = 'active') {
-  const plan = readTemplateJson('PLAN.json');
-  plan.$schema = ROOT_PLAN_SCHEMA_REF;
-  const phaseIds = bundle.phase_blueprints.map((phase) => phase.id);
-  const planningAnalysis = resolvePlanningAnalysisForMode(bundle, planningMode);
-  plan.plan_id = `${project}-plan`;
-  plan.phase = 'Planning';
-  plan.spec = specRel;
-  plan.objective = `Generate a real SMIKE planning bundle for ${specRel}.`;
-  plan.scope = `Planning only. Produce strategy, roadmap, and implementation phase contracts for ${project} without changing repo code.`;
-  plan.allowed_files = normalizePathList([
-    `.smike/${project}/**`,
-    specRel,
-    ...bundle.primary_refs,
-    ...contextFiles,
-  ]);
-  plan.blocked_files = ['.env*', '**/*.pem', '**/*.key'];
-  plan.write_scope.allowed_files = [`.smike/${project}/**`];
-  plan.write_scope.blocked_files = [...plan.blocked_files];
-  plan.write_scope.reason = 'Planning writes are limited to generated SMIKE artifacts.';
-  plan.preflight.require_clean_worktree = false;
-  plan.verify_commands = [{
-    id: 'planning-bundle',
-    run: buildPlanningBundleCheckCommand(project, phaseIds, planningAnalysis),
-    cwd: '../..',
-    timeout_ms: 30000,
-    expect: {
-      exit_code: 0,
-      stdout_includes: ['planning-bundle-ready'],
-    },
-  }];
-  if (planningAnalysis.checker_enabled) {
-    plan.verify_commands.push({
-      id: 'planning-checker',
-      run: buildPlanningReportCheckCommand(project, 'CHECKER'),
-      cwd: '../..',
-      timeout_ms: 30000,
-      expect: {
-        exit_code: 0,
-        stdout_includes: ['checker-ready'],
-      },
-    });
-  }
-  if (planningAnalysis.auditor_enabled) {
-    plan.verify_commands.push({
-      id: 'planning-auditor',
-      run: buildPlanningReportCheckCommand(project, 'AUDITOR'),
-      cwd: '../..',
-      timeout_ms: 30000,
-      expect: {
-        exit_code: 0,
-        stdout_includes: ['auditor-ready'],
-      },
-    });
-  }
-  plan.acceptance_criteria = buildAcceptanceCriteria(plan.verify_commands, 'Planning bundle verified');
-  plan.postflight = {
-    commands: [],
-  };
-  plan.workflow = {
-    auto_continue: true,
-    stop_on_failure: true,
-    max_phases_per_run: DEFAULT_MAX_PHASES_PER_RUN,
-    phase_plans: phaseIds.map((phaseId) => `phases/${phaseId}/${phaseId}-PLAN.json`),
-  };
-  plan.delegation = {
-    mode: 'runtime_subagents',
-    owner: 'runtime_orchestrator',
-    runtime_roles: ['strategist', 'detailer'],
-    dispatch_artifacts: [
-      `.smike/${project}/STATE.json`,
-    ],
-    result_artifacts: [
-      `.smike/${project}/STRATEGY.md`,
-      `.smike/${project}/ROADMAP.md`,
-      `.smike/${project}/PLAN-GRAPH.json`,
-      ...phaseIds.map((phaseId) => `.smike/${project}/phases/${phaseId}/${phaseId}-PLAN.json`),
-    ],
-  };
-  plan.orchestration = {
-    stage: 'planning',
-    discovery_propagation: true,
-    roles: {
-      strategist: { enabled: true },
-      detailer: { enabled: true },
-      checker: { enabled: false },
-      auditor: { enabled: false },
-      executor: { enabled: true },
-      judge: { enabled: true },
-      reviewer: { enabled: true },
-    },
-  };
-  return plan;
-}
-
-function buildPhasePlan(project, specRel, bundle, phase) {
-  const commands = buildPhaseVerifyCommands(project, phase, bundle.primary_refs, bundle.mode);
-  const isResearch = bundle.mode === 'research';
-  const researchResults = isResearch ? getResearchResultPaths(project, phase.id) : null;
-  const reviewerRequired = isResearch ? phase.research_reviewer_required !== false : true;
-  const phaseRefreshMode = isResearch
-    ? 'lightweight'
-    : (phase.depends_on.length > 0 ? 'auto_detailer_on_drift' : 'lightweight');
-  return {
-    $schema: PHASE_PLAN_SCHEMA_REF,
-    schema_version: '2.1.0',
-    profile: 'codex',
-    plan_id: phase.id,
-    phase: `Plan ${phase.id}`,
-    spec: specRel,
-    objective: isResearch
-      ? `Investigate ${phase.title.toLowerCase()} and record findings for the follow-on implementation loop.`
-      : phase.title,
-    scope: isResearch
-      ? `Read-only research only. ${phase.summary} Record evidence and findings in .smike/${project}/ without changing repo code.`
-      : phase.summary,
-    depends_on: phase.depends_on,
-    allowed_files: phase.allowed_files,
-    blocked_files: phase.blocked_files,
-    write_scope: {
-      mode: 'strict',
-      allowed_files: phase.write_scope_allowed_files,
-      blocked_files: phase.write_scope_blocked_files,
-      reason: phase.write_scope_reason,
-    },
-    preflight: {
-      require_clean_worktree: false,
-      required_tools: ['node', 'npm', 'git'],
-      required_env_vars: [],
-    },
-    verify_commands: commands,
-    acceptance_criteria: buildAcceptanceCriteria(commands, `${phase.id} verification`),
-    postflight: {
-      commands: [],
-    },
-    workflow: {
-      auto_continue: true,
-      stop_on_failure: true,
-      max_phases_per_run: 1,
-      phase_plans: [],
-    },
-    delegation: {
-      mode: isResearch ? 'runtime_subagents' : 'auto',
-      owner: isResearch ? 'runtime_orchestrator' : 'smike_runner',
-      runtime_roles: isResearch ? ['executor', 'judge', ...(reviewerRequired ? ['reviewer'] : [])] : ['executor'],
-      dispatch_artifacts: [
-        `.smike/${project}/STATE.json`,
-      ],
-      result_artifacts: isResearch && researchResults
-        ? [researchResults.jsonRel]
-        : [],
-    },
-    orchestration: {
-      stage: 'execution',
-      discovery_propagation: true,
-      roles: {
-        executor: { enabled: true },
-        judge: { enabled: true },
-        reviewer: { enabled: reviewerRequired },
-        fixer: { enabled: true },
-      },
-    },
-    feature_flags: {
-      phase_refresh_mode: phaseRefreshMode,
-    },
-  };
-}
-
-function buildPlanningState(project, specRel, contextFiles, plan, bundle, planningMode = 'active', inputSnapshot = null) {
-  const state = readTemplateJson('STATE.json');
-  state.$schema = ROOT_STATE_SCHEMA_REF;
-  const rootPlanHash = hashPlanContract(plan);
-  state.project = project;
-  state.created_at = nowIso();
-  state.updated_at = nowIso();
-  state.current_plan = {
-    plan_id: plan.plan_id,
-    plan_json: `.smike/${project}/PLAN.json`,
-    plan_md: `.smike/${project}/PLAN.md`,
-    depends_on: [],
-    contract_hash: rootPlanHash,
-  };
-  state.lifecycle = {
-    status: planningMode === 'draft' ? PLANNING_DRAFT_LIFECYCLE_STATUS : 'planning',
-    cycle_count: 0,
-    last_started_at: null,
-    last_completed_at: null,
-    last_result: null,
-    next_action: planningMode === 'draft'
-      ? `Planning draft created for ${project}. Refine it with \`${buildCycleCommand(project)}\`.`
-      : `Execute the planning phase for ${project}.`,
-    next_command: buildCycleCommand(project),
-  };
-  state.workflow = {
-    auto_continue: true,
-    stop_on_failure: true,
-    max_phases_per_run: DEFAULT_MAX_PHASES_PER_RUN,
-    plans: [],
-  };
-  state.history = [];
-  state.gotchas = trimStateGotchas(bundle.drift_seeds, STATE_GOTCHA_LIMIT, { keepLatest: false });
-  state.propagated_discoveries = [];
-  state.orchestration = {
-    stage: 'planning',
-    active_role: null,
-    last_role: null,
-    next_role: 'strategist',
-    discovery_propagation: true,
-    role_history: [],
-    capsules: {
-      latest_by_role: {},
-      by_plan: {},
-    },
-  };
+  const planningState = state?.planning && typeof state.planning === 'object' && !Array.isArray(state.planning)
+    ? state.planning
+    : {};
   state.planning = {
-    status: planningMode === 'draft' ? 'draft' : 'in_progress',
-    mode: bundle.mode,
-    spec_path: specRel,
-    spec_hash: bundle.spec_hash,
-    intake_prompt: bundle.intake_prompt || null,
-    clarifying_questions: bundle.clarifying_questions,
-    context_files: contextFiles,
-    input_snapshot: inputSnapshot,
-    primary_refs: bundle.primary_refs,
-    deliverables: bundle.deliverables,
-    initial_plan_hash: rootPlanHash,
-    last_plan_hash: rootPlanHash,
-    completed_at: null,
+    ...planningState,
+    analysis: {
+      checker_result: resolvedPlanningAnalysis.checker?.result || null,
+      auditor_result: resolvedPlanningAnalysis.auditor?.result || null,
+      blocking_findings: resolvedPlanningAnalysis.blocking_findings.map((finding) => ({
+        source: finding.source,
+        id: finding.id,
+        title: finding.title,
+        severity: finding.severity,
+      })),
+    },
   };
-  return state;
+
+  return {
+    planningAnalysis: resolvedPlanningAnalysis,
+    planningFreshness: resolvedPlanningFreshness,
+  };
 }
 
-function buildPlanningPhaseContracts(project, specRel, bundle) {
-  return bundle.phase_blueprints.map((phase) => {
-    const phasePlan = buildPhasePlan(project, specRel, bundle, phase);
-    return {
-      phase,
-      phasePlan,
-      analysisPlan: {
-        ...phasePlan,
-        dependency_mode: phase.dependency_mode || 'implicit',
-        declared_write_scope: normalizePathList(phase.declared_write_scope || []),
-        declared_verify_commands: normalizeStringArray(phase.declared_verify_commands || []),
-        write_scope_allowed_files: normalizePathList(phase.write_scope_allowed_files || []),
-      },
-    };
-  });
+function syncStateSurfaceState(project, paths, state, rootPlan) {
+  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
+  const advanceBehavior = syncLifecycleAdvanceBehavior(project, state, runtimeContext);
+  const { planningAnalysis, planningFreshness } = syncPlanningAnalysisState(state, paths);
+  const { dependencyBlockers, actionableTargets } = syncWorkflowDependencyBlockerState(project, state);
+  return {
+    runtimeContext,
+    advanceBehavior,
+    planningAnalysis,
+    planningFreshness,
+    dependencyBlockers,
+    actionableTargets,
+  };
 }
 
 function writePlanningAnalysisArtifacts(project, paths, bundle, phaseContracts, planningMode = 'active') {
   const planningAnalysis = resolvePlanningAnalysisForMode(bundle, planningMode);
   const analysisPlans = phaseContracts.map((contract) => contract.analysisPlan);
-  const removeIfExists = (filePath) => {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  };
 
   if (planningAnalysis.checker_enabled) {
     const checkerRecord = buildPlanningCheckerRecord(bundle, analysisPlans);
     writeJson(paths.planningCheckerJsonPath, checkerRecord);
-    removeIfExists(paths.planningCheckerMdPath);
   } else {
     removeIfExists(paths.planningCheckerJsonPath);
-    removeIfExists(paths.planningCheckerMdPath);
   }
 
   if (planningAnalysis.auditor_enabled) {
     const auditorRecord = buildPlanningAuditorRecord(bundle, analysisPlans);
     writeJson(paths.planningAuditorJsonPath, auditorRecord);
-    removeIfExists(paths.planningAuditorMdPath);
-    removeIfExists(paths.planningAuditJsonPath);
-    removeIfExists(paths.planningAuditMdPath);
   } else {
     removeIfExists(paths.planningAuditorJsonPath);
-    removeIfExists(paths.planningAuditorMdPath);
-    removeIfExists(paths.planningAuditJsonPath);
-    removeIfExists(paths.planningAuditMdPath);
   }
 }
 
@@ -7229,30 +7584,17 @@ function readPlanningAnalysisPlansFromDisk(project, paths, bundle) {
 function refreshPlanningAnalysisArtifactsFromCurrentPlans(project, paths, bundle) {
   const planningAnalysis = resolvePlanningAnalysisForMode(bundle, 'active');
   const analysisPlans = readPlanningAnalysisPlansFromDisk(project, paths, bundle);
-  const removeIfExists = (filePath) => {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  };
 
   if (planningAnalysis.checker_enabled) {
     writeJson(paths.planningCheckerJsonPath, buildPlanningCheckerRecord(bundle, analysisPlans));
-    removeIfExists(paths.planningCheckerMdPath);
   } else {
     removeIfExists(paths.planningCheckerJsonPath);
-    removeIfExists(paths.planningCheckerMdPath);
   }
 
   if (planningAnalysis.auditor_enabled) {
     writeJson(paths.planningAuditorJsonPath, buildPlanningAuditorRecord(bundle, analysisPlans));
-    removeIfExists(paths.planningAuditorMdPath);
-    removeIfExists(paths.planningAuditJsonPath);
-    removeIfExists(paths.planningAuditMdPath);
   } else {
     removeIfExists(paths.planningAuditorJsonPath);
-    removeIfExists(paths.planningAuditorMdPath);
-    removeIfExists(paths.planningAuditJsonPath);
-    removeIfExists(paths.planningAuditMdPath);
   }
 }
 
@@ -7261,7 +7603,7 @@ function writePlanningArtifacts(project, specRel, contextFiles, options = {}) {
   const paths = getProjectPaths(project);
   ensureDir(paths.projectDir);
 
-  const bundle = buildPlanningBundle(project, specRel, contextFiles);
+  const bundle = buildPlanningBundle(project, specRel, contextFiles, { autoprep: true });
   const plan = buildPlanningRootPlan(project, specRel, contextFiles, bundle, planningMode);
   const inputSnapshot = snapshotProjectInputs(project, paths, specRel, contextFiles);
   const state = buildPlanningState(project, specRel, contextFiles, plan, bundle, planningMode, inputSnapshot);
@@ -7281,8 +7623,6 @@ function writePlanningArtifacts(project, specRel, contextFiles, options = {}) {
     updated_at: state.updated_at,
   });
   fs.writeFileSync(paths.projectMdPath, renderProjectMarkdown(project, specRel, contextFiles, bundle), 'utf8');
-  fs.writeFileSync(paths.roadmapPath, renderRoadmapMarkdown(project, bundle), 'utf8');
-  fs.writeFileSync(paths.strategyPath, renderStrategyMarkdown(project, bundle), 'utf8');
   writeJson(paths.planJsonPath, plan);
   fs.writeFileSync(paths.planMdPath, renderPlanningPlanMarkdown(specRel, contextFiles, bundle), 'utf8');
 
@@ -7291,19 +7631,11 @@ function writePlanningArtifacts(project, specRel, contextFiles, options = {}) {
     ensureDir(phaseDir);
     const phasePlanJsonPath = path.join(phaseDir, `${phase.id}-PLAN.json`);
     writeJson(phasePlanJsonPath, phasePlan);
-    const legacyPhasePlanMdPath = path.join(phaseDir, `${phase.id}-PLAN.md`);
-    if (fs.existsSync(legacyPhasePlanMdPath)) {
-      fs.unlinkSync(legacyPhasePlanMdPath);
-    }
     if (bundle.mode === 'research') {
       const researchPaths = getResearchResultPaths(project, phase.id);
       const researchJsonPath = path.join(REPO_ROOT, researchPaths.jsonRel);
       if (!fs.existsSync(researchJsonPath)) {
         writeJson(researchJsonPath, buildResearchFindingsTemplate(project, phase));
-      }
-      const legacyResearchMdPath = path.join(REPO_ROOT, `.smike/${project}/phases/${phase.id}/${phase.id}-FINDINGS.md`);
-      if (fs.existsSync(legacyResearchMdPath)) {
-        fs.unlinkSync(legacyResearchMdPath);
       }
     }
   }
@@ -7314,17 +7646,11 @@ function writePlanningArtifacts(project, specRel, contextFiles, options = {}) {
   const contracts = buildWorkflowContracts(paths, plan, workflowSettings);
   syncWorkflowState(state, contracts, workflowSettings);
   writePlanningRoleCapsules(project, paths, bundle, plan, state);
-  syncActionableRuntimeDispatchState(project, paths, state, plan);
-  writeJson(paths.statePath, state);
-  fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, specRel, state), 'utf8');
-  generateDerivedArtifacts(project, paths, state, plan);
+  writeProjectStateArtifacts(project, paths, state, plan, specRel);
 }
 
 function shouldRefreshPlanningArtifacts(paths) {
   if (!fs.existsSync(paths.planJsonPath) || !fs.existsSync(paths.statePath)) {
-    return true;
-  }
-  if (!fs.existsSync(paths.roadmapPath) || !fs.existsSync(paths.strategyPath)) {
     return true;
   }
 
@@ -7445,7 +7771,7 @@ function syncPlanningState(project, state, plan) {
 
   let promotionCheck = { ready: false, blockers: ['spec-unreadable'] };
   try {
-    const bundle = buildPlanningBundle(project, specRel, contextFiles);
+    const bundle = buildPlanningBundle(project, specRel, contextFiles, { autoprep: true });
     const phaseContracts = buildPlanningPhaseContracts(project, specRel, bundle);
     promotionCheck = buildPlanningDraftPromotionCheck(bundle, phaseContracts);
   } catch {
@@ -7468,6 +7794,7 @@ function syncPlanningState(project, state, plan) {
   state.planning = {
     ...planning,
     status: 'complete',
+    draft_correction: null,
     last_plan_hash: currentHash,
     completed_at: state.updated_at,
   };
@@ -7476,22 +7803,12 @@ function syncPlanningState(project, state, plan) {
   orchestration.active_role = null;
   orchestration.next_role = 'executor';
 
-  syncActionableRuntimeDispatchState(project, paths, state, plan);
-  writeJson(paths.statePath, state);
-  fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, planning.spec_path || project, state), 'utf8');
-  generateDerivedArtifacts(project, paths, state, plan);
+  writeProjectStateArtifacts(project, paths, state, plan, planning.spec_path || project);
   return { transitioned: true, currentHash };
 }
 
 function getRuntimeDispatchSummaryLines(project, state) {
-  const paths = getProjectPaths(project);
-  if (!fs.existsSync(paths.planJsonPath)) {
-    return [];
-  }
-
-  const rootPlan = readJson(paths.planJsonPath);
-  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-  return buildRuntimeDispatchSummaryLines(runtimeContext);
+  return buildRuntimeDispatchSummaryLinesFromState(state);
 }
 
 function getQualitySummaryLines(state) {
@@ -7513,28 +7830,56 @@ function getQualitySummaryLines(state) {
 function getOperatorGuidanceLines(project, state) {
   const nextCommand = getLifecycleNextCommand(state) || 'none';
   const advanceCommand = buildAdvanceCommand(project);
-  const lines = [
-    `handoff: .smike/${project}/STATE.md`,
-    `inspect_command: ./smike status ${project}`,
-    `advance_command: ${advanceCommand}`,
-  ];
+  const lines = [`Do this now: ${nextCommand}`, `Inspect only: ./smike status ${project}`];
+  const dependencyBlockers = ensureArray(state?.workflow?.dependency_blockers);
+  const actionableTargets = ensureArray(state?.workflow?.actionable_dependency_targets);
+  const planningBlockers = ensureArray(state?.planning?.analysis?.blocking_findings);
+  const blockingPlanningSummary = planningBlockers
+    .slice(0, 3)
+    .map((finding) => `${finding.source}:${finding.id}`)
+    .join(', ');
 
   if (isPlanningDraftState(state)) {
-    lines.push('operator_requirement: planning_draft is spec-driven; update the spec, not .smike/**.');
+    lines.push('Requirement: planning_draft is spec-driven; update the spec, not .smike/**.');
+    if (dependencyBlockers.length > 0) {
+      lines.push(`Upstream order: ${buildDependencyNextAction({
+        project,
+        dependencyBlockers,
+        actionableTargets,
+        buildCycleCommand,
+      }).summary}`);
+    }
     return lines;
   }
 
+  if (planningBlockers.length > 0 && state?.planning?.status !== 'draft') {
+    lines.push(
+      `Planning blockers already exist: ${blockingPlanningSummary}. Treat this as plan-quality work, not just runtime waiting; inspect CHECKER.json/AUDITOR.json and rerun \`./smike recheck ${project}\` after artifact changes settle.`,
+    );
+  }
+
   if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
-    lines.push(`operator_requirement: run ${nextCommand} now, then mark each finished dispatch with ./smike dispatch ${project} completed <dispatch-id>.`);
+    lines.push(`Requirement: use \`./smike\` for the normal mutating step; \`${nextCommand}\` remains the exact authority for this state.`);
+    lines.push(`Requirement: after the runtime-owned work finishes, mark each dispatch with ./smike dispatch ${project} completed <dispatch-id>.`);
     return lines;
   }
 
   if (state.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
-    lines.push(`operator_requirement: stop in this session, start a fresh session, then run ${nextCommand}.`);
+    lines.push(`Requirement: stop in this session, start a fresh session, then run ${nextCommand}.`);
     return lines;
   }
 
-  lines.push(`operator_requirement: inspection is read-only; use ${advanceCommand} to execute the next legal step.`);
+  if (dependencyBlockers.length > 0) {
+    lines.push(`Requirement: ${buildDependencyNextAction({
+      project,
+      dependencyBlockers,
+      actionableTargets,
+      buildCycleCommand,
+    }).summary}`);
+    return lines;
+  }
+
+  lines.push('Requirement: inspection is read-only; use `./smike` for the normal mutating step.');
   return lines;
 }
 
@@ -7549,18 +7894,44 @@ function printProjectInspectionSummary(commandLabel, project, specRel, state, ex
   if (nextCommand) {
     console.log(`next_command: ${nextCommand}`);
   }
+  console.log(`advance_behavior: ${state.lifecycle?.advance_behavior || 'unknown'}`);
+  console.log(`advance_behavior_detail: ${state.lifecycle?.advance_behavior_detail || 'unknown'}`);
   for (const line of getOperatorGuidanceLines(project, state)) {
     console.log(line);
   }
   for (const line of getRuntimeDispatchSummaryLines(project, state)) {
     console.log(line);
   }
+  for (const line of getImplementationProfileSummaryLines(project, state)) {
+    console.log(line);
+  }
+  for (const line of getDependencyBlockerSummaryLines({ project, state, buildCycleCommand })) {
+    console.log(line);
+  }
   for (const line of getPlanningDraftNoticeLines(state)) {
+    console.log(line);
+  }
+  for (const line of getPlanningDraftCorrectionSummaryLines(state)) {
+    console.log(line);
+  }
+  for (const line of buildPlanningSnapshotSummaryLines(project)) {
     console.log(line);
   }
   for (const line of extraLines) {
     console.log(line);
   }
+}
+
+function buildInspectionProjectionWarning(project, inspection) {
+  const missing = ensureArray(inspection?.missingProjectionFields);
+  if (missing.length === 0) {
+    return [];
+  }
+
+  return [
+    `projection_warning: STATE.json is missing state-backed handoff fields (${missing.join(', ')}).`,
+    `projection_recovery: run \`./smike generate ${project}\` to refresh the projection without changing workflow state.`,
+  ];
 }
 
 function getStaleActiveProjectMissingPath(paths) {
@@ -7629,6 +8000,46 @@ function printStaleProject(project, paths, active = null, { noun = 'project' } =
   console.log(`next: run \`./smike doctor ${project}\`, \`./smike activate ${project}\`, or recreate the project from spec.`);
 }
 
+function getMissingStateProjectionFields(state) {
+  const missing = [];
+
+  if (!state?.lifecycle || typeof state.lifecycle !== 'object' || Array.isArray(state.lifecycle)) {
+    return ['lifecycle'];
+  }
+  if (typeof state.lifecycle.advance_behavior !== 'string' || !state.lifecycle.advance_behavior.trim()) {
+    missing.push('lifecycle.advance_behavior');
+  }
+  if (typeof state.lifecycle.advance_behavior_detail !== 'string' || !state.lifecycle.advance_behavior_detail.trim()) {
+    missing.push('lifecycle.advance_behavior_detail');
+  }
+
+  const planning = state?.planning;
+  if (!planning || typeof planning !== 'object' || Array.isArray(planning)) {
+    missing.push('planning');
+  } else {
+    if (!planning.analysis || typeof planning.analysis !== 'object' || Array.isArray(planning.analysis)) {
+      missing.push('planning.analysis');
+    }
+    if (!planning.verification || typeof planning.verification !== 'object' || Array.isArray(planning.verification)) {
+      missing.push('planning.verification');
+    }
+  }
+
+  const workflow = state?.workflow;
+  if (!workflow || typeof workflow !== 'object' || Array.isArray(workflow)) {
+    missing.push('workflow');
+  } else {
+    if (!Array.isArray(workflow.dependency_blockers)) {
+      missing.push('workflow.dependency_blockers');
+    }
+    if (!Array.isArray(workflow.actionable_dependency_targets)) {
+      missing.push('workflow.actionable_dependency_targets');
+    }
+  }
+
+  return missing;
+}
+
 function readProjectInspection(project, active = null) {
   const paths = getProjectPaths(project);
   const stalePath = getStaleActiveProjectMissingPath(paths);
@@ -7650,6 +8061,7 @@ function readProjectInspection(project, active = null) {
     || state?.planning?.spec_path
     || plan?.spec
     || null;
+  const missingProjectionFields = getMissingStateProjectionFields(state);
 
   return {
     project,
@@ -7657,6 +8069,7 @@ function readProjectInspection(project, active = null) {
     stale: false,
     state,
     specRel,
+    missingProjectionFields,
   };
 }
 
@@ -7705,6 +8118,7 @@ function runStatus(projectSelector = null) {
   printProjectInspectionSummary('status', project, inspection.specRel, inspection.state, [
     `plan: .smike/${project}/PLAN.md`,
     `contract: .smike/${project}/PLAN.json`,
+    ...buildInspectionProjectionWarning(project, inspection),
     ...getQualitySummaryLines(inspection.state),
   ]);
 }
@@ -7713,9 +8127,10 @@ function collectDoctorIssues(project, paths, state, active = null) {
   const issues = [];
   const specRel = active?.spec_path || state?.planning?.spec_path || null;
   const contextFiles = normalizePathList(active?.context_files || state?.planning?.context_files || []);
+  const rootPlan = fs.existsSync(paths.planJsonPath) ? readJson(paths.planJsonPath) : null;
   const inputStatus = collectProjectPlanningInputStatus(project, paths, specRel, contextFiles);
   const nextCommand = getLifecycleNextCommand(state);
-  const currentDispatchId = state?.orchestration?.current_actionable_dispatch?.dispatch_id || null;
+  const advanceCommand = buildAdvanceCommand(project);
 
   if (active?.project === project) {
     const activeSpec = typeof active.spec_path === 'string' ? active.spec_path.trim() : null;
@@ -7767,7 +8182,38 @@ function collectDoctorIssues(project, paths, state, active = null) {
     });
   }
 
+  if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
+    if ((state.lifecycle?.stop_reason || null) !== 'awaiting_runtime_dispatch') {
+      issues.push({
+        severity: 'error',
+        id: 'awaiting-runtime-dispatch-stop-reason-mismatch',
+        message:
+          `STATE.json is awaiting runtime dispatch but lifecycle.stop_reason is `
+          + `${state.lifecycle?.stop_reason || 'null'} instead of awaiting_runtime_dispatch.`,
+      });
+    }
+    if ((nextCommand || null) !== advanceCommand) {
+      issues.push({
+        severity: 'error',
+        id: 'awaiting-runtime-dispatch-next-command-mismatch',
+        message:
+          `STATE.json is awaiting runtime dispatch but lifecycle.next_command is `
+          + `${nextCommand || 'null'} instead of ${advanceCommand}.`,
+      });
+    }
+    if ((state.lifecycle?.advance_behavior || null) !== 'spawn_only') {
+      issues.push({
+        severity: 'error',
+        id: 'awaiting-runtime-dispatch-advance-behavior-mismatch',
+        message:
+          `STATE.json is awaiting runtime dispatch but lifecycle.advance_behavior is `
+          + `${state.lifecycle?.advance_behavior || 'null'} instead of spawn_only.`,
+      });
+    }
+  }
+
   const runtimeDispatchView = state?.orchestration?.runtime_dispatch_view;
+  const currentDispatches = getCurrentRuntimeDispatchEntriesFromState(state);
   if (!runtimeDispatchView || typeof runtimeDispatchView !== 'object' || Array.isArray(runtimeDispatchView)) {
     issues.push({
       severity: 'error',
@@ -7790,6 +8236,24 @@ function collectDoctorIssues(project, paths, state, active = null) {
         message: 'STATE.json is awaiting runtime dispatch but orchestration.runtime_dispatch_view.ready_dispatches is empty.',
       });
     }
+  }
+  for (const entry of currentDispatches.filter((dispatch) => isRuntimeDispatchLeaseExpired(dispatch))) {
+    issues.push({
+      severity: 'error',
+      id: 'expired-runtime-dispatch-lease',
+      message: `Runtime dispatch ${entry.dispatch_id} is still marked spawned even though its lease expired (${getRuntimeDispatchLeaseExpiry(entry) || 'unknown'}).`,
+    });
+  }
+  for (const entry of currentDispatches) {
+    const ownerHealth = inspectRuntimeDispatchOwnerHealth(entry);
+    if (!ownerHealth.orphaned) {
+      continue;
+    }
+    issues.push({
+      severity: 'error',
+      id: 'orphaned-runtime-dispatch-owner',
+      message: `Runtime dispatch ${entry.dispatch_id} is still marked spawned even though its owner disappeared: ${ownerHealth.reason}`,
+    });
   }
 
   const implementationHandoff = fs.existsSync(paths.implementationHandoffJsonPath) ? readJson(paths.implementationHandoffJsonPath) : null;
@@ -7848,36 +8312,25 @@ function collectDoctorIssues(project, paths, state, active = null) {
     }
   }
 
-  const planningHandoffMarkdown = fs.existsSync(paths.planningHandoffMdPath)
-    ? fs.readFileSync(paths.planningHandoffMdPath, 'utf8')
-    : null;
-  if (!planningHandoffMarkdown) {
-    issues.push({
-      severity: 'error',
-      id: 'missing-planning-handoff',
-      message: `Missing derived artifact: .smike/${project}/PLANNING-HANDOFF.md`,
-    });
-  } else if (!planningHandoffMarkdown.includes(`Next command: ${nextCommand || 'none'}`)) {
-    issues.push({
-      severity: 'error',
-      id: 'planning-handoff-next-command-mismatch',
-      message: 'PLANNING-HANDOFF.md next command does not match STATE.json.',
-    });
+  let bundle = null;
+  if (!rootPlanHasPlanningContext(rootPlan) && specRel && fs.existsSync(path.join(REPO_ROOT, specRel))) {
+    try {
+      bundle = buildPlanningBundle(project, specRel, contextFiles);
+    } catch {
+      bundle = null;
+    }
   }
-
-  if (
-    implementationHandoff?.actionable_surface?.current_dispatch?.dispatch_id
-    && currentDispatchId
-    && implementationHandoff.actionable_surface.current_dispatch.dispatch_id !== currentDispatchId
-  ) {
-    issues.push({
-      severity: 'error',
-      id: 'current-dispatch-mismatch',
-      message:
-        `IMPLEMENTATION-HANDOFF.json current dispatch ${implementationHandoff.actionable_surface.current_dispatch.dispatch_id} `
-        + `does not match STATE.json current actionable dispatch ${currentDispatchId}.`,
-    });
-  }
+  issues.push(
+    ...collectHandoffConsistencyIssues(project, paths, state, {
+      planningContext: resolveCanonicalPlanningContext({
+        rootPlan,
+        bundle,
+        paths,
+      }),
+      implementationHandoff,
+      stateMarkdown,
+    }),
+  );
 
   return {
     specRel,
@@ -7934,7 +8387,6 @@ function runDoctor(projectSelector = null) {
     'missing-runtime-delegation',
     'missing-implementation-handoff',
     'missing-state-markdown',
-    'missing-planning-handoff',
     'runtime-delegation-status-mismatch',
     'runtime-delegation-next-command-mismatch',
     'runtime-delegation-plan-mismatch',
@@ -7942,7 +8394,6 @@ function runDoctor(projectSelector = null) {
     'implementation-handoff-next-command-mismatch',
     'state-markdown-status-mismatch',
     'state-markdown-next-command-mismatch',
-    'planning-handoff-next-command-mismatch',
   ].includes(issue.id));
   if (needsDerivedRefresh) {
     console.log(`- remediation derived-artifacts: run \`./smike generate ${project}\` to refresh derived views from STATE.json.`);
@@ -7974,11 +8425,12 @@ function runActivate(project) {
 }
 
 async function runStart(specArgs) {
-  if (!Array.isArray(specArgs) || specArgs.length === 0) {
+  const normalizedSpecArgs = normalizeStartSpecArgs(specArgs);
+  if (!Array.isArray(normalizedSpecArgs) || normalizedSpecArgs.length === 0) {
     fail('spec path is required');
   }
 
-  const resolvedPaths = resolvePathList(specArgs);
+  const resolvedPaths = resolvePathList(normalizedSpecArgs);
   const spec = resolvedPaths[0];
   const contextFiles = normalizePathList(resolvedPaths.slice(1).map((entry) => entry.relative));
   const project = allocateProjectName(spec.relative);
@@ -7997,7 +8449,18 @@ async function runStart(specArgs) {
     activated_via: 'spec',
   });
 
-  console.log(`smike start: ${project}`);
+  if (hasExistingArtifacts && !needsPlanningRefresh) {
+    const existingState = readJson(paths.statePath);
+    console.log(`smike resume-existing: ${project}`);
+    console.log(`project_dir: .smike/${project}`);
+    console.log(`existing_created_at: ${existingState?.created_at || 'unknown'}`);
+    console.log(`existing_updated_at: ${existingState?.updated_at || 'unknown'}`);
+    console.log(`existing_lifecycle: ${existingState?.lifecycle?.status || 'unknown'}`);
+    console.log(`existing_planning: ${existingState?.planning?.status || 'unknown'}`);
+    console.log(`existing_next_command: ${getLifecycleNextCommand(existingState) || 'unknown'}`);
+  } else {
+    console.log(`smike start: ${project}`);
+  }
   console.log(`spec: ${spec.relative}`);
   if (contextFiles.length > 0) {
     console.log(`context: ${contextFiles.join(', ')}`);
@@ -8009,13 +8472,35 @@ async function runStart(specArgs) {
     await runCycle(project, { maxPhases: 1 });
     const updatedState = readJson(paths.statePath);
     printProjectInspectionSummary('resume', project, spec.relative, updatedState, [
-      `roadmap: .smike/${project}/ROADMAP.md`,
-      `strategy: .smike/${project}/STRATEGY.md`,
+      `plan_graph: .smike/${project}/PLAN-GRAPH.json`,
     ]);
     return;
   }
 
   await runEntrypoint();
+}
+
+async function runFresh(specArgs) {
+  const normalizedSpecArgs = normalizeStartSpecArgs(specArgs);
+  if (!Array.isArray(normalizedSpecArgs) || normalizedSpecArgs.length === 0) {
+    fail('spec path is required');
+  }
+
+  const resolvedPaths = resolvePathList(normalizedSpecArgs);
+  const spec = resolvedPaths[0];
+  const project = allocateProjectName(spec.relative);
+  const paths = getProjectPaths(project);
+
+  if (fs.existsSync(paths.projectDir)) {
+    clearActiveProject(project);
+    fs.rmSync(paths.projectDir, { recursive: true, force: true });
+    console.log(`smike fresh: removed existing runtime for ${project}`);
+    console.log(`removed: .smike/${project}`);
+  } else {
+    console.log(`smike fresh: no existing runtime for ${project}`);
+  }
+
+  await runStart(normalizedSpecArgs);
 }
 
 async function runIntake(rawArgs) {
@@ -8038,63 +8523,153 @@ async function runAdvanceExecution(project, active = null) {
     return;
   }
 
-  const plan = readJson(paths.planJsonPath);
-  const { state } = readValidatedState(paths, { persistRepair: true });
+  const releaseProjectLock = acquireProjectLock(project, 'advance');
+  try {
+    const plan = readJson(paths.planJsonPath);
+    const { state } = readValidatedState(paths, { persistRepair: true });
 
-  const specRel =
-    (active?.project === project ? active.spec_path : null)
-    || state?.planning?.spec_path
-    || plan?.spec
-    || null;
-  const planningSync = syncPlanningState(project, state, plan);
-  if (planningSync.transitioned) {
-    console.log(`smike: planning changes detected for ${project}; starting execution`);
-    await runCycle(project, {});
-    return;
-  }
+    const specRel =
+      (active?.project === project ? active.spec_path : null)
+      || state?.planning?.spec_path
+      || plan?.spec
+      || null;
+    const planningSync = syncPlanningState(project, state, plan);
+    if (planningSync.transitioned) {
+      console.log(`smike: planning changes detected for ${project}; starting execution`);
+      await runCycle(project, {}, { lockHeld: true });
+      return;
+    }
 
-  if (isPlanningLifecycleStatus(state.lifecycle?.status)) {
-    await runCycle(project, {});
-    return;
-  }
+    if (isPlanningLifecycleStatus(state.lifecycle?.status)) {
+      await runCycle(project, {}, { lockHeld: true });
+      return;
+    }
 
-  const clearedFreshSessionGate = clearFreshSessionImplementationGate(state);
-  if (clearedFreshSessionGate) {
-    persistProjectState(project, paths, state, plan, specRel);
-    console.log(`smike resume: cleared implementation gate for ${project}`);
-  }
+    const clearedFreshSessionGate = clearFreshSessionImplementationGate(state);
+    if (clearedFreshSessionGate) {
+      const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, plan);
+      const runtimeLifecycleUpdated = applyRuntimeDispatchPendingLifecycle(
+        project,
+        state,
+        buildRuntimeDispatchPendingState(runtimeContext),
+      );
+      if (!runtimeLifecycleUpdated) {
+        const readyWorkflowPlans = getReadyWorkflowPlans(project, state.workflow.plans);
+        const nextRunnablePending = readyWorkflowPlans[0] || null;
+        if (nextRunnablePending) {
+          state.current_plan = {
+            ...state.current_plan,
+            plan_id: nextRunnablePending.plan_id,
+            plan_json: nextRunnablePending.plan_json,
+            plan_md: nextRunnablePending.plan_md || null,
+            depends_on: ensureArray(nextRunnablePending.depends_on),
+          };
+          state.lifecycle.status = 'in_progress';
+          setLifecycleStopReason(state, null);
+          setLifecycleNextStep(state, describeReadyWorkflowPlans(readyWorkflowPlans), buildCycleCommand(project));
+          const orchestration = ensureOrchestrationState(state);
+          orchestration.stage = 'execution';
+          orchestration.active_role = null;
+          orchestration.next_role = 'executor';
+        }
+      }
+      persistProjectState(project, paths, state, plan, specRel);
+      console.log(`smike resume: cleared implementation gate for ${project}`);
+      return;
+    }
 
-  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, plan);
-  const lifecycleReconciled = applyRuntimeDispatchPendingLifecycle(
-    project,
-    state,
-    buildRuntimeDispatchPendingState(runtimeContext),
-  );
-  const planningRecheck = shouldAutoRecheckPlanning(
-    project,
-    paths,
-    state,
-    specRel,
-    normalizePathList((active?.project === project ? active.context_files : null) || state?.planning?.context_files || []),
-  );
-  if (planningRecheck.stale) {
-    await runRecheck(project);
-    return;
-  }
-  if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
-    const handoffRecorded = maybeRecordHandoffFailure(project, state);
-    if (lifecycleReconciled || handoffRecorded) {
+    let runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, plan);
+    let lifecycleReconciled = applyRuntimeDispatchPendingLifecycle(
+      project,
+      state,
+      buildRuntimeDispatchPendingState(runtimeContext),
+    );
+    const planningRecheck = shouldAutoRecheckPlanning(
+      project,
+      paths,
+      state,
+      specRel,
+      normalizePathList((active?.project === project ? active.context_files : null) || state?.planning?.context_files || []),
+    );
+    if (planningRecheck.stale) {
+      const previousLifecycleStatus = state.lifecycle?.status || null;
+      if (lifecycleReconciled) {
+        persistProjectState(project, paths, state, plan, specRel);
+      }
+      await runRecheck(project, { lockHeld: true });
+      const refreshedState = fs.existsSync(paths.statePath) ? readJson(paths.statePath) : null;
+      if (
+        previousLifecycleStatus !== AWAITING_FRESH_SESSION_LIFECYCLE_STATUS
+        && refreshedState?.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS
+      ) {
+        console.log(`smike advance: planning completed for ${project}; entering the fresh-session gate.`);
+        console.log(`fresh_session_requirement: stop in this session and resume with ${getLifecycleNextCommand(refreshedState) || buildAdvanceCommand(project)}.`);
+      }
+      return;
+    }
+    const autoCompletedDispatchIds = autoCompleteEligibleRuntimeDispatches(runtimeContext);
+    if (autoCompletedDispatchIds.length > 0) {
+      console.log(`smike advance: auto-completed runtime dispatches for ${project}: ${autoCompletedDispatchIds.join(', ')}`);
+      runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, plan);
+      lifecycleReconciled = applyRuntimeDispatchPendingLifecycle(
+        project,
+        state,
+        buildRuntimeDispatchPendingState(runtimeContext),
+        { readyLifecycle: 'in_progress' },
+      );
       persistProjectState(project, paths, state, plan, specRel);
     }
-    printProjectInspectionSummary('advance', project, specRel, state, [
-      `plan: .smike/${project}/PLAN.md`,
-      `contract: .smike/${project}/PLAN.json`,
-      ...getQualitySummaryLines(state),
-    ]);
-    return;
-  }
+    const recoveredDispatchIds = recoverOrphanedRuntimeDispatches(runtimeContext);
+    if (recoveredDispatchIds.length > 0) {
+      console.log(`smike advance: reclaiming orphaned runtime dispatches for ${project}: ${recoveredDispatchIds.join(', ')}`);
+      runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, plan);
+      lifecycleReconciled = applyRuntimeDispatchPendingLifecycle(
+        project,
+        state,
+        buildRuntimeDispatchPendingState(runtimeContext),
+        { readyLifecycle: 'in_progress' },
+      );
+      persistProjectState(project, paths, state, plan, specRel);
+    }
+    if (runtimeContext.active_dispatches.length > 0 || runtimeContext.failed_dispatches.length > 0) {
+      if (lifecycleReconciled) {
+        persistProjectState(project, paths, state, plan, specRel);
+      }
+      printProjectInspectionSummary('advance', project, specRel, state, [
+        `plan: .smike/${project}/PLAN.md`,
+        `contract: .smike/${project}/PLAN.json`,
+        ...getQualitySummaryLines(state),
+      ]);
+      return;
+    }
+    if (runtimeContext.ready_dispatches.length > 0) {
+      if (lifecycleReconciled) {
+        persistProjectState(project, paths, state, plan, specRel);
+      }
+      printProjectInspectionSummary('advance', project, specRel, state, [
+        `plan: .smike/${project}/PLAN.md`,
+        `contract: .smike/${project}/PLAN.json`,
+        ...getQualitySummaryLines(state),
+      ]);
+      return;
+    }
+    if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
+      const handoffRecorded = maybeRecordHandoffFailure(project, state);
+      if (lifecycleReconciled || handoffRecorded) {
+        persistProjectState(project, paths, state, plan, specRel);
+      }
+      printProjectInspectionSummary('advance', project, specRel, state, [
+        `plan: .smike/${project}/PLAN.md`,
+        `contract: .smike/${project}/PLAN.json`,
+        ...getQualitySummaryLines(state),
+      ]);
+      return;
+    }
 
-  await runCycle(project, {});
+    await runCycle(project, {}, { lockHeld: true });
+  } finally {
+    releaseProjectLock();
+  }
 }
 
 async function runResume(projectSelector = null) {
@@ -8119,6 +8694,7 @@ async function runResume(projectSelector = null) {
   printProjectInspectionSummary('resume', project, inspection.specRel, inspection.state, [
     `plan: .smike/${project}/PLAN.md`,
     `contract: .smike/${project}/PLAN.json`,
+    ...buildInspectionProjectionWarning(project, inspection),
     ...getQualitySummaryLines(inspection.state),
   ]);
 }
@@ -8202,8 +8778,8 @@ function shouldAutoRecheckPlanning(project, paths, state, planningSpecRel, plann
     return { stale: false, freshness: null };
   }
 
-  const bundle = buildPlanningBundle(project, planningSpecRel, planningContextFiles);
-  const freshness = getPlanningArtifactFreshness(paths, bundle);
+  const bundle = buildPlanningBundle(project, planningSpecRel, planningContextFiles, { autoprep: true });
+  const freshness = syncPlanningVerificationState(state, paths, getPlanningArtifactFreshness(paths, bundle));
   if (!freshness.stale) {
     return { stale: false, freshness };
   }
@@ -8221,6 +8797,7 @@ async function runPlanningRecheckInternal(
   planningContextFiles,
   options = {},
 ) {
+  const planningWasCompleteAtStart = state?.planning?.status === 'complete';
   const planningInputRecovery = ensurePlanningInputsReadable(
     project,
     paths,
@@ -8230,7 +8807,7 @@ async function runPlanningRecheckInternal(
   );
   printPlanningInputRecovery(project, planningInputRecovery);
 
-  const bundle = options.bundle || buildPlanningBundle(project, planningSpecRel, planningContextFiles);
+  const bundle = options.bundle || buildPlanningBundle(project, planningSpecRel, planningContextFiles, { autoprep: true });
   refreshPlanningAnalysisArtifactsFromCurrentPlans(project, paths, bundle);
 
   const contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
@@ -8243,130 +8820,14 @@ async function runPlanningRecheckInternal(
 
   const orchestration = ensureOrchestrationState(state);
   ensureDiscoveryLog(state);
-  const planOrchestration = resolveOrchestrationConfig(project, planningContract.plan);
   const cycleNumber = (state.lifecycle?.cycle_count || 0) + 1;
-  state.lifecycle = state.lifecycle || {};
-  state.lifecycle.cycle_count = cycleNumber;
-  state.lifecycle.last_started_at = nowIso();
-  state.lifecycle.status = 'running';
-  orchestration.stage = planOrchestration.stage;
-  orchestration.discovery_propagation = planOrchestration.discovery_propagation;
-  state.current_plan = {
-    plan_id: planningContract.plan.plan_id,
-    plan_json: planningContract.plan_json_rel,
-    plan_md: planningContract.plan_md_rel,
-    depends_on: ensureArray(planningContract.plan.depends_on),
-    contract_hash: hashPlanContract(planningContract.plan),
-  };
-
-  let executorCapsulePaths = null;
-  orchestration.active_role = 'executor';
-  orchestration.next_role = 'judge';
-  if (planOrchestration.roles.executor.enabled) {
-    const executorCapsule = buildExecutorCapsule(project, planningContract, state, cycleNumber);
-    executorCapsulePaths = persistRoleCapsule(
-      paths,
-      state,
-      executorCapsule,
-      'prepared',
-      `Executor context prepared for ${planningContract.plan.plan_id}.`,
-    );
-  }
-
-  const cycleRecord = await executeSinglePlan(planningContract, cycleNumber, paths.projectDir);
-  if (executorCapsulePaths) {
-    recordRoleHistory(orchestration, {
-      cycle: cycleNumber,
-      stage: planOrchestration.stage,
-      role: 'executor',
-      plan_id: planningContract.plan.plan_id,
-      status: cycleRecord.result,
-      capsule_json: executorCapsulePaths.jsonRel,
-      generated_at: nowIso(),
-      summary: `Executor finished ${planningContract.plan.plan_id} with ${cycleRecord.result}.`,
-    });
-    orchestration.last_role = 'executor';
-  }
-
-  let judgeCapsulePaths = null;
-  orchestration.active_role = 'judge';
-  orchestration.next_role = 'reviewer';
-  if (planOrchestration.roles.judge.enabled) {
-    const judgeCapsule = buildJudgeCapsule(project, paths, planningContract, state, cycleRecord);
-    judgeCapsulePaths = persistRoleCapsule(
-      paths,
-      state,
-      judgeCapsule,
-      'prepared',
-      `Judge context prepared for ${planningContract.plan.plan_id}.`,
-    );
-  }
-  const verdictRecord = await buildVerdictRecord(planningContract, cycleRecord, paths.projectDir);
-  if (judgeCapsulePaths) {
-    recordRoleHistory(orchestration, {
-      cycle: cycleNumber,
-      stage: planOrchestration.stage,
-      role: 'judge',
-      plan_id: planningContract.plan.plan_id,
-      status: verdictRecord.result,
-      capsule_json: judgeCapsulePaths.jsonRel,
-      generated_at: verdictRecord.generated_at,
-      summary: `Judge returned ${verdictRecord.result} for ${planningContract.plan.plan_id}.`,
-    });
-    orchestration.last_role = 'judge';
-  }
-  fs.writeFileSync(paths.verdictReportPath, buildVerdictReport(project, cycleRecord, verdictRecord), 'utf8');
-
-  let reviewerCapsulePaths = null;
-  orchestration.active_role = 'reviewer';
-  orchestration.next_role = null;
-  if (planOrchestration.roles.reviewer.enabled) {
-    const reviewerCapsule = buildReviewerCapsule(project, paths, planningContract, state, cycleRecord, verdictRecord);
-    reviewerCapsulePaths = persistRoleCapsule(
-      paths,
-      state,
-      reviewerCapsule,
-      'prepared',
-      `Reviewer context prepared for ${planningContract.plan.plan_id}.`,
-    );
-  }
-  const reviewRecord = buildReviewRecord(planningContract, cycleRecord, verdictRecord);
-  if (reviewerCapsulePaths) {
-    recordRoleHistory(orchestration, {
-      cycle: cycleNumber,
-      stage: planOrchestration.stage,
-      role: 'reviewer',
-      plan_id: planningContract.plan.plan_id,
-      status: reviewRecord.result,
-      capsule_json: reviewerCapsulePaths.jsonRel,
-      generated_at: reviewRecord.generated_at,
-      summary: `Reviewer returned ${reviewRecord.result} for ${planningContract.plan.plan_id}.`,
-    });
-    orchestration.last_role = 'reviewer';
-  }
-  const qualityFailures = uniqueStrings([
-    ...ensureArray(cycleRecord.failures),
-    ...ensureArray(verdictRecord.failures).map((value) => `judge.${value}`),
-    ...(reviewRecord.result === 'concerns' ? ['review.concerns'] : []),
-  ]);
-  cycleRecord.execution_result = cycleRecord.result;
-  cycleRecord.verdict = {
-    result: verdictRecord.result,
-    failures: verdictRecord.failures,
-    generated_at: verdictRecord.generated_at,
-  };
-  cycleRecord.review = {
-    result: reviewRecord.result,
-    findings: reviewRecord.findings.map((finding) => ({
-      id: finding.id,
-      severity: finding.severity,
-      title: finding.title,
-    })),
-    generated_at: reviewRecord.generated_at,
-  };
-  cycleRecord.failures = qualityFailures;
-  cycleRecord.result = qualityFailures.length === 0 ? 'pass' : 'fail';
-  fs.writeFileSync(paths.reviewReportPath, buildReviewReport(project, cycleRecord, reviewRecord, planningContract.plan), 'utf8');
+  const { cycleRecord } = await executePlanWithQualityPass(
+    project,
+    paths,
+    state,
+    planningContract,
+    cycleNumber,
+  );
 
   state.history.push(cycleRecord);
   const planningWorkflowPlan = state.workflow.plans.find((plan) => plan.plan_id === planningContract.plan.plan_id);
@@ -8379,7 +8840,7 @@ async function runPlanningRecheckInternal(
   state.lifecycle.last_completed_at = cycleRecord.completed_at;
   state.lifecycle.last_result = cycleRecord.result;
   const planningAnalysis = loadPlanningAnalysis(paths);
-  const planningReady = cycleRecord.result === 'pass' && planningAnalysisIsExecutionReady(planningAnalysis);
+  let planningReady = cycleRecord.result === 'pass' && planningAnalysisIsExecutionReady(planningAnalysis);
 
   if (state.planning && typeof state.planning === 'object') {
     state.planning = {
@@ -8399,6 +8860,7 @@ async function runPlanningRecheckInternal(
     if (
       nextRunnableContract
       && inferPlanStage(project, nextRunnableContract.plan) !== 'planning'
+      && shouldApplyFreshSessionImplementationGate(state, planningWasCompleteAtStart, workflowSettings)
     ) {
       applyFreshSessionImplementationGate(state);
     }
@@ -8459,15 +8921,50 @@ async function runPlanningRecheckInternal(
   if (state.history.length > 50) {
     state.history = state.history.slice(-50);
   }
-  syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
   const reportMarkdown = buildExecReport(project, rootPlan, [cycleRecord], state);
   fs.writeFileSync(paths.execReportPath, reportMarkdown, 'utf8');
-  writeJson(paths.statePath, state);
-  fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, rootPlan.spec || state?.planning?.spec_path || project, state), 'utf8');
-  generateDerivedArtifacts(project, paths, state, rootPlan);
+  writeProjectStateArtifacts(project, paths, state, rootPlan, rootPlan.spec || state?.planning?.spec_path || project);
+
+  const handoffConsistencyIssues = collectHandoffConsistencyIssues(project, paths, state, {
+    planningContext: resolveCanonicalPlanningContext({
+      rootPlan,
+      bundle,
+      paths,
+    }),
+  });
+  if (handoffConsistencyIssues.length > 0) {
+    planningReady = false;
+    cycleRecord.failures = uniqueStrings([...ensureArray(cycleRecord.failures), 'planning_projection_consistency']);
+    cycleRecord.result = 'fail';
+    state.lifecycle.status = 'planning_blocked';
+    setLifecycleStopReason(state, 'planning_projection_inconsistent');
+    setLifecycleNextStep(
+      state,
+      `Planning projection consistency failed. Fix the derived projection drift, then rerun \`${buildRecheckCommand(project)}\`.`,
+      buildRecheckCommand(project),
+    );
+    if (state.planning && typeof state.planning === 'object') {
+      state.planning = {
+        ...state.planning,
+        status: 'blocked',
+        completed_at: state.planning.completed_at || null,
+      };
+    }
+    const planningWorkflowPlanOnFailure = state.workflow.plans.find((plan) => plan.plan_id === planningContract.plan.plan_id);
+    if (planningWorkflowPlanOnFailure) {
+      planningWorkflowPlanOnFailure.last_result = 'fail';
+      planningWorkflowPlanOnFailure.status = 'failed';
+    }
+    state.lifecycle.last_result = 'fail';
+    state.updated_at = nowIso();
+    persistProjectState(project, paths, state, rootPlan, rootPlan.spec || state?.planning?.spec_path || project);
+  }
 
   const overallResult = planningReady ? 'PASS' : 'FAIL';
   console.log(`smike recheck ${project}: ${overallResult} (1 plan executed)`);
+  if (handoffConsistencyIssues.length > 0) {
+    console.log(`planning_consistency_failures: ${handoffConsistencyIssues.map((issue) => issue.id).join(', ')}`);
+  }
   if (!planningReady && options.exitOnFailure !== false) {
     if (cycleRecord.failures.length > 0) {
       console.log(`failing checks: ${cycleRecord.failures.join(', ')}`);
@@ -8476,13 +8973,13 @@ async function runPlanningRecheckInternal(
   }
 }
 
-async function runRecheck(projectSelector) {
+async function runRecheck(projectSelector, lockOptions = {}) {
   const project = resolveProjectSelector(projectSelector) || projectSelector;
   if (!project) {
     fail('project argument is required');
   }
 
-  const releaseProjectLock = acquireProjectLock(project, 'recheck');
+  const releaseProjectLock = lockOptions.lockHeld ? null : acquireProjectLock(project, 'recheck');
   try {
     const paths = getProjectPaths(project);
     if (!fs.existsSync(paths.planJsonPath)) {
@@ -8509,7 +9006,7 @@ async function runRecheck(projectSelector) {
       {},
     );
   } finally {
-    releaseProjectLock();
+    releaseProjectLock?.();
   }
 }
 
@@ -8520,7 +9017,7 @@ async function runAdvance(projectSelector = null) {
   const active = readActiveProject();
   const project = selectedProject || active?.project || null;
   if (!project) {
-    fail('no project selected. Use `./smike advance <project>` or activate a project first.');
+    fail('no project selected. Use `./smike <project>` or activate a project first.');
   }
 
   const paths = getProjectPaths(project);
@@ -8533,27 +9030,6 @@ async function runAdvance(projectSelector = null) {
   const nextCommand = getLifecycleNextCommand(state);
   if (!nextCommand) {
     fail(`no next_command recorded for ${project}`);
-  }
-
-  if (nextCommand === buildAdvanceCommand(project)) {
-    if (state.lifecycle?.status === 'awaiting_runtime_dispatch') {
-      const rootPlan = readJson(paths.planJsonPath);
-      const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-      const readyDispatches = runtimeContext.ready_dispatches
-        .filter((entry) => entry.group === currentRuntimeDispatchGroup(runtimeContext));
-      if (readyDispatches.length === 0) {
-        fail(`no ready runtime dispatches found for ${project}`);
-      }
-      for (const entry of readyDispatches) {
-        runDispatch(project, 'spawned', entry.dispatch_id, {});
-      }
-      return;
-    }
-
-    if (state.lifecycle?.status === AWAITING_FRESH_SESSION_LIFECYCLE_STATUS) {
-      await runAdvanceExecution(project, active);
-      return;
-    }
   }
 
   const parsed = parseCanonicalSmikeCommand(nextCommand);
@@ -8643,24 +9119,84 @@ function loadOrInitState(project, paths, rootPlan) {
 
 function resolveWorkflowSettings(rootPlan, cycleOptions = {}) {
   const workflow = rootPlan.workflow && typeof rootPlan.workflow === 'object' ? rootPlan.workflow : {};
+  const planningContext = rootPlan.planning_context && typeof rootPlan.planning_context === 'object'
+    ? rootPlan.planning_context
+    : {};
   const pauseReason = typeof workflow.pause_reason === 'string' ? workflow.pause_reason.trim() : '';
   const autoContinueFromPlan = workflow.auto_continue === false && pauseReason
     ? false
     : true;
   const autoContinue = cycleOptions.noAutoContinue ? false : autoContinueFromPlan;
   const stopOnFailure = workflow.stop_on_failure !== false;
+  const freshSessionGate = KNOWN_FRESH_SESSION_GATES.has(workflow.fresh_session_gate)
+    ? workflow.fresh_session_gate
+    : DEFAULT_FRESH_SESSION_GATE;
   const maxFromPlan = Number.isInteger(workflow.max_phases_per_run)
     ? workflow.max_phases_per_run
     : DEFAULT_MAX_PHASES_PER_RUN;
   const maxPhases = Number.isInteger(cycleOptions.maxPhases) ? cycleOptions.maxPhases : maxFromPlan;
   const phasePlans = ensureArray(workflow.phase_plans).map((item) => String(item).trim()).filter(Boolean);
+  const productionGate = normalizeStringArray(planningContext.production_gate || []);
+  const optionalPhasePlanIds = normalizeStringArray(
+    Array.isArray(planningContext.optional_phase)
+      ? planningContext.optional_phase
+      : [planningContext.optional_phase],
+  );
   return {
     auto_continue: autoContinue,
+    fresh_session_gate: freshSessionGate,
     pause_reason: pauseReason || null,
     stop_on_failure: stopOnFailure,
     max_phases_per_run: Math.max(1, maxPhases),
     phase_plans: phasePlans,
+    production_gate: productionGate,
+    optional_phase_plan_ids: optionalPhasePlanIds,
   };
+}
+
+function isWorkflowPlanRequired(plan) {
+  return plan?.required_for_completion !== false;
+}
+
+function isWorkflowPlanAutoRunnable(plan) {
+  return plan?.auto_run !== false;
+}
+
+function findPlanHistoryEntry(state, planId, cycle = null) {
+  const history = ensureArray(state?.history);
+  if (cycle !== null && cycle !== undefined) {
+    return history.find((entry) => entry?.plan_id === planId && entry?.cycle === cycle) || null;
+  }
+  return [...history].reverse().find((entry) => entry?.plan_id === planId) || null;
+}
+
+function recordedMaterialEvidencePasses(plan, cycleRecord) {
+  if (!cycleRecord || typeof cycleRecord !== 'object') {
+    return false;
+  }
+  const evidence = cycleRecord.material_evidence;
+  if (evidence && typeof evidence === 'object') {
+    return evidence.pass !== false;
+  }
+  return evaluateMaterialExecutionEvidence(plan, cycleRecord.scope).pass;
+}
+
+function shouldReopenSuspiciousCompletion(project, state, contract, existing) {
+  if (existing?.status !== 'complete') {
+    return false;
+  }
+  if (!isWorkflowPlanAutoRunnable(existing)) {
+    return false;
+  }
+  if (inferPlanStage(project, contract?.plan || {}) !== 'execution') {
+    return false;
+  }
+  const cycleRecord = findPlanHistoryEntry(state, contract.plan.plan_id, existing?.last_cycle);
+  return !recordedMaterialEvidencePasses(contract.plan, cycleRecord);
+}
+
+function getPendingRequiredWorkflowPlan(workflowPlans) {
+  return ensureArray(workflowPlans).find((plan) => isWorkflowPlanRequired(plan) && plan.status !== 'complete') || null;
 }
 
 function resolvePlanContract(projectDir, jsonPath, fallbackMdPath = null) {
@@ -8886,12 +9422,23 @@ function buildWorkflowContracts(paths, rootPlan, workflowSettings) {
 }
 
 function syncWorkflowState(state, contracts, workflowSettings) {
+  const project = state?.project || '';
+  const requiredPhasePlanIds = new Set(normalizeStringArray(workflowSettings.production_gate || []));
+  const optionalPhasePlanIds = new Set(normalizeStringArray(workflowSettings.optional_phase_plan_ids || []));
+  const hasExplicitProductionGate = requiredPhasePlanIds.size > 0;
   const existingByPath = new Map(
     ensureArray(state.workflow?.plans).map((item) => [item.plan_json, item]),
   );
 
   const plans = contracts.map((contract) => {
     const existing = existingByPath.get(contract.plan_json_rel);
+    const isRootPlanningPlan = contract.plan.plan_id === `${project}-plan`;
+    const requiredForCompletion = isRootPlanningPlan
+      ? true
+      : hasExplicitProductionGate
+        ? requiredPhasePlanIds.has(contract.plan.plan_id)
+        : !optionalPhasePlanIds.has(contract.plan.plan_id);
+    const autoRun = requiredForCompletion;
     const matchesLegacyHash =
       typeof existing?.contract_hash === 'string' &&
       existing.contract_hash === hashPlanContractLegacy(contract.plan);
@@ -8899,6 +9446,11 @@ function syncWorkflowState(state, contracts, workflowSettings) {
       typeof existing?.contract_hash === 'string' &&
       existing.contract_hash !== contract.contract_hash &&
       !matchesLegacyHash;
+    const suspiciousCompletion = !contractChanged && shouldReopenSuspiciousCompletion(project, state, contract, {
+      ...existing,
+      auto_run: autoRun,
+      required_for_completion: requiredForCompletion,
+    });
     return {
       plan_id: contract.plan.plan_id,
       plan_json: contract.plan_json_rel,
@@ -8906,17 +9458,25 @@ function syncWorkflowState(state, contracts, workflowSettings) {
       depends_on: normalizeStringArray(contract.plan.depends_on),
       contract_hash: contract.contract_hash,
       contract_changed: contractChanged,
-      status: existing?.status === 'complete' && !contractChanged ? 'complete' : 'pending',
-      last_result: contractChanged ? null : existing?.last_result || null,
-      last_cycle: contractChanged ? null : existing?.last_cycle || null,
+      required_for_completion: requiredForCompletion,
+      auto_run: autoRun,
+      status: existing?.status === 'complete' && !contractChanged && !suspiciousCompletion ? 'complete' : 'pending',
+      reopened_reason: suspiciousCompletion
+        ? 'missing_material_change_evidence'
+        : null,
+      last_result: contractChanged || suspiciousCompletion ? null : existing?.last_result || null,
+      last_cycle: contractChanged || suspiciousCompletion ? null : existing?.last_cycle || null,
     };
   });
 
   state.workflow = {
     auto_continue: workflowSettings.auto_continue,
+    fresh_session_gate: workflowSettings.fresh_session_gate,
     pause_reason: workflowSettings.pause_reason,
     stop_on_failure: workflowSettings.stop_on_failure,
     max_phases_per_run: workflowSettings.max_phases_per_run,
+    production_gate: normalizeStringArray(workflowSettings.production_gate || []),
+    optional_phase_plan_ids: normalizeStringArray(workflowSettings.optional_phase_plan_ids || []),
     plans,
   };
 }
@@ -9033,7 +9593,7 @@ function getDependencyBlockers(project, workflowPlans, projectContextCache = new
   const blockers = [];
 
   for (const plan of workflowPlans) {
-    if (plan.status !== 'pending') {
+    if (plan.status !== 'pending' || !isWorkflowPlanAutoRunnable(plan)) {
       continue;
     }
 
@@ -9060,7 +9620,9 @@ function getReadyWorkflowPlans(project, workflowPlans) {
   const dependencyBlockers = getDependencyBlockers(project, workflowPlans);
   const blockedPlanIds = new Set(dependencyBlockers.map((blocker) => blocker.plan_id));
   return ensureArray(workflowPlans).filter(
-    (workflowPlan) => workflowPlan.status === 'pending' && !blockedPlanIds.has(workflowPlan.plan_id),
+    (workflowPlan) => workflowPlan.status === 'pending'
+      && isWorkflowPlanAutoRunnable(workflowPlan)
+      && !blockedPlanIds.has(workflowPlan.plan_id),
   );
 }
 
@@ -9099,13 +9661,29 @@ function describeReadyWorkflowPlans(readyPlans) {
   return `Continue with ready plans: ${planIds.join(', ')}. Only the lowest-numbered ready dependency group advances in a cycle.`;
 }
 
-function describeDependencyBlockers(dependencyBlockers) {
-  return dependencyBlockers.map((blocker) => {
-    const unmet = blocker.unmet_dependencies
-      .map((dependency) => `${dependency.plan_id} (${dependency.status})`)
-      .join(', ');
-    return `${blocker.plan_id} <= ${unmet}`;
-  }).join('; ');
+function syncWorkflowDependencyBlockerState(project, state) {
+  const workflowPlans = ensureArray(state?.workflow?.plans);
+  const dependencyBlockers = getDependencyBlockers(project, workflowPlans);
+  const actionableTargets = getActionableDependencyTargets(dependencyBlockers);
+  const dependencyNextAction = dependencyBlockers.length > 0
+    ? buildDependencyNextAction({
+      project,
+      dependencyBlockers,
+      actionableTargets,
+      buildCycleCommand,
+    }).summary
+    : null;
+
+  if (state?.workflow && typeof state.workflow === 'object' && !Array.isArray(state.workflow)) {
+    state.workflow = {
+      ...state.workflow,
+      dependency_blockers: dependencyBlockers,
+      actionable_dependency_targets: actionableTargets,
+      dependency_next_action: dependencyNextAction,
+    };
+  }
+
+  return { dependencyBlockers, actionableTargets };
 }
 
 function resolveActionablePlanContext(project, paths, state, rootPlan) {
@@ -9159,17 +9737,22 @@ function resolveActionablePlanContext(project, paths, state, rootPlan) {
   };
 }
 
-async function executeSinglePlan(contract, cycleNumber, projectDir) {
+async function executeSinglePlan(contract, cycleNumber, projectDir, options = {}) {
   const baselineDirty = getDirtyPaths();
   const baselineDirtyArray = [...baselineDirty].sort();
   const startedAt = nowIso();
+  const runtimeExecutorEvidence = options.runtimeExecutorEvidence || null;
+  const runtimeExecutorCompleted = runtimeExecutorEvidence?.completed_fresh === true;
 
   const preflight = runPreflight(contract.plan, baselineDirtyArray);
-  const verifyResults = preflight.passed ? await runVerifyCommands(contract.plan, projectDir) : [];
+  const canEvaluatePlan = preflight.passed || runtimeExecutorCompleted;
+  const verifyResults = canEvaluatePlan ? await runVerifyCommands(contract.plan, projectDir) : [];
   const verifyMap = new Map(verifyResults.map((result) => [result.id, result]));
-  const acceptance = preflight.passed ? evaluateAcceptance(contract.plan, verifyMap) : [];
-  const scope = preflight.passed
-    ? enforceWriteScope(contract.plan, baselineDirty, contract.plan.preflight.require_clean_worktree)
+  const acceptance = canEvaluatePlan ? evaluateAcceptance(contract.plan, verifyMap) : [];
+  const scope = canEvaluatePlan
+    ? enforceWriteScope(contract.plan, baselineDirty, contract.plan.preflight.require_clean_worktree, {
+        supplementalChangedPaths: runtimeExecutorEvidence?.changed_paths || [],
+      })
     : {
         mode: contract.plan.preflight.require_clean_worktree ? 'workspace' : 'delta',
         changed_paths: [],
@@ -9184,8 +9767,21 @@ async function executeSinglePlan(contract, cycleNumber, projectDir) {
         pass: false,
         violations: [{ file: '(n/a)', reason: 'scope check skipped due to preflight failure' }],
       };
-  const postflight = preflight.passed ? await runPostflight(contract.plan, projectDir) : [];
-  const failures = summarizeFailures(preflight, verifyResults, acceptance, scope, postflight);
+  const materialEvidence = evaluateMaterialExecutionEvidence(contract.plan, scope);
+  if (runtimeExecutorCompleted && runtimeExecutorEvidence.changed_paths.length > 0) {
+    materialEvidence.runtime_dispatch = {
+      dispatch_id: runtimeExecutorEvidence.dispatch_id,
+      changed_paths: runtimeExecutorEvidence.changed_paths,
+      result_artifacts: runtimeExecutorEvidence.result_artifacts,
+    };
+  }
+  const postflight = canEvaluatePlan ? await runPostflight(contract.plan, projectDir) : [];
+  const failures = summarizeFailures(preflight, verifyResults, acceptance, scope, postflight, {
+    ignorePreflightFailures: runtimeExecutorCompleted,
+  });
+  if (!materialEvidence.pass) {
+    failures.push('execution.no_material_change');
+  }
   const result = failures.length === 0 ? 'pass' : 'fail';
   const completedAt = nowIso();
 
@@ -9220,6 +9816,8 @@ async function executeSinglePlan(contract, cycleNumber, projectDir) {
       blocked_globs: scope.blocked_globs,
       violations: scope.violations,
     },
+    material_evidence: materialEvidence,
+    runtime_executor_evidence: runtimeExecutorEvidence,
     postflight: postflight.map((item) => ({
       id: item.id,
       run: item.run,
@@ -9341,6 +9939,198 @@ function buildExecReport(project, rootPlan, executedPlans, state) {
   return `${lines.join('\n')}\n`;
 }
 
+function startExecutionCycle(project, contract, state, cycleNumber) {
+  const orchestration = ensureOrchestrationState(state);
+  const planOrchestration = resolveOrchestrationConfig(project, contract.plan);
+  state.lifecycle = state.lifecycle || {};
+  state.lifecycle.cycle_count = cycleNumber;
+  state.lifecycle.last_started_at = nowIso();
+  state.lifecycle.status = 'running';
+  orchestration.stage = planOrchestration.stage;
+  orchestration.discovery_propagation = planOrchestration.discovery_propagation;
+  state.current_plan = {
+    plan_id: contract.plan.plan_id,
+    plan_json: contract.plan_json_rel,
+    plan_md: contract.plan_md_rel,
+    depends_on: ensureArray(contract.plan.depends_on),
+    contract_hash: hashPlanContract(contract.plan),
+  };
+  return { orchestration, planOrchestration };
+}
+
+function finalizeExecutionQuality(cycleRecord, verdictRecord, reviewRecord) {
+  const qualityFailures = uniqueStrings([
+    ...ensureArray(cycleRecord.failures),
+    ...ensureArray(verdictRecord.failures).map((value) => `judge.${value}`),
+    ...(reviewRecord.result === 'concerns' ? ['review.concerns'] : []),
+  ]);
+  cycleRecord.execution_result = cycleRecord.result;
+  cycleRecord.verdict = {
+    result: verdictRecord.result,
+    failures: verdictRecord.failures,
+    generated_at: verdictRecord.generated_at,
+  };
+  cycleRecord.review = {
+    result: reviewRecord.result,
+    findings: reviewRecord.findings.map((finding) => ({
+      id: finding.id,
+      severity: finding.severity,
+      title: finding.title,
+    })),
+    generated_at: reviewRecord.generated_at,
+  };
+  cycleRecord.failures = qualityFailures;
+  cycleRecord.result = qualityFailures.length === 0 ? 'pass' : 'fail';
+}
+
+async function executePlanWithQualityPass(project, paths, state, contract, cycleNumber, options = {}) {
+  const {
+    recordFixRoute = false,
+    propagateDiscoveries = false,
+    clearRoleAfterReview = false,
+  } = options;
+  const { orchestration, planOrchestration } = startExecutionCycle(project, contract, state, cycleNumber);
+
+  let executorCapsulePaths = null;
+  orchestration.active_role = 'executor';
+  orchestration.next_role = 'judge';
+  if (planOrchestration.roles.executor.enabled) {
+    const executorCapsule = buildExecutorCapsule(project, contract, state, cycleNumber);
+    executorCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      executorCapsule,
+      'prepared',
+      `Executor context prepared for ${contract.plan.plan_id}.`,
+    );
+  }
+
+  const runtimeExecutorEvidence = collectRuntimeExecutorEvidence(state, contract.plan.plan_id);
+  const cycleRecord = await executeSinglePlan(contract, cycleNumber, paths.projectDir, {
+    runtimeExecutorEvidence,
+  });
+  if (executorCapsulePaths) {
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'executor',
+      plan_id: contract.plan.plan_id,
+      status: cycleRecord.result,
+      capsule_json: executorCapsulePaths.jsonRel,
+      generated_at: nowIso(),
+      summary: `Executor finished ${contract.plan.plan_id} with ${cycleRecord.result}.`,
+    });
+    orchestration.last_role = 'executor';
+  }
+
+  let judgeCapsulePaths = null;
+  orchestration.active_role = 'judge';
+  orchestration.next_role = 'reviewer';
+  if (planOrchestration.roles.judge.enabled) {
+    const judgeCapsule = buildJudgeCapsule(project, paths, contract, state, cycleRecord);
+    judgeCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      judgeCapsule,
+      'prepared',
+      `Judge context prepared for ${contract.plan.plan_id}.`,
+    );
+  }
+  const verdictRecord = await buildVerdictRecord(contract, cycleRecord, paths.projectDir);
+  if (judgeCapsulePaths) {
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'judge',
+      plan_id: contract.plan.plan_id,
+      status: verdictRecord.result,
+      capsule_json: judgeCapsulePaths.jsonRel,
+      generated_at: verdictRecord.generated_at,
+      summary: `Judge returned ${verdictRecord.result} for ${contract.plan.plan_id}.`,
+    });
+    orchestration.last_role = 'judge';
+  }
+  fs.writeFileSync(paths.verdictReportPath, buildVerdictReport(project, cycleRecord, verdictRecord), 'utf8');
+
+  let reviewerCapsulePaths = null;
+  orchestration.active_role = 'reviewer';
+  orchestration.next_role = null;
+  if (planOrchestration.roles.reviewer.enabled) {
+    const reviewerCapsule = buildReviewerCapsule(project, paths, contract, state, cycleRecord, verdictRecord);
+    reviewerCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      reviewerCapsule,
+      'prepared',
+      `Reviewer context prepared for ${contract.plan.plan_id}.`,
+    );
+  }
+  const reviewRecord = buildReviewRecord(contract, cycleRecord, verdictRecord);
+  if (reviewerCapsulePaths) {
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'reviewer',
+      plan_id: contract.plan.plan_id,
+      status: reviewRecord.result,
+      capsule_json: reviewerCapsulePaths.jsonRel,
+      generated_at: reviewRecord.generated_at,
+      summary: `Reviewer returned ${reviewRecord.result} for ${contract.plan.plan_id}.`,
+    });
+    orchestration.last_role = 'reviewer';
+  }
+
+  finalizeExecutionQuality(cycleRecord, verdictRecord, reviewRecord);
+  fs.writeFileSync(paths.reviewReportPath, buildReviewReport(project, cycleRecord, reviewRecord, contract.plan), 'utf8');
+
+  if (recordFixRoute && cycleRecord.result === 'fail' && planOrchestration.stage !== 'planning' && planOrchestration.roles.fixer.enabled) {
+    orchestration.active_role = 'fixer';
+    orchestration.next_role = 'fixer';
+    const fixerCapsule = buildFixerCapsule(project, paths, contract, state, cycleRecord, verdictRecord, reviewRecord);
+    const fixerCapsulePaths = persistRoleCapsule(
+      paths,
+      state,
+      fixerCapsule,
+      'routed',
+      `Fix route prepared for ${contract.plan.plan_id}.`,
+    );
+    recordRoleHistory(orchestration, {
+      cycle: cycleNumber,
+      stage: planOrchestration.stage,
+      role: 'fixer',
+      plan_id: contract.plan.plan_id,
+      status: 'routed',
+      capsule_json: fixerCapsulePaths.jsonRel,
+      generated_at: nowIso(),
+      summary: `Fix route prepared for ${contract.plan.plan_id}.`,
+    });
+    orchestration.last_role = 'fixer';
+  } else if (clearRoleAfterReview) {
+    orchestration.active_role = null;
+    orchestration.next_role = null;
+  }
+
+  if (propagateDiscoveries && planOrchestration.discovery_propagation) {
+    appendPropagatedDiscoveries(
+      state,
+      contract.plan.plan_id,
+      findDownstreamPlanIds(state.workflow.plans, contract.plan.plan_id),
+      uniqueStrings([
+        ...ensureArray(verdictRecord.failures).map((value) => `judge: ${value}`),
+        ...ensureArray(reviewRecord.findings).map((finding) => `${finding.severity} review: ${finding.title}`),
+        ...ensureArray(cycleRecord.scope?.violations).map((violation) => `scope: ${violation.file} (${violation.reason})`),
+      ]),
+    );
+  }
+
+  return {
+    cycleRecord,
+    verdictRecord,
+    reviewRecord,
+    planOrchestration,
+  };
+}
+
 function dispatchGroupForRole(project, currentPlanId, role) {
   if (currentPlanId === `${project}-plan`) {
     if (role === 'strategist') {
@@ -9436,6 +10226,11 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
     ? normalizeDelegationConfig(currentPlan)
     : resolveExecutionDelegation(project, state, rootExecutionContract);
   const dispatches = [];
+  const buildExecutorDispatchInstruction = (planId, planDelegation) => (
+    planDelegation.result_artifacts.length > 0
+      ? `Read the capsule first, then produce the required result artifacts for ${planId} without widening scope.`
+      : `Read the capsule first, then implement ${planId} inside the declared write scope before reconciliation.`
+  );
 
   const pushDispatch = (planId, role, capsuleJsonRel, currentDelegation = delegation, groupOverride = null, instructionOverride = null) => {
     if (typeof capsuleJsonRel !== 'string' || !capsuleJsonRel.trim()) {
@@ -9462,6 +10257,25 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
     dispatches.push(dispatch);
   };
 
+  const pushExecutorDispatch = (contract, planDelegation, groupOverride) => {
+    const executorCapsule = buildExecutorCapsule(
+      project,
+      contract,
+      state,
+      (state.lifecycle?.cycle_count || 0) + 1,
+      planDelegation,
+    );
+    const executorCapsuleRel = writeDispatchCapsule(paths, state, executorCapsule).jsonRel;
+    pushDispatch(
+      contract.plan.plan_id,
+      'executor',
+      executorCapsuleRel,
+      planDelegation,
+      groupOverride,
+      buildExecutorDispatchInstruction(contract.plan.plan_id, planDelegation),
+    );
+  };
+
   const maybePushDetailerRefreshDispatch = (contract, groupOverride = null) => {
     if (!shouldAutoDetailerRefresh(state, contract)) {
       return false;
@@ -9485,7 +10299,6 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
         mode: 'runtime_subagents',
         owner: 'runtime_orchestrator',
         runtime_roles: ['detailer'],
-        dispatch_artifacts: [`.smike/${project}/STATE.json`],
         result_artifacts: buildPlanningRoleResultArtifacts(project, 'detailer', contract.plan.plan_id),
       },
       groupOverride || 1,
@@ -9540,27 +10353,7 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
       ) {
         continue;
       }
-
-      const executorCapsule = buildExecutorCapsule(
-        project,
-        contract,
-        state,
-        (state.lifecycle?.cycle_count || 0) + 1,
-        planDelegation,
-      );
-      const executorCapsuleRel = writeDispatchCapsule(paths, state, executorCapsule).jsonRel;
-
-      const instruction = planDelegation.result_artifacts.length > 0
-        ? `Read the capsule first, then produce the required result artifacts for ${contract.plan.plan_id} without widening scope.`
-        : `Read the capsule first, then implement ${contract.plan.plan_id} inside the declared write scope before reconciliation.`;
-      pushDispatch(
-        contract.plan.plan_id,
-        'executor',
-        executorCapsuleRel,
-        planDelegation,
-        actionableContext.group || 1,
-        instruction,
-      );
+      pushExecutorDispatch(contract, planDelegation, actionableContext.group || 1);
     }
     return dispatches.sort((a, b) => a.group - b.group || a.plan_id.localeCompare(b.plan_id));
   }
@@ -9581,26 +10374,8 @@ function buildRuntimeDispatches(project, paths, state, actionableContext) {
         && planDelegation.owner === 'runtime_orchestrator'
         && planDelegation.runtime_roles.includes('executor')
       ) {
-        const executorCapsule = buildExecutorCapsule(
-          project,
-          contract,
-          state,
-          (state.lifecycle?.cycle_count || 0) + 1,
-          planDelegation,
-        );
-        const executorCapsuleRel = writeDispatchCapsule(paths, state, executorCapsule).jsonRel;
-        const instruction = planDelegation.result_artifacts.length > 0
-          ? `Read the capsule first, then produce the required result artifacts for ${contract.plan.plan_id} without widening scope.`
-          : `Read the capsule first, then implement ${contract.plan.plan_id} inside the declared write scope before reconciliation.`;
         if (!isRuntimeDispatchCompletedFresh(state, contract.plan.plan_id, 'executor')) {
-          pushDispatch(
-            contract.plan.plan_id,
-            'executor',
-            executorCapsuleRel,
-            planDelegation,
-            baseGroup,
-            instruction,
-          );
+          pushExecutorDispatch(contract, planDelegation, baseGroup);
           return dispatches.sort((a, b) => a.group - b.group || a.role.localeCompare(b.role));
         }
 
@@ -9701,6 +10476,8 @@ function createRuntimeDispatchEntry(dispatch, createdAt = nowIso()) {
     failed_at: null,
     stale_at: null,
     failure_reason: null,
+    active_owner: null,
+    last_owner: null,
     spawn_baseline: [],
     completion_artifacts: [],
     freshness: createDispatchFreshness('pending', 'Dispatch is queued for the runtime orchestrator.', null),
@@ -9753,6 +10530,7 @@ function syncRuntimeDispatchState(state, dispatches) {
     existing.last_seen_at = syncAt;
 
     if (signatureChanged) {
+      moveActiveRuntimeDispatchOwnerToHistory(existing);
       existing.spawn_baseline = [];
       existing.completion_artifacts = [];
       existing.freshness = createDispatchFreshness(
@@ -9768,12 +10546,20 @@ function syncRuntimeDispatchState(state, dispatches) {
       const freshness = buildDispatchFreshnessFromCompletion(existing);
       existing.freshness = freshness;
       if (freshness.status !== 'fresh') {
+        moveActiveRuntimeDispatchOwnerToHistory(existing);
         updateRuntimeDispatchStatus(existing, 'stale', freshness.reason, syncAt);
       }
       continue;
     }
 
     if (existing.status === 'spawned') {
+      if (isRuntimeDispatchLeaseExpired(existing, syncAt)) {
+        const expiredReason = buildRuntimeDispatchLeaseExpiredReason(existing, syncAt);
+        moveActiveRuntimeDispatchOwnerToHistory(existing);
+        existing.freshness = createDispatchFreshness('stale', expiredReason, syncAt);
+        updateRuntimeDispatchStatus(existing, 'stale', expiredReason, syncAt);
+        continue;
+      }
       existing.freshness = createDispatchFreshness('pending', 'Runtime dispatch is still in flight.', syncAt);
       continue;
     }
@@ -9849,12 +10635,77 @@ function hasCompletedFreshDispatches(entries) {
   return entries.length > 0 && entries.every((entry) => entry.status === 'completed' && entry.freshness?.status === 'fresh');
 }
 
+function clearTerminalRuntimeDispatchSurface(state) {
+  const orchestration = ensureOrchestrationState(state);
+  const runtimeDispatches = ensureRuntimeDispatchState(orchestration);
+  for (const entry of Object.values(runtimeDispatches.by_id)) {
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      entry.current = false;
+    }
+  }
+  orchestration.current_actionable_dispatch = null;
+  orchestration.current_actionable_capsule = null;
+  orchestration.runtime_dispatch_view = {
+    actionable_plan: {
+      plan_id: null,
+      plan_ids: [],
+      group: null,
+      completable_group: 'none',
+      plan_json: null,
+      stage: 'complete',
+    },
+    ready_dispatches: [],
+    dispatch_counts: {
+      tracked: 0,
+      ready: 0,
+      active: 0,
+      failed: 0,
+      completed: 0,
+    },
+    delegation: {
+      mode: 'local_only',
+      owner: 'smike_runner',
+      result_artifacts: [],
+    },
+  };
+
+  return {
+    actionable: {
+      workflow_plan: null,
+      workflow_plans: [],
+      plan: null,
+      plan_path: null,
+      plan_id: null,
+      plan_ids: [],
+      group: null,
+      next_runnable_pending: null,
+    },
+    delegation: {
+      mode: 'local_only',
+      owner: 'smike_runner',
+      runtime_roles: [],
+      result_artifacts: [],
+    },
+    dispatches: [],
+    ready_dispatches: [],
+    active_dispatches: [],
+    failed_dispatches: [],
+    completed_dispatches: [],
+    all_dispatches_completed_fresh: true,
+  };
+}
+
 function buildRuntimeDispatchContract(entry) {
   return {
     dispatch_id: entry.dispatch_id,
     plan_id: entry.plan_id,
     role: entry.role,
     group: entry.group,
+    status: entry.status,
+    freshness: entry.freshness?.status || null,
+    active_owner: normalizeRuntimeDispatchOwner(entry.active_owner),
+    last_owner: normalizeRuntimeDispatchOwner(entry.last_owner),
+    lease_expires_at: getRuntimeDispatchLeaseExpiry(entry),
     agent_type_hint: entry.agent_type_hint,
     reasoning_effort_hint: entry.reasoning_effort_hint,
     capsule_json: entry.capsule_json,
@@ -9869,14 +10720,8 @@ function buildRuntimeDispatchContract(entry) {
 }
 
 function currentRuntimeDispatchGroup(runtimeContext) {
-  return (
-    runtimeContext.ready_dispatches[0]?.group
-    || runtimeContext.active_dispatches[0]?.group
-    || runtimeContext.failed_dispatches[0]?.group
-    || runtimeContext.dispatches[0]?.group
-    || runtimeContext.actionable.group
-    || null
-  );
+  const currentEntry = resolveCurrentActionableRuntimeDispatchEntry(runtimeContext);
+  return currentEntry?.group || runtimeContext.actionable.group || null;
 }
 
 function currentCompletableRuntimeDispatchGroup(runtimeContext) {
@@ -9893,6 +10738,9 @@ function currentCompletableRuntimeDispatchGroup(runtimeContext) {
 function syncActionableRuntimeDispatchState(project, paths, state, rootPlan) {
   const actionable = resolveActionablePlanContext(project, paths, state, rootPlan);
   const orchestration = ensureOrchestrationState(state);
+  if (state?.lifecycle?.status === 'complete') {
+    return clearTerminalRuntimeDispatchSurface(state);
+  }
   const declaredDelegation = normalizeDelegationConfig(actionable.plan);
   const dispatches = buildRuntimeDispatches(project, paths, state, actionable);
   syncRuntimeDispatchState(state, dispatches);
@@ -9907,15 +10755,16 @@ function syncActionableRuntimeDispatchState(project, paths, state, rootPlan) {
       mode: 'runtime_subagents',
       owner: 'runtime_orchestrator',
       runtime_roles: uniqueStrings(currentEntries.map((entry) => entry.role)),
-      dispatch_artifacts: declaredDelegation.dispatch_artifacts,
       result_artifacts: uniqueStrings(currentEntries.flatMap((entry) => ensureArray(entry.result_artifacts))),
     }
     : declaredDelegation;
-  const currentActionableEntry = readyEntries[0]
-    || activeEntries[0]
-    || failedEntries[0]
-    || currentEntries[0]
-    || null;
+  const currentActionableEntry = resolveCurrentActionableRuntimeDispatchEntry({
+    actionable,
+    dispatches: currentEntries,
+    ready_dispatches: readyEntries,
+    active_dispatches: activeEntries,
+    failed_dispatches: failedEntries,
+  });
   orchestration.current_actionable_dispatch = currentActionableEntry
     ? {
       dispatch_id: currentActionableEntry.dispatch_id,
@@ -9925,6 +10774,9 @@ function syncActionableRuntimeDispatchState(project, paths, state, rootPlan) {
       group: currentActionableEntry.group,
       status: currentActionableEntry.status,
       freshness: currentActionableEntry.freshness?.status || null,
+      active_owner: normalizeRuntimeDispatchOwner(currentActionableEntry.active_owner),
+      last_owner: normalizeRuntimeDispatchOwner(currentActionableEntry.last_owner),
+      lease_expires_at: getRuntimeDispatchLeaseExpiry(currentActionableEntry),
       capsule_json: typeof currentActionableEntry.capsule_json === 'string'
         ? normalizeRel(currentActionableEntry.capsule_json)
         : null,
@@ -9985,8 +10837,14 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     .filter((item) => item && item.pass === false)
     .map((item) => item.id);
   const workflowPlans = ensureArray(state.workflow?.plans);
-  const nextPending = workflowPlans.find((plan) => plan.status !== 'complete') || null;
-  const dependencyBlockers = getDependencyBlockers(project, workflowPlans);
+  const nextPending = getPendingRequiredWorkflowPlan(workflowPlans);
+  const {
+    runtimeContext,
+    planningAnalysis,
+    planningFreshness,
+    dependencyBlockers,
+    actionableTargets: actionableDependencyTargets,
+  } = syncStateSurfaceState(project, paths, state, rootPlan);
   const dependencyBlockersByPlanId = new Map(
     dependencyBlockers.map((blocker) => [blocker.plan_id, blocker.unmet_dependencies]),
   );
@@ -10002,9 +10860,28 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
   const reviewCount = state.history.filter((entry) => entry?.review?.generated_at).length;
   const latestVerdictResult = latest?.verdict?.result || null;
   const latestReviewResult = latest?.review?.result || null;
-  const runtimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
-  const planningAnalysis = loadPlanningAnalysis(paths);
-  const planningFreshness = getPlanningArtifactFreshness(paths);
+  const planningSpecRel = rootPlan.spec || state?.planning?.spec_path || null;
+  const planningContextFiles = normalizePathList(state?.planning?.context_files || []);
+  let livePlanningBundle = null;
+  if (planningSpecRel && fs.existsSync(path.join(REPO_ROOT, planningSpecRel))) {
+    try {
+      livePlanningBundle = buildPlanningBundle(project, planningSpecRel, planningContextFiles);
+    } catch {
+      livePlanningBundle = null;
+    }
+  }
+  const canonicalPlanningContext = resolveCanonicalPlanningContext({
+    rootPlan,
+    bundle: livePlanningBundle,
+    paths,
+  });
+  const canonicalPlanningContextHash = hashPlanningContext(canonicalPlanningContext);
+  if (state?.planning && typeof state.planning === 'object' && !Array.isArray(state.planning)) {
+    state.planning = {
+      ...state.planning,
+      planning_context_hash: canonicalPlanningContextHash,
+    };
+  }
   const currentDelegation = runtimeContext.delegation;
   const currentDispatchGroup = currentRuntimeDispatchGroup(runtimeContext);
   const completableDispatchGroup = currentCompletableRuntimeDispatchGroup(runtimeContext);
@@ -10049,164 +10926,64 @@ function generateDerivedArtifacts(project, paths, state, rootPlan) {
     operatorNotes,
   );
   syncDurableFeedbackMemory(project, rootPlan, state, planningNotes, loopFindings, frameworkFrictionCandidates);
+  const advanceBehavior = syncLifecycleAdvanceBehavior(project, state, runtimeContext);
+  authoritativeState.lifecycle.advance_behavior = advanceBehavior.code;
+  authoritativeState.lifecycle.advance_behavior_detail = advanceBehavior.detail;
 
-  const resumeCapsuleJson = {
-    schema_version: '2.1.0',
-    generated_at: nowIso(),
+  const {
+    implementationHandoffJson,
+    indexJson,
+    planGraphJson,
+    resumeCapsuleJson,
+  } = buildDerivedArtifactPayloads({
     project,
-    next_action: state.lifecycle.next_action,
-    next_command: getLifecycleNextCommand(state),
-    stop_reason: state.lifecycle.stop_reason || null,
-    current_phase: state.lifecycle.status,
-    current_plan: runtimeContext.actionable.plan_id || state.current_plan?.plan_id || null,
-    current_plan_group: currentDispatchGroup,
-    current_plan_ids: runtimeContext.actionable.plan_ids,
-    blockers:
-      orchestration.stage === 'planning' && planningAnalysis.blocking_findings.length > 0
-        ? planningAnalysis.blocking_findings.map((finding) => `${finding.source}:${finding.id}`)
-        : ensureArray(latest?.failures),
-    dependency_blockers: dependencyBlockers,
-    acceptance_gaps: acceptanceGaps,
-    latest_verdict: latestVerdictResult,
-    latest_review: latestReviewResult,
-    gotchas: ensureArray(state.gotchas),
-    planning: {
-      checker_result: planningAnalysis.checker?.result || null,
-      auditor_result: planningAnalysis.auditor?.result || null,
-      artifacts_fresh: !planningFreshness.stale,
-      artifacts_freshness_reason: planningFreshness.reason,
-      blocking_findings: planningAnalysis.blocking_findings.map((finding) => ({
-        source: finding.source,
-        id: finding.id,
-        title: finding.title,
-        severity: finding.severity,
-      })),
-    },
-    orchestration: {
-      stage: orchestration.stage,
-      active_role: orchestration.active_role,
-      last_role: orchestration.last_role,
-      next_role: orchestration.next_role,
-      runtime_dispatch_view: orchestration.runtime_dispatch_view,
-    },
-    delegation: {
-      mode: currentDelegation.mode,
-      owner: currentDelegation.owner,
-      ready_dispatch_ids: readyDispatches.map((entry) => entry.dispatch_id),
-    },
-  };
-
-  const planGraphJson = {
-    schema_version: '2.1.0',
-    generated_at: nowIso(),
-    project,
-    phase: rootPlan.phase || null,
-    summary: {
-      spec: rootPlan.spec || null,
-      created: state.created_at || null,
-      total_plans: workflowPlans.length || 1,
-      parallel_groups: dependencyGroups.parallel_groups,
-      blocked_plans: dependencyBlockers.length,
-    },
-    groups: dependencyGroups.groups,
-    dependency_blockers: dependencyBlockers,
-    plans: workflowPlans.map((plan) => ({
-      plan: plan.plan_id,
-      file: plan.plan_md || plan.plan_json,
-      group: dependencyGroups.group_by_plan_id.get(plan.plan_id) || 1,
-      depends_on: ensureArray(plan.depends_on),
-      blocked_by: ensureArray(dependencyBlockersByPlanId.get(plan.plan_id)),
-      pause: null,
-      status: plan.status,
-    })),
-  };
-
-  const indexJson = {
-    schema_version: '2.1.0',
-    generated_at: nowIso(),
-    project,
-    counts: {
-      plans: workflowPlans.length || (fs.existsSync(paths.planMdPath) ? 1 : 0),
-      exec_reports: fs.existsSync(paths.execReportPath) ? 1 : 0,
-      verdict_reports: verdictCount,
-      review_reports: reviewCount,
-      planning_reports:
-        (fs.existsSync(paths.planningCheckerJsonPath) ? 1 : 0)
-        + (fs.existsSync(paths.planningAuditorJsonPath) ? 1 : 0),
-      fix_reports: 0,
-      role_capsules: roleCapsuleCount,
-    },
-    next_plan: nextPending ? path.resolve(REPO_ROOT, nextPending.plan_md || nextPending.plan_json) : null,
-    latest_reports: {
-      exec: fs.existsSync(paths.execReportPath) ? path.resolve(paths.execReportPath) : null,
-      verdict: fs.existsSync(paths.verdictReportPath) ? path.resolve(paths.verdictReportPath) : null,
-      review: fs.existsSync(paths.reviewReportPath) ? path.resolve(paths.reviewReportPath) : null,
-      checker: fs.existsSync(paths.planningCheckerJsonPath) ? path.resolve(paths.planningCheckerJsonPath) : null,
-      auditor: fs.existsSync(paths.planningAuditorJsonPath) ? path.resolve(paths.planningAuditorJsonPath) : null,
-      handoff: path.resolve(paths.implementationHandoffJsonPath),
-      planning_handoff: path.resolve(paths.planningHandoffMdPath),
-    },
-    orchestration: {
-      stage: orchestration.stage,
-      active_role: orchestration.active_role,
-      last_role: orchestration.last_role,
-      next_role: orchestration.next_role,
-    },
-    latest_capsules: latestCapsules,
-    discovery_log_entries: propagatedDiscoveries.length,
-  };
-
-  const implementationHandoffJson = {
-    schema_version: '1.0.0',
-    generated_at: nowIso(),
-    project,
-    authoritative_state: authoritativeState,
-    lifecycle: {
-      status: state.lifecycle.status,
-      next_action: state.lifecycle.next_action,
-      next_command: getLifecycleNextCommand(state),
-      stop_reason: state.lifecycle.stop_reason || null,
-    },
-    planning: {
-      checker_result: planningAnalysis.checker?.result || null,
-      auditor_result: planningAnalysis.auditor?.result || null,
-      artifacts_fresh: !planningFreshness.stale,
-      artifacts_freshness_reason: planningFreshness.reason,
-    },
-    actionable_surface: {
-      plan_id: runtimeContext.actionable.plan_id || state.current_plan?.plan_id || null,
-      plan_ids: runtimeContext.actionable.plan_ids,
-      dispatch_group: currentDispatchGroup,
-      completable_group: completableDispatchGroup,
-      current_dispatch: orchestration.current_actionable_dispatch,
-      current_capsule: orchestration.current_actionable_capsule || null,
-    },
-    phase_graph: workflowPlanDetails,
-    dependency_blockers: dependencyBlockers,
-    deferred_items: parseMarkdownBulletSection(paths.strategyPath, 'Deferred Items'),
-    protected_areas: parseMarkdownBulletSection(paths.strategyPath, 'Protected Areas'),
-  };
+    paths,
+    repoRoot: REPO_ROOT,
+    rootPlan,
+    state,
+    orchestration,
+    propagatedDiscoveries,
+    latest,
+    acceptanceGaps,
+    workflowPlans,
+    nextPending,
+    runtimeContext,
+    planningAnalysis,
+    planningFreshness,
+    dependencyBlockers,
+    actionableDependencyTargets,
+    dependencyBlockersByPlanId,
+    dependencyGroups,
+    verdictCount,
+    reviewCount,
+    latestVerdictResult,
+    latestReviewResult,
+    canonicalPlanningContext,
+    canonicalPlanningContextHash,
+    currentDelegation,
+    currentDispatchGroup,
+    completableDispatchGroup,
+    readyDispatches,
+    latestCapsules,
+    roleCapsuleCount,
+    workflowPlanDetails,
+    authoritativeState,
+    getLifecycleNextCommand,
+    nowIso,
+  });
 
   writeJson(paths.statePath, state);
   fs.writeFileSync(paths.notesPath, notesMarkdown, 'utf8');
   writeJson(paths.resumeCapsuleJsonPath, resumeCapsuleJson);
-  if (fs.existsSync(paths.resumeCapsuleMdPath)) {
-    fs.unlinkSync(paths.resumeCapsuleMdPath);
-  }
 
   writeJson(paths.planGraphJsonPath, planGraphJson);
-  if (fs.existsSync(paths.planGraphMdPath)) {
-    fs.unlinkSync(paths.planGraphMdPath);
-  }
 
   writeJson(paths.indexJsonPath, indexJson);
   writeJson(paths.implementationHandoffJsonPath, implementationHandoffJson);
-  fs.writeFileSync(paths.planningHandoffMdPath, renderPlanningHandoffMarkdown(project, implementationHandoffJson), 'utf8');
-  removeLegacyRuntimeDelegationArtifacts(paths.projectDir);
 }
 
-async function runCycle(project, cycleOptions = {}) {
-  const releaseProjectLock = acquireProjectLock(project, 'cycle');
+async function runCycle(project, cycleOptions = {}, lockOptions = {}) {
+  const releaseProjectLock = lockOptions.lockHeld ? null : acquireProjectLock(project, 'cycle');
   try {
   const paths = getProjectPaths(project);
 
@@ -10273,6 +11050,7 @@ async function runCycle(project, cycleOptions = {}) {
         state.planning = {
           ...state.planning,
           status: 'draft',
+          draft_correction: buildPlanningDraftCorrectionLoop(promotionCheck, draftBundle),
           completed_at: null,
         };
       }
@@ -10296,8 +11074,9 @@ async function runCycle(project, cycleOptions = {}) {
   const previousWorkflow = state.workflow && typeof state.workflow === 'object'
     ? { ...state.workflow }
     : null;
+  const planningWasCompleteAtStart = state?.planning?.status === 'complete';
   syncWorkflowState(state, contracts, workflowSettings);
-  carryForwardFreshSessionImplementationGate(state, previousWorkflow);
+  carryForwardFreshSessionImplementationGate(state, previousWorkflow, workflowSettings);
   const orchestration = ensureOrchestrationState(state);
   ensureDiscoveryLog(state);
   const planningRecheck = shouldAutoRecheckPlanning(project, paths, state, planningSpecRel, planningContextFiles);
@@ -10385,169 +11164,18 @@ async function runCycle(project, cycleOptions = {}) {
     }
 
     const cycleNumber = (state.lifecycle?.cycle_count || 0) + 1;
-    state.lifecycle = state.lifecycle || {};
-    state.lifecycle.cycle_count = cycleNumber;
-    state.lifecycle.last_started_at = nowIso();
-    state.lifecycle.status = 'running';
-    orchestration.stage = planOrchestration.stage;
-    orchestration.discovery_propagation = planOrchestration.discovery_propagation;
-
-    state.current_plan = {
-      plan_id: contract.plan.plan_id,
-      plan_json: contract.plan_json_rel,
-      plan_md: contract.plan_md_rel,
-      depends_on: ensureArray(contract.plan.depends_on),
-      contract_hash: hashPlanContract(contract.plan),
-    };
-
-    let executorCapsulePaths = null;
-    orchestration.active_role = 'executor';
-    orchestration.next_role = 'judge';
-    if (planOrchestration.roles.executor.enabled) {
-      const executorCapsule = buildExecutorCapsule(project, contract, state, cycleNumber);
-      executorCapsulePaths = persistRoleCapsule(
-        paths,
-        state,
-        executorCapsule,
-        'prepared',
-        `Executor context prepared for ${contract.plan.plan_id}.`,
-      );
-    }
-
-    const cycleRecord = await executeSinglePlan(contract, cycleNumber, paths.projectDir);
-    if (executorCapsulePaths) {
-      recordRoleHistory(orchestration, {
-        cycle: cycleNumber,
-        stage: planOrchestration.stage,
-        role: 'executor',
-        plan_id: contract.plan.plan_id,
-        status: cycleRecord.result,
-        capsule_json: executorCapsulePaths.jsonRel,
-        generated_at: nowIso(),
-        summary: `Executor finished ${contract.plan.plan_id} with ${cycleRecord.result}.`,
-      });
-      orchestration.last_role = 'executor';
-    }
-
-    let judgeCapsulePaths = null;
-    orchestration.active_role = 'judge';
-    orchestration.next_role = 'reviewer';
-    if (planOrchestration.roles.judge.enabled) {
-      const judgeCapsule = buildJudgeCapsule(project, paths, contract, state, cycleRecord);
-      judgeCapsulePaths = persistRoleCapsule(
-        paths,
-        state,
-        judgeCapsule,
-        'prepared',
-        `Judge context prepared for ${contract.plan.plan_id}.`,
-      );
-    }
-    const verdictRecord = await buildVerdictRecord(contract, cycleRecord, paths.projectDir);
-    if (judgeCapsulePaths) {
-      recordRoleHistory(orchestration, {
-        cycle: cycleNumber,
-        stage: planOrchestration.stage,
-        role: 'judge',
-        plan_id: contract.plan.plan_id,
-        status: verdictRecord.result,
-        capsule_json: judgeCapsulePaths.jsonRel,
-        generated_at: verdictRecord.generated_at,
-        summary: `Judge returned ${verdictRecord.result} for ${contract.plan.plan_id}.`,
-      });
-      orchestration.last_role = 'judge';
-    }
-    fs.writeFileSync(paths.verdictReportPath, buildVerdictReport(project, cycleRecord, verdictRecord), 'utf8');
-
-    let reviewerCapsulePaths = null;
-    orchestration.active_role = 'reviewer';
-    orchestration.next_role = null;
-    if (planOrchestration.roles.reviewer.enabled) {
-      const reviewerCapsule = buildReviewerCapsule(project, paths, contract, state, cycleRecord, verdictRecord);
-      reviewerCapsulePaths = persistRoleCapsule(
-        paths,
-        state,
-        reviewerCapsule,
-        'prepared',
-        `Reviewer context prepared for ${contract.plan.plan_id}.`,
-      );
-    }
-    const reviewRecord = buildReviewRecord(contract, cycleRecord, verdictRecord);
-    if (reviewerCapsulePaths) {
-      recordRoleHistory(orchestration, {
-        cycle: cycleNumber,
-        stage: planOrchestration.stage,
-        role: 'reviewer',
-        plan_id: contract.plan.plan_id,
-        status: reviewRecord.result,
-        capsule_json: reviewerCapsulePaths.jsonRel,
-        generated_at: reviewRecord.generated_at,
-        summary: `Reviewer returned ${reviewRecord.result} for ${contract.plan.plan_id}.`,
-      });
-      orchestration.last_role = 'reviewer';
-    }
-    const qualityFailures = uniqueStrings([
-      ...ensureArray(cycleRecord.failures),
-      ...ensureArray(verdictRecord.failures).map((value) => `judge.${value}`),
-      ...(reviewRecord.result === 'concerns' ? ['review.concerns'] : []),
-    ]);
-    cycleRecord.execution_result = cycleRecord.result;
-    cycleRecord.verdict = {
-      result: verdictRecord.result,
-      failures: verdictRecord.failures,
-      generated_at: verdictRecord.generated_at,
-    };
-    cycleRecord.review = {
-      result: reviewRecord.result,
-      findings: reviewRecord.findings.map((finding) => ({
-        id: finding.id,
-        severity: finding.severity,
-        title: finding.title,
-      })),
-      generated_at: reviewRecord.generated_at,
-    };
-    cycleRecord.failures = qualityFailures;
-    cycleRecord.result = qualityFailures.length === 0 ? 'pass' : 'fail';
-
-    fs.writeFileSync(paths.reviewReportPath, buildReviewReport(project, cycleRecord, reviewRecord, contract.plan), 'utf8');
-    if (cycleRecord.result === 'fail' && planOrchestration.stage !== 'planning' && planOrchestration.roles.fixer.enabled) {
-      orchestration.active_role = 'fixer';
-      orchestration.next_role = 'fixer';
-      const fixerCapsule = buildFixerCapsule(project, paths, contract, state, cycleRecord, verdictRecord, reviewRecord);
-      const fixerCapsulePaths = persistRoleCapsule(
-        paths,
-        state,
-        fixerCapsule,
-        'routed',
-        `Fix route prepared for ${contract.plan.plan_id}.`,
-      );
-      recordRoleHistory(orchestration, {
-        cycle: cycleNumber,
-        stage: planOrchestration.stage,
-        role: 'fixer',
-        plan_id: contract.plan.plan_id,
-        status: 'routed',
-        capsule_json: fixerCapsulePaths.jsonRel,
-        generated_at: nowIso(),
-        summary: `Fix route prepared for ${contract.plan.plan_id}.`,
-      });
-      orchestration.last_role = 'fixer';
-    } else {
-      orchestration.active_role = null;
-      orchestration.next_role = null;
-    }
-
-    if (planOrchestration.discovery_propagation) {
-      appendPropagatedDiscoveries(
-        state,
-        contract.plan.plan_id,
-        findDownstreamPlanIds(state.workflow.plans, contract.plan.plan_id),
-        uniqueStrings([
-          ...ensureArray(verdictRecord.failures).map((value) => `judge: ${value}`),
-          ...ensureArray(reviewRecord.findings).map((finding) => `${finding.severity} review: ${finding.title}`),
-          ...ensureArray(cycleRecord.scope?.violations).map((violation) => `scope: ${violation.file} (${violation.reason})`),
-        ]),
-      );
-    }
+    const { cycleRecord } = await executePlanWithQualityPass(
+      project,
+      paths,
+      state,
+      contract,
+      cycleNumber,
+      {
+        recordFixRoute: true,
+        propagateDiscoveries: true,
+        clearRoleAfterReview: true,
+      },
+    );
 
     executedPlans.push(cycleRecord);
     state.history.push(cycleRecord);
@@ -10574,6 +11202,7 @@ async function runCycle(project, cycleOptions = {}) {
       if (
         nextContractAfterPlanning
         && inferPlanStage(project, nextContractAfterPlanning.plan) !== 'planning'
+        && shouldApplyFreshSessionImplementationGate(state, planningWasCompleteAtStart, workflowSettings)
       ) {
         applyFreshSessionImplementationGate(state);
         break;
@@ -10581,9 +11210,11 @@ async function runCycle(project, cycleOptions = {}) {
     }
   }
 
-  const allComplete = state.workflow.plans.length > 0 && state.workflow.plans.every((plan) => plan.status === 'complete');
-  const nextPending = state.workflow.plans.find((plan) => plan.status === 'pending') || null;
+  const requiredWorkflowPlans = ensureArray(state.workflow.plans).filter((plan) => isWorkflowPlanRequired(plan));
+  const allComplete = requiredWorkflowPlans.length > 0 && requiredWorkflowPlans.every((plan) => plan.status === 'complete');
+  const nextPending = getPendingRequiredWorkflowPlan(state.workflow.plans);
   const dependencyBlockers = getDependencyBlockers(project, state.workflow.plans);
+  const actionableDependencyTargets = getActionableDependencyTargets(dependencyBlockers);
   const readyWorkflowPlans = getReadyWorkflowPlans(project, state.workflow.plans);
   const nextRunnablePending = readyWorkflowPlans[0] || null;
   const nextRunnableContract = nextRunnablePending ? contractsByPath.get(nextRunnablePending.plan_json) : null;
@@ -10635,6 +11266,7 @@ async function runCycle(project, cycleOptions = {}) {
     && !runtimeDispatchPending
     && nextRunnableContract
     && inferPlanStage(project, nextRunnableContract.plan) !== 'planning'
+    && shouldApplyFreshSessionImplementationGate(state, planningWasCompleteAtStart, workflowSettings)
   ) {
     applyFreshSessionImplementationGate(state);
   }
@@ -10697,10 +11329,16 @@ async function runCycle(project, cycleOptions = {}) {
     orchestration.next_role = 'executor';
   } else if (dependencyBlockers.length > 0) {
     state.lifecycle.status = 'blocked';
+    const dependencyNextStep = buildDependencyNextAction({
+      project,
+      dependencyBlockers,
+      actionableTargets: actionableDependencyTargets,
+      buildCycleCommand,
+    });
     setLifecycleNextStep(
       state,
-      `Unblock dependency blockers: ${describeDependencyBlockers(dependencyBlockers)}.`,
-      buildCycleCommand(project),
+      dependencyNextStep.summary,
+      dependencyNextStep.next_command,
     );
     orchestration.next_role = null;
   } else {
@@ -10717,13 +11355,10 @@ async function runCycle(project, cycleOptions = {}) {
   if (state.history.length > 50) {
     state.history = state.history.slice(-50);
   }
-  syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
 
   const reportMarkdown = buildExecReport(project, rootPlan, executedPlans, state);
   fs.writeFileSync(paths.execReportPath, reportMarkdown, 'utf8');
-  writeJson(paths.statePath, state);
-  fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, rootPlan.spec || state?.planning?.spec_path || project, state), 'utf8');
-  generateDerivedArtifacts(project, paths, state, rootPlan);
+  writeProjectStateArtifacts(project, paths, state, rootPlan, rootPlan.spec || state?.planning?.spec_path || project);
 
   const overallResult = failTriggered ? 'FAIL' : allComplete ? 'PASS' : 'PARTIAL';
   console.log(`smike cycle ${project}: ${overallResult} (${executedPlans.length} plan${executedPlans.length === 1 ? '' : 's'} executed)`);
@@ -10735,7 +11370,7 @@ async function runCycle(project, cycleOptions = {}) {
     process.exit(1);
   }
   } finally {
-    releaseProjectLock();
+    releaseProjectLock?.();
   }
 }
 
@@ -10743,6 +11378,9 @@ function runValidate(project) {
   const paths = getProjectPaths(project);
   if (!fs.existsSync(paths.planJsonPath)) {
     fail(`missing PLAN.json: ${paths.planJsonPath}`);
+  }
+  if (!fs.existsSync(paths.statePath)) {
+    fail(`missing STATE.json: ${paths.statePath}`);
   }
   const rootPlan = readJson(paths.planJsonPath);
   const errors = validatePlan(rootPlan);
@@ -10755,9 +11393,197 @@ function runValidate(project) {
 
   const workflowSettings = resolveWorkflowSettings(rootPlan, {});
   const contracts = buildWorkflowContracts(paths, rootPlan, workflowSettings);
+  readValidatedState(paths, { persistRepair: true });
   console.log(`PLAN.json valid for codex profile: ${paths.planJsonPath}`);
+  console.log(`STATE.json valid: ${paths.statePath}`);
   if (contracts.length > 1) {
     console.log(`workflow phase plans validated: ${contracts.length - 1}`);
+  }
+}
+
+function repoRelativeExistingFile(input, label = 'file') {
+  const raw = String(input || '').trim();
+  if (!raw) {
+    fail(`${label} path is required`);
+  }
+  const absolutePath = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : path.resolve(REPO_ROOT, raw);
+  if (!isPathInside(REPO_ROOT, absolutePath)) {
+    fail(`${label} must be inside the repo: ${raw}`);
+  }
+  if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+    fail(`${label} not found: ${raw}`);
+  }
+  return normalizeRel(path.relative(REPO_ROOT, absolutePath));
+}
+
+function buildPlanQualityReport(specRel, contextFiles = [], options = {}) {
+  const project = options.project || `plan-quality-${slugifyProjectName(specRel)}`;
+  try {
+    const bundle = buildPlanningBundle(project, specRel, contextFiles);
+    const phaseContracts = buildPlanningPhaseContracts(project, specRel, bundle);
+    const promotionCheck = buildPlanningDraftPromotionCheck(bundle, phaseContracts);
+    return {
+      ok: promotionCheck.ready,
+      project,
+      spec: specRel,
+      context_files: contextFiles,
+      mode: bundle.mode,
+      phases: bundle.phase_blueprints.map((phase) => phase.id),
+      blockers: promotionCheck.blockers,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      project,
+      spec: specRel,
+      context_files: contextFiles,
+      mode: null,
+      phases: [],
+      blockers: [`planning bundle build failed: ${error.message}`],
+    };
+  }
+}
+
+function printPlanQualityReport(report, options = {}) {
+  if (options.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  console.log(`smike validate plan-quality: ${report.ok ? 'PASS' : 'FAIL'}`);
+  console.log(`spec: ${report.spec}`);
+  console.log(`project: ${report.project}`);
+  console.log(`mode: ${report.mode || 'unknown'}`);
+  console.log(`phases: ${report.phases.join(', ') || 'none'}`);
+  console.log(`blockers: ${report.blockers.length}`);
+  for (const blocker of report.blockers) {
+    console.log(`- ${blocker}`);
+  }
+}
+
+function runValidatePlanQuality(args) {
+  const json = args.includes('--json');
+  const paths = args.filter((arg) => arg !== '--json');
+  const specArg = paths[0];
+  if (!specArg) {
+    fail('validate --plan-quality requires a spec path');
+  }
+  const specRel = repoRelativeExistingFile(specArg, 'spec');
+  const contextFiles = paths.slice(1).map((contextArg) => repoRelativeExistingFile(contextArg, 'context file'));
+  const report = buildPlanQualityReport(specRel, contextFiles);
+  printPlanQualityReport(report, { json });
+  if (!report.ok) {
+    process.exit(2);
+  }
+}
+
+function fixtureRepoRel(fixtureRoot, relativePath, label) {
+  const raw = String(relativePath || '').trim();
+  if (!raw) {
+    throw new Error(`${label} path is required`);
+  }
+  const absolutePath = path.resolve(fixtureRoot, raw);
+  if (!isPathInside(REPO_ROOT, absolutePath)) {
+    throw new Error(`${label} must be inside the repo: ${raw}`);
+  }
+  if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+    throw new Error(`${label} not found: ${raw}`);
+  }
+  return normalizeRel(path.relative(REPO_ROOT, absolutePath));
+}
+
+function runValidatePlanQualityFixtures() {
+  const manifest = readJson(PLAN_QUALITY_FIXTURE_MANIFEST_PATH);
+  const fixtureRoot = path.dirname(PLAN_QUALITY_FIXTURE_MANIFEST_PATH);
+  const fixtures = Array.isArray(manifest?.fixtures) ? manifest.fixtures : null;
+  if (!fixtures) {
+    fail(`${normalizeRel(path.relative(REPO_ROOT, PLAN_QUALITY_FIXTURE_MANIFEST_PATH))} must define a fixtures array`);
+  }
+
+  const failures = [];
+  let checked = 0;
+
+  for (const fixture of fixtures) {
+    checked += 1;
+    const id = typeof fixture?.id === 'string' && fixture.id.trim() ? fixture.id.trim() : `<fixture-${checked}>`;
+    try {
+      const specRel = fixtureRepoRel(fixtureRoot, fixture.path, `fixture ${id} spec`);
+      const contextFiles = ensureArray(fixture.context_files)
+        .map((contextFile) => fixtureRepoRel(fixtureRoot, contextFile, `fixture ${id} context file`));
+      const expectedReady = fixture.expect_ready === true;
+      const expectedBlocked = fixture.expect_ready === false;
+      if (!expectedReady && !expectedBlocked) {
+        failures.push(`${id}: must declare expect_ready: true or false`);
+        continue;
+      }
+
+      const report = buildPlanQualityReport(specRel, contextFiles, {
+        project: fixture.project || `plan-quality-${safeSlug(id)}`,
+      });
+      const blockerText = report.blockers.join('\n');
+
+      if (expectedReady && !report.ok) {
+        failures.push(`${id}: expected ready but failed:\n- ${report.blockers.join('\n- ')}`);
+        continue;
+      }
+      if (expectedBlocked && report.ok) {
+        failures.push(`${id}: expected blockers but passed`);
+        continue;
+      }
+      for (const expectedBlocker of ensureArray(fixture.expected_blockers)) {
+        if (typeof expectedBlocker !== 'string' || !expectedBlocker.trim()) {
+          continue;
+        }
+        if (!blockerText.includes(expectedBlocker)) {
+          failures.push(`${id}: missing expected blocker substring: ${expectedBlocker}`);
+        }
+      }
+    } catch (error) {
+      failures.push(`${id}: ${error.message}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    fail(`plan-quality fixture verification failed:\n- ${failures.join('\n- ')}`, 2);
+  }
+
+  console.log('smike validate plan-quality-fixtures: PASS');
+  console.log(`fixtures: ${checked}`);
+}
+
+function runValidateContracts() {
+  const result = verifyContracts();
+  if (!result.ok) {
+    fail(
+      `contract verification failed:\n- ${result.failures.join('\n- ')}`,
+      2,
+    );
+  }
+  console.log('smike validate contracts: PASS');
+  console.log(`schemas: ${result.counts.schemas}`);
+  console.log(`templates: ${result.counts.templates}`);
+  console.log(`fixtures: ${result.counts.fixtures}`);
+}
+
+function runValidateCompatibility() {
+  const result = auditCompatibility();
+  console.log(`smike validate compatibility: ${result.status}`);
+  console.log(`repo_root: ${REPO_ROOT}`);
+  console.log(`scanned: ${result.counts.scanned}`);
+  console.log(`compatible: ${result.counts.compatible}`);
+  console.log(`migratable: ${result.counts.migratable}`);
+  console.log(`unsupported: ${result.counts.unsupported}`);
+  if (result.entries.length === 0) {
+    console.log('no runtime artifacts found under .smike, .smike-archive, or .smike-snapshots');
+    return;
+  }
+  for (const entry of result.entries) {
+    console.log(`- ${entry.classification} ${entry.kind} ${entry.label}`);
+    for (const error of entry.errors || []) {
+      console.log(`  ${error}`);
+    }
   }
 }
 
@@ -10781,25 +11607,96 @@ function runGenerate(project) {
   syncWorkflowState(state, contracts, workflowSettings);
   ensureOrchestrationState(state);
   ensureDiscoveryLog(state);
-  syncActionableRuntimeDispatchState(project, paths, state, plan);
   state.updated_at = nowIso();
-  writeJson(paths.statePath, state);
-  fs.writeFileSync(paths.stateMdPath, renderStateMarkdown(project, plan.spec || state?.planning?.spec_path || project, state), 'utf8');
-  generateDerivedArtifacts(project, paths, state, plan);
+  writeProjectStateArtifacts(project, paths, state, plan, plan.spec || state?.planning?.spec_path || project);
   console.log(`derived artifacts regenerated for ${project}`);
   } finally {
     releaseProjectLock();
   }
 }
 
-function persistProjectState(project, paths, state, rootPlan, specRel = null) {
+function writeProjectStateArtifacts(project, paths, state, rootPlan, specRel = null) {
   generateDerivedArtifacts(project, paths, state, rootPlan);
-  writeJson(paths.statePath, state);
   fs.writeFileSync(
     paths.stateMdPath,
     renderStateMarkdown(project, specRel || rootPlan.spec || state?.planning?.spec_path || project, state),
     'utf8',
   );
+  writePlanningReadySnapshot(project, paths, state, rootPlan);
+}
+
+function persistProjectState(project, paths, state, rootPlan, specRel = null) {
+  writeProjectStateArtifacts(project, paths, state, rootPlan, specRel);
+}
+
+function tryAutoCompleteRuntimeDispatchEntry(entry) {
+  if (entry?.status !== 'spawned') {
+    return { completed: false, reason: 'dispatch is not spawned' };
+  }
+
+  const snapshots = snapshotArtifactList(entry.result_artifacts);
+  const missingArtifact = snapshots.find((artifact) => !artifact.exists);
+  if (missingArtifact) {
+    return { completed: false, reason: `missing result artifact ${missingArtifact.path}` };
+  }
+
+  const completionRequirements = normalizeDispatchCompletionRequirements(
+    entry.completion_requirements,
+    entry.result_artifacts,
+    entry.artifact_change_required,
+  );
+  const semanticFailures = collectCompletionRequirementFailures(
+    completionRequirements,
+    snapshots,
+    (artifactPath) => fs.readFileSync(path.resolve(REPO_ROOT, artifactPath), 'utf8'),
+  );
+  if (semanticFailures.length > 0) {
+    return { completed: false, reason: semanticFailures[0] };
+  }
+
+  if (entry.artifact_change_required && artifactSnapshotEquivalent(entry.spawn_baseline, snapshots)) {
+    return { completed: false, reason: 'result artifacts are unchanged from the spawn baseline' };
+  }
+
+  const at = nowIso();
+  entry.completion_artifacts = snapshots;
+  moveActiveRuntimeDispatchOwnerToHistory(entry);
+  entry.freshness = buildDispatchFreshnessFromCompletion(entry);
+  updateRuntimeDispatchStatus(entry, 'completed', 'Runtime dispatch auto-completed from verified artifacts.', at);
+  return { completed: true };
+}
+
+function autoCompleteEligibleRuntimeDispatches(runtimeContext) {
+  const completedDispatchIds = [];
+  for (const entry of ensureArray(runtimeContext?.active_dispatches)) {
+    if (!entry?.result_artifacts || entry.result_artifacts.length === 0) {
+      continue;
+    }
+    const result = tryAutoCompleteRuntimeDispatchEntry(entry);
+    if (result.completed) {
+      completedDispatchIds.push(entry.dispatch_id);
+    }
+  }
+  return completedDispatchIds;
+}
+
+function recoverOrphanedRuntimeDispatches(runtimeContext) {
+  const recoveredDispatchIds = [];
+  const at = nowIso();
+
+  for (const entry of ensureArray(runtimeContext?.active_dispatches)) {
+    const ownerHealth = inspectRuntimeDispatchOwnerHealth(entry);
+    if (!ownerHealth.orphaned) {
+      continue;
+    }
+
+    moveActiveRuntimeDispatchOwnerToHistory(entry);
+    entry.freshness = createDispatchFreshness('stale', ownerHealth.reason, at);
+    updateRuntimeDispatchStatus(entry, 'stale', ownerHealth.reason, at);
+    recoveredDispatchIds.push(entry.dispatch_id);
+  }
+
+  return recoveredDispatchIds;
 }
 
 function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
@@ -10817,6 +11714,7 @@ function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
   );
   const missingArtifact = snapshots.find((artifact) => !artifact.exists);
   if (missingArtifact) {
+    moveActiveRuntimeDispatchOwnerToHistory(entry);
     entry.freshness = createDispatchFreshness('missing', `Missing result artifact: ${missingArtifact.path}`, at);
     updateRuntimeDispatchStatus(entry, 'failed', `Missing result artifact: ${missingArtifact.path}`, at);
     const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
@@ -10832,6 +11730,7 @@ function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
   );
   if (semanticFailures.length > 0) {
     const failureReason = semanticFailures[0];
+    moveActiveRuntimeDispatchOwnerToHistory(entry);
     entry.freshness = createDispatchFreshness('stale', failureReason, at);
     updateRuntimeDispatchStatus(entry, 'failed', failureReason, at);
     const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
@@ -10845,7 +11744,9 @@ function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
     const advanceCommand = buildAdvanceCommand(project);
     const recoveryReason =
       'Result artifacts did not change after spawn. '
-      + `If they were edited before \`spawned\` was recorded, run \`${retryCommand}\`, rerun \`${advanceCommand}\` to respawn, then rewrite the artifacts after spawn.`;
+      + `If they were edited before \`spawned\` was recorded, run \`${retryCommand}\`, rerun \`${advanceCommand}\` to surface the dispatch again, `
+      + `mark it spawned with \`${buildSpawnDispatchCommand(project, dispatchId)}\`, then rewrite the artifacts after spawn.`;
+    moveActiveRuntimeDispatchOwnerToHistory(entry);
     entry.freshness = createDispatchFreshness(
       'unchanged',
       recoveryReason,
@@ -10858,11 +11759,13 @@ function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
     fail(
       `dispatch ${dispatchId} cannot be completed: result artifacts are unchanged from the spawn baseline\n`
       + `recovery: if those artifacts were edited before \`spawned\` was recorded, run \`${retryCommand}\`, `
-      + `rerun \`${advanceCommand}\` to respawn, then rewrite the required artifacts after spawn`,
+      + `rerun \`${advanceCommand}\` to surface the dispatch again, `
+      + `mark it spawned with \`${buildSpawnDispatchCommand(project, dispatchId)}\`, then rewrite the required artifacts after spawn`,
     );
   }
 
   entry.completion_artifacts = snapshots;
+  moveActiveRuntimeDispatchOwnerToHistory(entry);
   entry.freshness = buildDispatchFreshnessFromCompletion(entry);
   updateRuntimeDispatchStatus(entry, 'completed', 'Runtime dispatch completed and artifacts were verified.', at);
   const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
@@ -10883,8 +11786,8 @@ function completeRuntimeDispatchEntry(project, paths, state, rootPlan, entry) {
   persistProjectState(project, paths, state, rootPlan);
 }
 
-function runDispatchGroup(project, action, groupSelector, options = {}) {
-  const releaseProjectLock = acquireProjectLock(project, 'dispatch');
+function runDispatchGroup(project, action, groupSelector, options = {}, lockOptions = {}) {
+  const releaseProjectLock = lockOptions.lockHeld ? null : acquireProjectLock(project, 'dispatch');
   try {
     const paths = getProjectPaths(project);
     if (!fs.existsSync(paths.planJsonPath)) {
@@ -10935,12 +11838,12 @@ function runDispatchGroup(project, action, groupSelector, options = {}) {
     console.log(`smike dispatch ${project}: group ${targetGroup} -> completed (${entries.length} dispatches)`);
     printDispatchFollowOn(project, state);
   } finally {
-    releaseProjectLock();
+    releaseProjectLock?.();
   }
 }
 
-function runDispatch(project, action, dispatchId, options = {}) {
-  const releaseProjectLock = acquireProjectLock(project, 'dispatch');
+function runDispatch(project, action, dispatchId, options = {}, lockOptions = {}) {
+  const releaseProjectLock = lockOptions.lockHeld ? null : acquireProjectLock(project, 'dispatch');
   try {
   const paths = getProjectPaths(project);
   if (!fs.existsSync(paths.planJsonPath)) {
@@ -10978,7 +11881,11 @@ function runDispatch(project, action, dispatchId, options = {}) {
     if (entry.status !== 'queued' && entry.status !== 'stale') {
       fail(`dispatch ${dispatchId} must be queued or stale before marking it spawned`);
     }
+    const ownerCommand = typeof options.owner_command === 'string' && options.owner_command.trim()
+      ? options.owner_command.trim()
+      : buildSpawnDispatchCommand(project, dispatchId);
     entry.spawn_baseline = snapshotArtifactList(entry.result_artifacts);
+    setActiveRuntimeDispatchOwner(entry, buildRuntimeDispatchOwner(ownerCommand, at));
     entry.freshness = createDispatchFreshness('pending', 'Runtime dispatch is in flight.', at);
     updateRuntimeDispatchStatus(entry, 'spawned', 'Runtime dispatch claimed by the orchestrator.', at);
     const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
@@ -11000,6 +11907,7 @@ function runDispatch(project, action, dispatchId, options = {}) {
     const reason = typeof options.reason === 'string' && options.reason.trim()
       ? options.reason.trim()
       : 'Runtime dispatch failed.';
+    moveActiveRuntimeDispatchOwnerToHistory(entry);
     entry.freshness = createDispatchFreshness('stale', reason, at);
     updateRuntimeDispatchStatus(entry, 'failed', reason, at);
     const nextRuntimeContext = syncActionableRuntimeDispatchState(project, paths, state, rootPlan);
@@ -11022,6 +11930,7 @@ function runDispatch(project, action, dispatchId, options = {}) {
     if (entry.status !== 'failed' && entry.status !== 'stale') {
       fail(`dispatch ${dispatchId} must be failed or stale before it can be retried`);
     }
+    moveActiveRuntimeDispatchOwnerToHistory(entry);
     entry.spawn_baseline = [];
     entry.completion_artifacts = [];
     entry.freshness = createDispatchFreshness('pending', 'Dispatch requeued for retry.', at);
@@ -11041,7 +11950,28 @@ function runDispatch(project, action, dispatchId, options = {}) {
 
   fail(`unknown dispatch action: ${action}`);
   } finally {
-    releaseProjectLock();
+    releaseProjectLock?.();
+  }
+}
+
+function removePathIfExists(filePath) {
+  fs.rmSync(filePath, { recursive: true, force: true });
+}
+
+function runGitRestoreHead(paths) {
+  const normalized = uniqueStrings(paths.map(normalizeRel).filter(Boolean));
+  if (normalized.length === 0) {
+    return;
+  }
+
+  const chunkSize = 100;
+  for (let index = 0; index < normalized.length; index += chunkSize) {
+    const chunk = normalized.slice(index, index + chunkSize);
+    const command = `git restore --source=HEAD --staged --worktree -- ${chunk.map(shellEscape).join(' ')}`;
+    const result = runShellSync(command, { timeoutMs: 60_000 });
+    if (result.status !== 0) {
+      fail(`failed to restore tracked files from git HEAD:\n${result.stderr || result.stdout}`);
+    }
   }
 }
 
@@ -11065,10 +11995,19 @@ function runArchive(projectSelector, options = {}) {
     const { state } = readValidatedState(paths, { persistRepair: true });
     const projectMeta = fs.existsSync(paths.projectMetaPath) ? readJson(paths.projectMetaPath) : {};
     const lifecycleStatus = state?.lifecycle?.status || null;
+    const liveDispatches = getCurrentRuntimeDispatchEntriesFromState(state)
+      .filter((entry) => entry.status === 'spawned')
+      .map((entry) => entry.dispatch_id);
     const terminalStatuses = new Set(['complete', 'failed', 'blocked', 'planning_blocked']);
 
     if (!options.force && !terminalStatuses.has(lifecycleStatus)) {
       fail(`refusing to archive nonterminal project ${project} with status ${lifecycleStatus || 'unknown'}; use --force to override`);
+    }
+    if (options.abandon_live_dispatches && !options.force) {
+      fail('`--abandon-live-dispatches` requires `--force`');
+    }
+    if (liveDispatches.length > 0 && !options.abandon_live_dispatches) {
+      fail(`refusing to archive ${project} while runtime dispatches are still live (${liveDispatches.join(', ')}); rerun with --force --abandon-live-dispatches to archive anyway`);
     }
 
     const archiveMode = options.mode === 'full' ? 'full' : 'compact';
@@ -11101,6 +12040,9 @@ function runArchive(projectSelector, options = {}) {
     if (clearedActive) {
       console.log('active: cleared');
     }
+    if (liveDispatches.length > 0 && options.abandon_live_dispatches) {
+      console.log(`abandoned_live_dispatches: ${liveDispatches.join(', ')}`);
+    }
     const manifest = readJson(archivePaths.manifestPath);
     if (manifest.input_snapshot?.missing?.length > 0) {
       console.log(`missing_inputs: ${manifest.input_snapshot.missing.join(', ')}`);
@@ -11125,18 +12067,107 @@ function runRestore(projectSelector) {
     fail(`project directory already exists: ${paths.projectDir}`);
   }
 
-  ensureDir(SMIKE_ROOT);
-  copyTreeFiles(archivePaths.runtimeDir, paths.projectDir);
+  const releaseProjectLock = acquireProjectLock(project, 'restore');
+  try {
+    ensureDir(SMIKE_ROOT);
+    copyTreeFiles(archivePaths.runtimeDir, paths.projectDir);
 
-  console.log(`smike restore: ${project}`);
-  console.log(`project: .smike/${project}`);
-  console.log(`resume: run \`./smike activate ${project}\` then \`./smike\``);
+    try {
+      if (!fs.existsSync(paths.planJsonPath)) {
+        fail(`restored archive is missing PLAN.json: ${paths.planJsonPath}`);
+      }
+      if (!fs.existsSync(paths.statePath)) {
+        fail(`restored archive is missing STATE.json: ${paths.statePath}`);
+      }
+      const plan = readJson(paths.planJsonPath);
+      const { state } = readValidatedState(paths, { persistRepair: true });
+      if (plan.profile !== 'codex') {
+        fail(`profile is ${plan.profile}; restore supports codex profile only`);
+      }
+      const workflowSettings = resolveWorkflowSettings(plan, {});
+      const contracts = buildWorkflowContracts(paths, plan, workflowSettings);
+      syncWorkflowState(state, contracts, workflowSettings);
+      ensureOrchestrationState(state);
+      ensureDiscoveryLog(state);
+      state.updated_at = nowIso();
+      writeProjectStateArtifacts(project, paths, state, plan, plan.spec || state?.planning?.spec_path || project);
+    } catch (error) {
+      fs.rmSync(paths.projectDir, { recursive: true, force: true });
+      throw error;
+    }
+
+    console.log(`smike restore: ${project}`);
+    console.log(`project: .smike/${project}`);
+    console.log(`validated: .smike/${project}/STATE.json`);
+    console.log(`resume: run \`./smike activate ${project}\` then \`./smike\``);
+  } finally {
+    releaseProjectLock();
+  }
+}
+
+function runResetPlanning(projectSelector) {
+  const project = resolveProjectSelector(projectSelector) || projectSelector;
+  const snapshotPaths = getPlanningSnapshotPaths(project);
+  const paths = getProjectPaths(project);
+
+  if (!fs.existsSync(snapshotPaths.snapshotDir) || !fs.existsSync(snapshotPaths.manifestPath)) {
+    fail(`planning snapshot not found for ${project}: .smike-snapshots/${project}/planning-ready`);
+  }
+  if (!fs.existsSync(snapshotPaths.runtimeDir)) {
+    fail(`planning snapshot is missing runtime payload: ${snapshotPaths.runtimeDir}`);
+  }
+
+  const releaseProjectLock = acquireProjectLock(project, 'reset-planning');
+  try {
+    const manifest = readJson(snapshotPaths.manifestPath);
+    const currentStatus = readGitWorkspaceStatus();
+    runGitRestoreHead(currentStatus.tracked_paths || []);
+    for (const relPath of currentStatus.untracked_paths || []) {
+      if (isSmikeManagedWorkspacePath(relPath)) {
+        continue;
+      }
+      removePathIfExists(path.join(REPO_ROOT, relPath));
+    }
+
+    fs.rmSync(paths.projectDir, { recursive: true, force: true });
+    ensureDir(SMIKE_ROOT);
+    copyTreeFiles(snapshotPaths.runtimeDir, paths.projectDir);
+    copyTreeFiles(snapshotPaths.workspaceDir, REPO_ROOT);
+
+    const restoredPlan = fs.existsSync(paths.planJsonPath) ? readJson(paths.planJsonPath) : null;
+    const { state } = readValidatedState(paths, { persistRepair: true });
+    if (restoredPlan?.profile && restoredPlan.profile !== 'codex') {
+      fail(`profile is ${restoredPlan.profile}; reset-planning supports codex profile only`);
+    }
+    const workflowSettings = resolveWorkflowSettings(restoredPlan, {});
+    const contracts = buildWorkflowContracts(paths, restoredPlan, workflowSettings);
+    syncWorkflowState(state, contracts, workflowSettings);
+    ensureOrchestrationState(state);
+    ensureDiscoveryLog(state);
+    state.updated_at = nowIso();
+    writeProjectStateArtifacts(project, paths, state, restoredPlan, restoredPlan?.spec || state?.planning?.spec_path || project);
+
+    setActiveProject({
+      project,
+      spec_path: manifest.spec_path || restoredPlan?.spec || state?.planning?.spec_path || project,
+      context_files: normalizePathList(manifest.context_files || state?.planning?.context_files || []),
+      activated_via: 'planning_snapshot',
+    });
+
+    console.log(`smike reset-planning: ${project}`);
+    console.log(`snapshot: .smike-snapshots/${project}/planning-ready`);
+    console.log(`status: ${state.lifecycle?.status || 'unknown'}`);
+    console.log(`next_command: ${getLifecycleNextCommand(state) || buildAdvanceCommand(project)}`);
+    console.log('workspace_baseline: restored from the saved planning handoff snapshot (git HEAD + untracked files at snapshot time).');
+  } finally {
+    releaseProjectLock();
+  }
 }
 
 function runGc() {
   pruneStaleProjectLocks();
-  const removedTmp = removeTempFiles(SMIKE_ROOT) + removeTempFiles(SMIKE_ARCHIVE_ROOT);
-  const removedEmptyDirs = pruneEmptyDirs(SMIKE_ROOT) + pruneEmptyDirs(SMIKE_ARCHIVE_ROOT);
+  const removedTmp = removeTempFiles(SMIKE_ROOT) + removeTempFiles(SMIKE_ARCHIVE_ROOT) + removeTempFiles(SMIKE_SNAPSHOT_ROOT);
+  const removedEmptyDirs = pruneEmptyDirs(SMIKE_ROOT) + pruneEmptyDirs(SMIKE_ARCHIVE_ROOT) + pruneEmptyDirs(SMIKE_SNAPSHOT_ROOT);
 
   console.log('smike gc: complete');
   console.log(`tmp_removed: ${removedTmp}`);
@@ -11205,6 +12236,10 @@ async function main() {
     await runIntake(args.slice(1));
     return;
   }
+  if (command === 'fresh') {
+    await runFresh([project, ...rest].filter(Boolean));
+    return;
+  }
   if (command === 'recheck') {
     if (!project) {
       fail('project argument is required');
@@ -11265,10 +12300,13 @@ async function main() {
     const options = {
       mode: 'compact',
       force: false,
+      abandon_live_dispatches: false,
     };
     for (const flag of rest) {
       if (flag === '--force') {
         options.force = true;
+      } else if (flag === '--abandon-live-dispatches') {
+        options.abandon_live_dispatches = true;
       } else if (flag.startsWith('--mode=')) {
         const mode = flag.slice('--mode='.length);
         if (mode !== 'compact' && mode !== 'full') {
@@ -11292,6 +12330,16 @@ async function main() {
     runRestore(project);
     return;
   }
+  if (command === 'reset-planning') {
+    if (!project) {
+      fail('project argument is required');
+    }
+    if (rest.length > 0) {
+      fail(`reset-planning does not accept extra arguments: ${rest.join(' ')}`);
+    }
+    runResetPlanning(project);
+    return;
+  }
   if (command === 'gc') {
     if (args.length > 1) {
       fail(`gc does not accept extra arguments: ${args.slice(1).join(' ')}`);
@@ -11300,6 +12348,31 @@ async function main() {
     return;
   }
   if (command === 'validate') {
+    if (project === '--plan-quality' || project === 'plan-quality') {
+      runValidatePlanQuality(rest);
+      return;
+    }
+    if (project === '--plan-quality-fixtures' || project === 'plan-quality-fixtures') {
+      if (rest.length > 0) {
+        fail(`validate --plan-quality-fixtures does not accept extra arguments: ${rest.join(' ')}`);
+      }
+      runValidatePlanQualityFixtures();
+      return;
+    }
+    if (project === '--contracts' || project === 'contracts') {
+      if (rest.length > 0) {
+        fail(`validate --contracts does not accept extra arguments: ${rest.join(' ')}`);
+      }
+      runValidateContracts();
+      return;
+    }
+    if (project === '--compatibility' || project === 'compatibility') {
+      if (rest.length > 0) {
+        fail(`validate --compatibility does not accept extra arguments: ${rest.join(' ')}`);
+      }
+      runValidateCompatibility();
+      return;
+    }
     if (!project) {
       fail('project argument is required');
     }
