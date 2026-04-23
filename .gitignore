@@ -1,4 +1,7 @@
 node_modules
+memories
 .smike
 .smike-archive
+.smike-unsupported
 .smike-test-tmp
+.smike-snapshots

@@ -1,5 +1,7 @@
 # Codebase Unification + Hardening Cleanup
 
+> Historical project spec. It may mention artifacts or workflow details that were valid when written; it is not the live SMIKE runtime contract. Use `README.md` and `scripts/smike/RUNTIME_ORCHESTRATOR.md` for current operator/runtime behavior.
+
 > **SMIKE spec.**
 > Canonical project slug: `spec-codebase-unification-cleanup`
 > Primary refs:

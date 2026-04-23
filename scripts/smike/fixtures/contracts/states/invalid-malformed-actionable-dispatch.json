@@ -1,0 +1,150 @@
+{
+  "$schema": "../../scripts/smike/schemas/state.schema.json",
+  "schema_version": "2.1.0",
+  "profile": "codex",
+  "project": "fixture-invalid-actionable-dispatch",
+  "created_at": "2026-04-23T00:00:00.000Z",
+  "updated_at": "2026-04-23T00:00:00.000Z",
+  "planning": {
+    "status": "complete",
+    "intake_prompt": null,
+    "clarifying_questions": [],
+    "spec_path": "docs/spec-smike-runtime-acceptance.md",
+    "spec_hash": "fixture-spec-hash",
+    "planning_context_hash": "fixture-context-hash",
+    "draft_correction": null,
+    "verification": {
+      "checked_at": "2026-04-23T00:00:00.000Z",
+      "stale": false,
+      "reason": null,
+      "source_paths": [
+        "docs/spec-smike-runtime-acceptance.md"
+      ],
+      "verification_paths": [],
+      "stale_outputs": []
+    },
+    "analysis": {
+      "checker_result": "pass",
+      "auditor_result": "pass",
+      "blocking_findings": []
+    }
+  },
+  "current_plan": {
+    "plan_id": "01",
+    "plan_json": ".smike/fixture-invalid-actionable-dispatch/phases/01/01-PLAN.json",
+    "plan_md": ".smike/fixture-invalid-actionable-dispatch/phases/01/01-PLAN.md",
+    "depends_on": [],
+    "status": "pending"
+  },
+  "lifecycle": {
+    "status": "awaiting_runtime_dispatch",
+    "cycle_count": 1,
+    "last_started_at": null,
+    "last_completed_at": null,
+    "last_result": null,
+    "next_action": "Spawn executor",
+    "stop_reason": "awaiting_runtime_dispatch",
+    "next_command": "./smike advance fixture-invalid-actionable-dispatch",
+    "advance_behavior": "spawn_only",
+    "advance_behavior_detail": "Spawn the current actionable runtime dispatch."
+  },
+  "workflow": {
+    "auto_continue": true,
+    "stop_on_failure": true,
+    "max_phases_per_run": 10,
+    "plans": [
+      {
+        "plan_id": "01",
+        "plan_json": ".smike/fixture-invalid-actionable-dispatch/phases/01/01-PLAN.json",
+        "plan_md": ".smike/fixture-invalid-actionable-dispatch/phases/01/01-PLAN.md",
+        "depends_on": [],
+        "status": "pending"
+      }
+    ],
+    "dependency_blockers": [],
+    "actionable_dependency_targets": [],
+    "dependency_next_action": null
+  },
+  "history": [],
+  "gotchas": [],
+  "propagated_discoveries": [],
+  "orchestration": {
+    "stage": "execution",
+    "active_role": null,
+    "last_role": null,
+    "next_role": "executor",
+    "discovery_propagation": true,
+    "role_history": [],
+    "runtime_dispatches": {
+      "by_id": {
+        "01-executor": {
+          "dispatch_id": "01-executor",
+          "plan_id": "01",
+          "role": "executor",
+          "group": 1,
+          "current": true,
+          "status": "queued",
+          "capsule_json": ".smike/fixture-invalid-actionable-dispatch/capsules/01-executor.json",
+          "freshness": {
+            "status": "pending",
+            "checked_at": null,
+            "reason": null
+          }
+        }
+      }
+    },
+    "runtime_dispatch_view": {
+      "actionable_plan": {
+        "plan_id": "01",
+        "plan_ids": [
+          "01"
+        ],
+        "group": 1,
+        "completable_group": "none",
+        "plan_json": ".smike/fixture-invalid-actionable-dispatch/phases/01/01-PLAN.json",
+        "stage": "execution"
+      },
+      "ready_dispatches": [
+        {
+          "dispatch_id": "01-executor",
+          "plan_id": "01",
+          "plan_ids": [
+            "01"
+          ],
+          "role": "executor",
+          "status": "queued",
+          "freshness": "pending",
+          "capsule_json": ".smike/fixture-invalid-actionable-dispatch/capsules/01-executor.json"
+        }
+      ],
+      "dispatch_counts": {
+        "tracked": 1,
+        "ready": 1,
+        "active": 0,
+        "failed": 0,
+        "completed": 0
+      },
+      "delegation": {
+        "mode": "runtime_subagents",
+        "owner": "runtime_orchestrator",
+        "result_artifacts": []
+      }
+    },
+    "current_actionable_dispatch": {
+      "dispatch_id": "01-executor",
+      "plan_id": "01",
+      "plan_ids": [
+        "01"
+      ],
+      "role": "executor",
+      "status": "queued",
+      "freshness": "pending",
+      "capsule_json": ".smike/fixture-invalid-actionable-dispatch/capsules/01-executor.json"
+    },
+    "current_actionable_capsule": ".smike/fixture-invalid-actionable-dispatch/capsules/01-executor.json",
+    "capsules": {
+      "latest_by_role": {},
+      "by_plan": {}
+    }
+  }
+}

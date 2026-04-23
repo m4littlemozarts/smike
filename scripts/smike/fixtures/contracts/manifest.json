@@ -1,0 +1,80 @@
+{
+  "fixtures": [
+    {
+      "id": "plan-valid-parallel",
+      "kind": "plan",
+      "path": "plans/valid-parallel-plan.json",
+      "expect_valid": true
+    },
+    {
+      "id": "plan-invalid-scope-and-command-drift",
+      "kind": "plan",
+      "path": "plans/invalid-scope-and-command-drift.json",
+      "expect_valid": false,
+      "expected_errors": [
+        "allowed_files must contain every write_scope.allowed_files entry",
+        "blocked_files must match write_scope.blocked_files",
+        "command id reused across verify_commands and postflight.commands: verify-routing",
+        "acceptance_criteria[AC-2] references unknown command id: verify-workers",
+        "acceptance_criteria[AC-2] signal references unknown command id: verify-workers"
+      ]
+    },
+    {
+      "id": "state-valid-planning-draft",
+      "kind": "state",
+      "path": "states/valid-planning-draft.json",
+      "expect_valid": true
+    },
+    {
+      "id": "state-valid-awaiting-fresh-session",
+      "kind": "state",
+      "path": "states/valid-awaiting-fresh-session.json",
+      "expect_valid": true
+    },
+    {
+      "id": "state-valid-awaiting-runtime-dispatch",
+      "kind": "state",
+      "path": "states/valid-awaiting-runtime-dispatch.json",
+      "expect_valid": true
+    },
+    {
+      "id": "state-valid-complete",
+      "kind": "state",
+      "path": "states/valid-complete.json",
+      "expect_valid": true
+    },
+    {
+      "id": "state-invalid-missing-lifecycle-authority",
+      "kind": "state",
+      "path": "states/invalid-missing-lifecycle-authority.json",
+      "expect_valid": false,
+      "expected_errors": [
+        "STATE.json lifecycle.next_command must have required property 'next_command'",
+        "STATE.json lifecycle.advance_behavior must have required property 'advance_behavior'",
+        "STATE.json lifecycle.advance_behavior_detail must have required property 'advance_behavior_detail'",
+        "STATE.json lifecycle.stop_reason must have required property 'stop_reason'"
+      ]
+    },
+    {
+      "id": "state-invalid-malformed-actionable-dispatch",
+      "kind": "state",
+      "path": "states/invalid-malformed-actionable-dispatch.json",
+      "expect_valid": false,
+      "expected_errors": [
+        "STATE.json orchestration.runtime_dispatch_view.ready_dispatches.0.group must have required property 'group'",
+        "STATE.json orchestration.current_actionable_dispatch.group must have required property 'group'"
+      ]
+    },
+    {
+      "id": "state-invalid-projection-drift",
+      "kind": "state",
+      "path": "states/invalid-projection-drift.json",
+      "expect_valid": false,
+      "expected_errors": [
+        "runtime_dispatch_view.ready_dispatches references unknown dispatch_id: missing-dispatch",
+        "runtime_dispatch_view.dispatch_counts.ready does not match runtime dispatch state: expected 1, got 3",
+        "runtime_dispatch_view.dispatch_counts.tracked does not match runtime dispatch state: expected 1, got 2"
+      ]
+    }
+  ]
+}

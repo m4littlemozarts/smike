@@ -1,0 +1,1 @@
+For SMIKE ingestion-plan drafting from a normal non-SMIKE planning session, start with `scripts/smike/SPEC_PREP_BRIEF.md`. For the full prompt and parser contract, see `scripts/smike/SPEC_AUTHORING.md#planning-design-prompt`.

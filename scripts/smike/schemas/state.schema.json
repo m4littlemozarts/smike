@@ -50,6 +50,39 @@
         "failed"
       ]
     },
+    "lifecycleAdvanceBehavior": {
+      "type": "string",
+      "enum": [
+        "follow_next_command",
+        "stop_at_fresh_session_gate",
+        "spawn_only",
+        "reconcile_dispatches",
+        "execute_state_machine"
+      ]
+    },
+    "runtimeRole": {
+      "type": "string",
+      "enum": [
+        "strategist",
+        "detailer",
+        "checker",
+        "auditor",
+        "executor",
+        "judge",
+        "reviewer",
+        "fixer"
+      ]
+    },
+    "runtimeDispatchStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "spawned",
+        "completed",
+        "stale",
+        "failed"
+      ]
+    },
     "dependencyRef": {
       "type": "string",
       "pattern": "^(?:[^:\\s]+|[^:\\s]+:[^:\\s]+)$"
@@ -107,9 +140,40 @@
         }
       }
     },
+    "dependencyBlocker": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "plan_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "unmet_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "actionableDependencyTarget": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "plan_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
     "dispatchFreshness": {
       "type": "object",
       "additionalProperties": true,
+      "required": [
+        "status"
+      ],
       "properties": {
         "status": {
           "type": "string",
@@ -129,9 +193,89 @@
         }
       }
     },
+    "runtimeDispatchOwner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "host": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "command": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "claimed_at": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "lease_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "lease_expires_at": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "dispatchCompletionRequirements": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "require_artifact_change": {
+          "type": "boolean"
+        },
+        "artifact_requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "path": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "json",
+                  "text",
+                  "file"
+                ]
+              },
+              "must_exist": {
+                "type": "boolean"
+              },
+              "must_be_nonempty": {
+                "type": "boolean"
+              },
+              "must_parse_json": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
     "runtimeDispatchEntry": {
       "type": "object",
       "additionalProperties": true,
+      "required": [
+        "dispatch_id",
+        "plan_id",
+        "role",
+        "group",
+        "status"
+      ],
       "properties": {
         "dispatch_id": {
           "$ref": "#/$defs/nonEmptyString"
@@ -140,17 +284,7 @@
           "$ref": "#/$defs/nonEmptyString"
         },
         "role": {
-          "type": "string",
-          "enum": [
-            "strategist",
-            "detailer",
-            "checker",
-            "auditor",
-            "executor",
-            "judge",
-            "reviewer",
-            "fixer"
-          ]
+          "$ref": "#/$defs/runtimeRole"
         },
         "group": {
           "type": "integer",
@@ -160,55 +294,179 @@
           "type": "boolean"
         },
         "status": {
-          "type": "string",
-          "enum": [
-            "queued",
-            "spawned",
-            "completed",
-            "stale",
-            "failed"
-          ]
+          "$ref": "#/$defs/runtimeDispatchStatus"
         },
         "freshness": {
           "$ref": "#/$defs/dispatchFreshness"
         },
         "completion_requirements": {
-          "type": "object",
-          "additionalProperties": true,
-          "properties": {
-            "require_artifact_change": {
-              "type": "boolean"
+          "$ref": "#/$defs/dispatchCompletionRequirements"
+        }
+      }
+    },
+    "runtimeDispatchViewActionablePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plan_id",
+        "plan_ids",
+        "group",
+        "completable_group"
+      ],
+      "properties": {
+        "plan_id": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "plan_ids": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "group": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "completable_group": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
             },
-            "artifact_requirements": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": true,
-                "properties": {
-                  "path": {
-                    "$ref": "#/$defs/nonEmptyString"
-                  },
-                  "kind": {
-                    "type": "string",
-                    "enum": [
-                      "json",
-                      "text",
-                      "file"
-                    ]
-                  },
-                  "must_exist": {
-                    "type": "boolean"
-                  },
-                  "must_be_nonempty": {
-                    "type": "boolean"
-                  },
-                  "must_parse_json": {
-                    "type": "boolean"
-                  }
-                }
-              }
+            {
+              "type": "string",
+              "enum": [
+                "mixed",
+                "none"
+              ]
             }
-          }
+          ]
+        },
+        "plan_json": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "stage": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "runtimeDispatchCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracked",
+        "ready",
+        "active",
+        "failed",
+        "completed"
+      ],
+      "properties": {
+        "tracked": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ready": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "currentActionableDispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch_id",
+        "plan_id",
+        "role",
+        "group",
+        "status"
+      ],
+      "properties": {
+        "dispatch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "plan_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "plan_ids": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "role": {
+          "$ref": "#/$defs/runtimeRole"
+        },
+        "group": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "$ref": "#/$defs/runtimeDispatchStatus"
+        },
+        "active_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/runtimeDispatchOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/runtimeDispatchOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "freshness": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "pending",
+            "fresh",
+            "stale",
+            "missing",
+            "unchanged",
+            null
+          ]
+        },
+        "capsule_json": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "agent_type_hint": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "reasoning_effort_hint": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "result_artifacts": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "completion_requirements": {
+          "$ref": "#/$defs/dispatchCompletionRequirements"
+        },
+        "instruction": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "lease_expires_at": {
+          "$ref": "#/$defs/nullableString"
         }
       }
     }
@@ -229,9 +487,128 @@
     "updated_at": {
       "$ref": "#/$defs/nonEmptyString"
     },
-    "current_plan": {
+    "planning": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "properties": {
+        "verification": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "checked_at": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "reason": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "source_paths": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "verification_paths": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "stale_outputs": {
+              "$ref": "#/$defs/stringArray"
+            }
+          }
+        },
+        "analysis": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "checker_result": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "auditor_result": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "blocking_findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "source": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  },
+                  "id": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  },
+                  "title": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  },
+                  "severity": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "intake_prompt": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "clarifying_questions": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "spec_path": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "spec_hash": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "planning_context_hash": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "draft_correction": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "summary": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "questions": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "blockers": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "fix_targets": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "action_plan": {
+              "$ref": "#/$defs/stringArray"
+            },
+            "phase_requirements": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "plan_id": {
+                    "$ref": "#/$defs/nonEmptyString"
+                  },
+                  "issues": {
+                    "$ref": "#/$defs/stringArray"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "current_plan": {
+      "$ref": "#/$defs/workflowPlan"
     },
     "lifecycle": {
       "type": "object",
@@ -277,8 +654,91 @@
         },
         "next_command": {
           "$ref": "#/$defs/nullableString"
+        },
+        "advance_behavior": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/lifecycleAdvanceBehavior"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "advance_behavior_detail": {
+          "$ref": "#/$defs/nullableString"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "awaiting_runtime_dispatch"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "next_command",
+              "advance_behavior",
+              "advance_behavior_detail",
+              "stop_reason"
+            ],
+            "properties": {
+              "next_command": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "advance_behavior": {
+                "$ref": "#/$defs/lifecycleAdvanceBehavior"
+              },
+              "advance_behavior_detail": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "stop_reason": {
+                "$ref": "#/$defs/nonEmptyString"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "awaiting_fresh_session"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "next_command",
+              "advance_behavior",
+              "advance_behavior_detail",
+              "stop_reason"
+            ],
+            "properties": {
+              "next_command": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "advance_behavior": {
+                "$ref": "#/$defs/lifecycleAdvanceBehavior"
+              },
+              "advance_behavior_detail": {
+                "$ref": "#/$defs/nonEmptyString"
+              },
+              "stop_reason": {
+                "$ref": "#/$defs/nonEmptyString"
+              }
+            }
+          }
+        }
+      ]
     },
     "workflow": {
       "type": "object",
@@ -305,6 +765,21 @@
           "items": {
             "$ref": "#/$defs/workflowPlan"
           }
+        },
+        "dependency_blockers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dependencyBlocker"
+          }
+        },
+        "actionable_dependency_targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/actionableDependencyTarget"
+          }
+        },
+        "dependency_next_action": {
+          "$ref": "#/$defs/nullableString"
         }
       }
     },
@@ -398,6 +873,9 @@
         "runtime_dispatches": {
           "type": "object",
           "additionalProperties": true,
+          "required": [
+            "by_id"
+          ],
           "properties": {
             "by_id": {
               "type": "object",
@@ -416,40 +894,25 @@
                 "object",
                 "null"
               ],
-              "additionalProperties": true
+              "allOf": [
+                {
+                  "if": {
+                    "type": "object"
+                  },
+                  "then": {
+                    "$ref": "#/$defs/runtimeDispatchViewActionablePlan"
+                  }
+                }
+              ]
             },
             "ready_dispatches": {
               "type": "array",
               "items": {
-                "type": "object",
-                "additionalProperties": true
+                "$ref": "#/$defs/currentActionableDispatch"
               }
             },
             "dispatch_counts": {
-              "type": "object",
-              "additionalProperties": true,
-              "properties": {
-                "tracked": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "ready": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "active": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "failed": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "completed": {
-                  "type": "integer",
-                  "minimum": 0
-                }
-              }
+              "$ref": "#/$defs/runtimeDispatchCounts"
             },
             "delegation": {
               "type": "object",
@@ -462,7 +925,16 @@
             "object",
             "null"
           ],
-          "additionalProperties": true
+          "allOf": [
+            {
+              "if": {
+                "type": "object"
+              },
+              "then": {
+                "$ref": "#/$defs/currentActionableDispatch"
+              }
+            }
+          ]
         },
         "current_actionable_capsule": {
           "$ref": "#/$defs/nullableString"

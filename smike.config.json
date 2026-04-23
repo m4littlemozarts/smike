@@ -1,0 +1,6 @@
+{
+  "framework_dir": ".",
+  "portability_heuristics": {
+    "default_verify_family": "python"
+  }
+}

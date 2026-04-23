@@ -6,11 +6,23 @@ import {
   tokenize,
   topologicalOrder,
 } from './planning-analysis-utils.mjs';
+import {
+  createPortabilityHeuristics,
+  DEFAULT_GENERIC_VERIFY_COMMAND_IDS,
+} from './portability-heuristics.mjs';
 
-const GENERIC_VERIFY_COMMAND_IDS = new Set(['typecheck', 'unit-tests', 'doc-paths', 'phase-ready', 'research-artifacts']);
+const portabilityHeuristics = createPortabilityHeuristics();
 
 function ensureArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function uniqueStrings(values) {
+  return [...new Set(
+    ensureArray(values)
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  )];
 }
 
 function normalizeSentence(value) {
@@ -21,13 +33,9 @@ function normalizeSentence(value) {
     .trim();
 }
 
-function hasCodeScope(plan) {
-  return plan.allowed_files.some((filePath) => /^(packages|tests|scripts)\//.test(filePath));
-}
-
 function usesOnlyGenericVerification(plan) {
   return plan.verify_commands.length > 0
-    && plan.verify_commands.every((command) => GENERIC_VERIFY_COMMAND_IDS.has(command.id));
+    && plan.verify_commands.every((command) => DEFAULT_GENERIC_VERIFY_COMMAND_IDS.has(command.id));
 }
 
 function isFallbackPhaseScope(plan) {
@@ -61,6 +69,94 @@ function buildPlanCoverageText(plan) {
     .join(' ');
 }
 
+function buildWriteScopeReferenceTokens(plan) {
+  return uniqueStrings(
+    ensureArray([
+      ...ensureArray(plan.allowed_files),
+      ...ensureArray(plan.write_scope_allowed_files),
+    ])
+      .filter((entry) => portabilityHeuristics.isLikelySourcePath(entry))
+      .flatMap((entry) => tokenize(String(entry || ''))),
+  ).filter((token) => !new Set(['src', 'lib', 'app', 'apps', 'packages', 'routes', 'scripts', 'tests']).has(token));
+}
+
+function normalizePathEntry(value) {
+  return String(value || '').replaceAll('\\', '/').replace(/^\.\//, '').trim();
+}
+
+function collectWriteScopeEntries(plan) {
+  return uniqueStrings([
+    ...ensureArray(plan.allowed_files),
+    ...ensureArray(plan.write_scope_allowed_files),
+  ]).map((entry) => normalizePathEntry(entry));
+}
+
+function hasWildcard(entry) {
+  return /[*?[{]/.test(String(entry || ''));
+}
+
+function isConventionalRouteScopeEntry(entry) {
+  const normalized = normalizePathEntry(entry);
+  if (!normalized || hasWildcard(normalized) || !portabilityHeuristics.isLikelySourcePath(normalized)) {
+    return false;
+  }
+  return /(^|\/)routes\/[^/]+\.[^/]+$/i.test(normalized);
+}
+
+function isLikelyRouteWiringEntry(entry) {
+  const normalized = normalizePathEntry(entry);
+  if (!normalized || hasWildcard(normalized) || !portabilityHeuristics.isLikelySourcePath(normalized)) {
+    return false;
+  }
+  return /(^|\/)(app|server|main|index|router|routes|worker|entry)\.[^/]+$/i.test(normalized)
+    || /(^|\/)(app|server|main|router|routes)\/index\.[^/]+$/i.test(normalized);
+}
+
+function planHasConventionalRouteScope(plan) {
+  return collectWriteScopeEntries(plan).some((entry) => isConventionalRouteScopeEntry(entry));
+}
+
+function planHasRouteWiringScope(plan) {
+  return collectWriteScopeEntries(plan).some((entry) => isLikelyRouteWiringEntry(entry));
+}
+
+function routeVerificationNeedsBehavioralProof(plan) {
+  if (!planHasConventionalRouteScope(plan)) {
+    return false;
+  }
+  const verifyCommands = ensureArray(plan.verify_commands);
+  if (verifyCommands.length === 0) {
+    return true;
+  }
+  return !verifyCommands.some((command) => portabilityHeuristics.looksLikeBehavioralVerificationCommand(command));
+}
+
+function verificationLooksDetachedFromCodeScope(plan) {
+  if (!portabilityHeuristics.planHasCodeScope(plan)) {
+    return false;
+  }
+
+  const verifyCommands = ensureArray(plan.verify_commands);
+  if (verifyCommands.length === 0) {
+    return false;
+  }
+  if (verifyCommands.some((command) => portabilityHeuristics.looksLikeVerificationCoverageCommand(command) || portabilityHeuristics.looksLikeTestVerificationCommand(command))) {
+    return false;
+  }
+
+  const scopeTokens = buildWriteScopeReferenceTokens(plan);
+  if (scopeTokens.length === 0) {
+    return false;
+  }
+
+  const verifyText = verifyCommands
+    .flatMap((command) => [command?.id, command?.run])
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+
+  return !scopeTokens.some((token) => verifyText.includes(token));
+}
+
 function coverageRatio(requirement, plan) {
   const requirementTokens = tokenize(requirement);
   if (requirementTokens.length === 0) {
@@ -86,10 +182,7 @@ function rankRequirementCoverage(requirement, phasePlans) {
 }
 
 function getFirstPhaseContractItems(bundle) {
-  if (Array.isArray(bundle?.first_phase_contract_items) && bundle.first_phase_contract_items.length > 0) {
-    return bundle.first_phase_contract_items;
-  }
-  return Array.isArray(bundle?.recommended_first_phase_items) ? bundle.recommended_first_phase_items : [];
+  return Array.isArray(bundle?.first_phase_contract_items) ? bundle.first_phase_contract_items : [];
 }
 
 export function createBuildPlanningCheckerRecord({
@@ -100,7 +193,7 @@ export function createBuildPlanningCheckerRecord({
     const explicitDependencies = phasePlans.some((plan) => (plan.metadata?.dependency_mode || plan.dependency_mode) === 'explicit');
     const planIds = new Set(phasePlans.map((plan) => plan.plan_id));
     const topological = topologicalOrder(phasePlans);
-    const codeScopedPlans = phasePlans.filter((plan) => hasCodeScope(plan));
+    const codeScopedPlans = phasePlans.filter((plan) => portabilityHeuristics.planHasCodeScope(plan));
     const broadImplementationBundle = bundle.mode !== 'research'
       && (
         codeScopedPlans.length >= 2
@@ -162,7 +255,7 @@ export function createBuildPlanningCheckerRecord({
         });
       }
 
-      const codeScope = hasCodeScope(plan);
+      const codeScope = portabilityHeuristics.planHasCodeScope(plan);
       const onlyGenericVerification = usesOnlyGenericVerification(plan);
       if (codeScope && onlyGenericVerification) {
         findings.push({
@@ -170,6 +263,36 @@ export function createBuildPlanningCheckerRecord({
           severity: 'low',
           title: `Plan ${plan.plan_id} uses only generic verification commands`,
           details: 'Phase verification is limited to reusable defaults. Add a phase-specific check when the slice has a specialized risk surface.',
+          origin: 'checker',
+        });
+      }
+
+      if (verificationLooksDetachedFromCodeScope(plan)) {
+        findings.push({
+          id: `detached-proof-${plan.plan_id}`,
+          severity: 'medium',
+          title: `Plan ${plan.plan_id} proof surface is detached from the code-bearing write scope`,
+          details: 'Verification commands do not reference code-bearing write-scope targets and do not run tests, builds, or other coverage commands. Tighten the proof surface before execution can pass.',
+          origin: 'checker',
+        });
+      }
+
+      if (routeVerificationNeedsBehavioralProof(plan)) {
+        findings.push({
+          id: `route-behavioral-proof-gap-${plan.plan_id}`,
+          severity: 'medium',
+          title: `Plan ${plan.plan_id} route verification is inspection-only`,
+          details: 'This phase owns conventional route modules, but its proof surface is limited to grep/printf-style inspection or other non-behavioral commands. Add a behavioral route check such as an HTTP/request assertion, test run, or executable proof script before planning can pass.',
+          origin: 'checker',
+        });
+      }
+
+      if (planHasConventionalRouteScope(plan) && !planHasRouteWiringScope(plan)) {
+        findings.push({
+          id: `route-wiring-scope-${plan.plan_id}`,
+          severity: 'medium',
+          title: `Plan ${plan.plan_id} route scope omits likely router wiring ownership`,
+          details: 'This phase owns conventional route files under a routes/ directory, but no likely router or entrypoint file is in write scope. Add the registration surface (for example app.ts, server.ts, router.ts, or index.ts) or narrow the route scope so the wiring assumption is explicit.',
           origin: 'checker',
         });
       }

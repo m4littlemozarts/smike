@@ -1,0 +1,36 @@
+{
+  "fixtures": [
+    {
+      "id": "valid-single-doc-slice",
+      "path": "specs/valid-single-doc-slice.md",
+      "expect_ready": true
+    },
+    {
+      "id": "invalid-missing-priority-summary",
+      "path": "specs/invalid-missing-priority-summary.md",
+      "expect_ready": false,
+      "expected_blockers": [
+        "concrete phase summary"
+      ]
+    },
+    {
+      "id": "invalid-generic-proof",
+      "path": "specs/invalid-generic-proof.md",
+      "expect_ready": false,
+      "expected_blockers": [
+        "generic verify command"
+      ]
+    },
+    {
+      "id": "invalid-context-only-objective",
+      "path": "specs/invalid-context-only-objective.md",
+      "context_files": [
+        "context/objective-context.md"
+      ],
+      "expect_ready": false,
+      "expected_blockers": [
+        "spec-missing-objective"
+      ]
+    }
+  ]
+}

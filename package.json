@@ -2,6 +2,16 @@
   "name": "smike-framework",
   "private": true,
   "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 scripts/smike/lib/*.test.mjs scripts/smike/*.test.mjs",
+    "test:cli": "npm run test:cli:contracts && npm run test:cli:operator && npm run test:cli:planning",
+    "test:cli:contracts": "node --test --test-concurrency=1 scripts/smike/cli-compatibility.test.mjs scripts/smike/cli-contracts.test.mjs scripts/smike/cli-plan-quality.test.mjs",
+    "test:cli:operator": "node --test --test-concurrency=1 scripts/smike/cli-operator-surface.test.mjs",
+    "test:cli:planning": "node --test --test-concurrency=1 scripts/smike/cli-planning-draft.test.mjs",
+    "test:lib": "node --test scripts/smike/lib/*.test.mjs",
+    "validate": "npm test"
+  },
   "dependencies": {
     "ajv": "8.18.0"
   },

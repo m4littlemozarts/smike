@@ -5,6 +5,28 @@
   "project": "replace-with-project-name",
   "created_at": "1970-01-01T00:00:00.000Z",
   "updated_at": "1970-01-01T00:00:00.000Z",
+  "planning": {
+    "status": null,
+    "intake_prompt": null,
+    "clarifying_questions": [],
+    "spec_path": null,
+    "spec_hash": null,
+    "planning_context_hash": null,
+    "draft_correction": null,
+    "verification": {
+      "checked_at": null,
+      "stale": false,
+      "reason": null,
+      "source_paths": [],
+      "verification_paths": [],
+      "stale_outputs": []
+    },
+    "analysis": {
+      "checker_result": null,
+      "auditor_result": null,
+      "blocking_findings": []
+    }
+  },
   "current_plan": {
     "plan_id": "replace-with-plan-id",
     "plan_json": ".smike/<project>/PLAN.json",
@@ -17,13 +39,18 @@
     "last_started_at": null,
     "last_completed_at": null,
     "last_result": null,
-    "next_action": "Run `./smike cycle <project>`"
+    "next_action": "Run `./smike cycle <project>`",
+    "advance_behavior": "follow_next_command",
+    "advance_behavior_detail": "Use the recorded next_command as authority for this state."
   },
   "workflow": {
     "auto_continue": true,
     "stop_on_failure": true,
     "max_phases_per_run": 10,
-    "plans": []
+    "plans": [],
+    "dependency_blockers": [],
+    "actionable_dependency_targets": [],
+    "dependency_next_action": null
   },
   "history": [],
   "gotchas": [],

@@ -18,12 +18,12 @@ export function createBuildPlanningAuditorRecord({
         scope: [
           ...bundle.constraints,
           ...bundle.phase_blueprints.map((phase) => `${phase.id} ${phase.title} ${phase.summary}`),
-          'ROADMAP PLAN-GRAPH STRATEGY PLAN',
+          'PLAN-GRAPH PLAN',
         ].join(' '),
         allowed_files: [],
         write_scope_allowed_files: ['.smike/**'],
         delegation: {
-          result_artifacts: ['ROADMAP.md', 'PLAN-GRAPH.json', 'STRATEGY.md', 'PLAN.md'],
+          result_artifacts: ['PLAN.json', 'PLAN-GRAPH.json', 'PLAN.md'],
         },
       },
       ...phasePlans,
@@ -83,5 +83,3 @@ export function createBuildPlanningAuditorRecord({
     };
   };
 }
-
-export const createBuildPlanningAuditRecord = createBuildPlanningAuditorRecord;

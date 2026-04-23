@@ -138,39 +138,118 @@ test('checker allows a substantive first phase with specific verification', () =
   assert.equal(record.result, 'pass');
 });
 
-test('checker still honors the legacy recommended-first-phase alias', () => {
+test('checker treats src and service layouts as code-bearing scope', () => {
   const bundle = {
     lint: { findings: [] },
     mode: 'implementation',
-    deliverables: [
-      'schema + shared types',
-      'seed import tooling',
-    ],
+    deliverables: ['python service route'],
     integration_requirements: [],
-    recommended_first_phase_items: [
-      'create schema',
-      'create shared types',
-      'import current curated sources',
-    ],
+    first_phase_contract_items: [],
   };
 
   const phasePlans = [
     makePlan({
       plan_id: '01',
-      objective: 'Schema + shared types + seed import',
-      scope: 'Create the schema, shared types, and curated seed import path.',
+      objective: 'Python service handler',
+      scope: 'Update the service entrypoint and request handler.',
+      allowed_files: ['src/service.py', 'services/api/**'],
       verify_commands: [
         { id: 'typecheck' },
-        { id: 'seed-import-proof' },
+        { id: 'unit-tests' },
       ],
     }),
   ];
 
   const record = buildChecker(bundle, phasePlans);
-  const ids = new Set(record.findings.map((finding) => finding.id));
+  const finding = record.findings.find((entry) => entry.id === 'generic-verification-01');
 
-  assert.equal(record.result, 'pass');
-  assert.equal(ids.has('first-phase-misaligned'), false);
+  assert.equal(finding?.title, 'Plan 01 uses only generic verification commands');
+});
+
+test('checker blocks code-bearing phases whose proof commands only inspect planning artifacts', () => {
+  const bundle = {
+    lint: { findings: [] },
+    mode: 'implementation',
+    deliverables: ['auth bootstrap', 'send route'],
+    integration_requirements: [],
+    first_phase_contract_items: [],
+  };
+
+  const phasePlans = [
+    makePlan({
+      plan_id: '01',
+      objective: 'Auth bootstrap',
+      scope: 'Implement auth bootstrap and domain discovery boundaries.',
+      allowed_files: ['src/auth/token.ts', 'src/routes/domains.ts', 'src/app.ts'],
+      verify_commands: [
+        { id: 'verify-1', run: 'rg -n "wrong-scope bearer" plan-email-mcp.md .smike/demo/STATE.md' },
+      ],
+    }),
+  ];
+
+  const record = buildChecker(bundle, phasePlans);
+  const finding = record.findings.find((entry) => entry.id === 'detached-proof-01');
+
+  assert.equal(record.result, 'concerns');
+  assert.equal(finding?.severity, 'medium');
+});
+
+test('checker blocks conventional route slices that only use inspection-style proof commands', () => {
+  const bundle = {
+    lint: { findings: [] },
+    mode: 'implementation',
+    deliverables: ['domain discovery route'],
+    integration_requirements: [],
+    first_phase_contract_items: [],
+  };
+
+  const phasePlans = [
+    makePlan({
+      plan_id: '01',
+      objective: 'Domain discovery route',
+      scope: 'Tighten GET /v1/domains auth behavior.',
+      allowed_files: ['src/routes/domains.ts', 'src/app.ts'],
+      write_scope_allowed_files: ['src/routes/domains.ts', 'src/app.ts'],
+      verify_commands: [
+        { id: 'route-proof', run: 'rg -n "wrong-scope bearer" plan-email-mcp.md src/routes/domains.ts' },
+      ],
+    }),
+  ];
+
+  const record = buildChecker(bundle, phasePlans);
+  const finding = record.findings.find((entry) => entry.id === 'route-behavioral-proof-gap-01');
+
+  assert.equal(record.result, 'concerns');
+  assert.equal(finding?.severity, 'medium');
+});
+
+test('checker flags route slices that omit likely router wiring surfaces from write scope', () => {
+  const bundle = {
+    lint: { findings: [] },
+    mode: 'implementation',
+    deliverables: ['send route'],
+    integration_requirements: [],
+    first_phase_contract_items: [],
+  };
+
+  const phasePlans = [
+    makePlan({
+      plan_id: '02',
+      objective: 'Send route',
+      scope: 'Add the outbound send route.',
+      allowed_files: ['src/routes/send.ts', 'src/email/send.ts'],
+      write_scope_allowed_files: ['src/routes/send.ts', 'src/email/send.ts'],
+      verify_commands: [
+        { id: 'send-http-proof', run: 'node scripts/verify-send-route.mjs' },
+      ],
+    }),
+  ];
+
+  const record = buildChecker(bundle, phasePlans);
+  const finding = record.findings.find((entry) => entry.id === 'route-wiring-scope-02');
+
+  assert.equal(record.result, 'concerns');
+  assert.equal(finding?.severity, 'medium');
 });
 
 test('checker flags Plan 01 contract items that are owned by later phases', () => {

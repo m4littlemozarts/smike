@@ -248,12 +248,178 @@
         }
       }
     },
+    "planning_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "truth_sources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "production_gate": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "optional_phase": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "phase_order_notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "parallel_groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["group", "phases"],
+            "properties": {
+              "group": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "phases": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "write_surfaces": {
+                "anyOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              "note": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "operator_checkpoints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase", "checkpoint"],
+            "properties": {
+              "phase": {
+                "type": "string",
+                "minLength": 1
+              },
+              "checkpoint": {
+                "type": "string",
+                "minLength": 1
+              },
+              "blocks_final_proof": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
+        "collision_matrix": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["shared_paths", "rule"],
+            "properties": {
+              "shared_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "owner_split": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "rule": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "risk_controls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["risk", "control"],
+            "properties": {
+              "risk": {
+                "type": "string",
+                "minLength": 1
+              },
+              "control": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "explicit_deferrals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "protected_areas": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
     "workflow": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "auto_continue": {
           "type": "boolean"
+        },
+        "fresh_session_gate": {
+          "type": "string",
+          "enum": ["initial_only", "never"]
         },
         "pause_reason": {
           "type": "string",
@@ -275,6 +441,60 @@
         }
       }
     },
+    "execution_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "promotion": {
+              "type": "string",
+              "minLength": 1
+            },
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "follow_on_roles": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "quality": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "judge_rerun_verify": {
+              "type": "boolean"
+            },
+            "review_focus_areas": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "review_anti_patterns": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
     "delegation": {
       "type": "object",
       "additionalProperties": false,
@@ -288,13 +508,6 @@
           "enum": ["smike_runner", "runtime_orchestrator"]
         },
         "runtime_roles": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "dispatch_artifacts": {
           "type": "array",
           "items": {
             "type": "string",

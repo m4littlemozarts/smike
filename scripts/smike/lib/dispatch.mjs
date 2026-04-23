@@ -5,21 +5,6 @@ export function createDispatchHelpers({ safeSlug, normalizePathList, normalizeDi
     return `${safeSlug(planId)}-${safeSlug(role)}`;
   }
 
-  function legacyDispatchIdFor(planId, role, group) {
-    return `${dispatchIdFor(planId, role)}-g${group}`;
-  }
-
-  function getRuntimeDispatchLookupIds(dispatch) {
-    const ids = [dispatch.dispatch_id];
-    if (Number.isInteger(dispatch.group) && dispatch.group >= 1) {
-      const legacyId = legacyDispatchIdFor(dispatch.plan_id, dispatch.role, dispatch.group);
-      if (!ids.includes(legacyId)) {
-        ids.push(legacyId);
-      }
-    }
-    return ids;
-  }
-
   function compareRuntimeDispatchRecency(left, right) {
     const leftTime = Date.parse(left.last_seen_at || left.updated_at || left.created_at || '') || 0;
     const rightTime = Date.parse(right.last_seen_at || right.updated_at || right.created_at || '') || 0;
@@ -36,11 +21,9 @@ export function createDispatchHelpers({ safeSlug, normalizePathList, normalizeDi
   }
 
   function resolveRuntimeDispatchEntry(byId, dispatch) {
-    for (const lookupId of getRuntimeDispatchLookupIds(dispatch)) {
-      const existing = byId[lookupId];
-      if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
-        return rekeyRuntimeDispatchEntry(byId, lookupId, dispatch.dispatch_id, existing);
-      }
+    const existing = byId[dispatch.dispatch_id];
+    if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+      return rekeyRuntimeDispatchEntry(byId, dispatch.dispatch_id, dispatch.dispatch_id, existing);
     }
 
     const matchingEntries = Object.entries(byId)

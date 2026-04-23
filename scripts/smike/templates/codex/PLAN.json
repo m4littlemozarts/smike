@@ -102,17 +102,45 @@
   "postflight": {
     "commands": []
   },
+  "planning_context": {
+    "truth_sources": [],
+    "explicit_deferrals": [],
+    "protected_areas": []
+  },
+  "feature_flags": {
+    "phase_refresh_mode": "lightweight",
+    "implementation_profile": "thin_executor_first",
+    "implementation_runtime_promotion": "complexity_gated_executor_only",
+    "implementation_runtime_follow_on_roles": "local_only"
+  },
   "workflow": {
     "auto_continue": true,
+    "fresh_session_gate": "initial_only",
     "stop_on_failure": true,
     "max_phases_per_run": 10,
     "phase_plans": []
   },
+  "execution_policy": {
+    "profile": "thin_executor_first",
+    "runtime": {
+      "promotion": "complexity_gated_executor_only",
+      "roles": [
+        "executor"
+      ],
+      "follow_on_roles": "local_only"
+    },
+    "quality": {
+      "judge_rerun_verify": true,
+      "review_focus_areas": [
+        "scope_control",
+        "verification_contract"
+      ],
+      "review_anti_patterns": []
+    }
+  },
   "delegation": {
     "mode": "local_only",
     "owner": "smike_runner",
-    "runtime_roles": [],
-    "dispatch_artifacts": [],
     "result_artifacts": []
   },
   "orchestration": {
@@ -135,15 +163,6 @@
         "enabled": true,
         "additional_context": []
       }
-    }
-  },
-  "quality_gates": {
-    "judge": {
-      "rerun_verify": true
-    },
-    "review": {
-      "focus_areas": [],
-      "anti_patterns": []
     }
   }
 }

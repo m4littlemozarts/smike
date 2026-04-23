@@ -1,0 +1,78 @@
+{
+  "$schema": "../../scripts/smike/schemas/plan.schema.json",
+  "schema_version": "2.1.0",
+  "profile": "codex",
+  "plan_id": "framework-contract-broken",
+  "phase": "Execution",
+  "spec": "docs/spec-smike-runtime-acceptance.md",
+  "objective": "Carry an intentionally inconsistent contract fixture.",
+  "scope": "Exercise semantic validation failures for file scope and command references.",
+  "depends_on": [],
+  "allowed_files": [
+    "scripts/smike/routes/**"
+  ],
+  "blocked_files": [
+    ".env*",
+    "secrets/**"
+  ],
+  "write_scope": {
+    "mode": "strict",
+    "allowed_files": [
+      "scripts/smike/routes/**",
+      "scripts/smike/lib/**"
+    ],
+    "blocked_files": [
+      ".env*"
+    ],
+    "reason": "Broken on purpose for contract verifier coverage."
+  },
+  "preflight": {
+    "require_clean_worktree": false,
+    "required_tools": [
+      "node"
+    ],
+    "required_env_vars": []
+  },
+  "verify_commands": [
+    {
+      "id": "verify-routing",
+      "run": "echo routing"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "description": "Routing verification exists.",
+      "command_ids": [
+        "verify-routing"
+      ],
+      "signals": [
+        {
+          "command_id": "verify-routing",
+          "expected_signal": "exit=0"
+        }
+      ]
+    },
+    {
+      "id": "AC-2",
+      "description": "Worker verification is intentionally missing.",
+      "command_ids": [
+        "verify-workers"
+      ],
+      "signals": [
+        {
+          "command_id": "verify-workers",
+          "expected_signal": "exit=0"
+        }
+      ]
+    }
+  ],
+  "postflight": {
+    "commands": [
+      {
+        "id": "verify-routing",
+        "run": "echo duplicate"
+      }
+    ]
+  }
+}

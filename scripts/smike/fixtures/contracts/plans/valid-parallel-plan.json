@@ -1,0 +1,140 @@
+{
+  "$schema": "../../scripts/smike/schemas/plan.schema.json",
+  "schema_version": "2.1.0",
+  "profile": "codex",
+  "plan_id": "framework-contract-parallel",
+  "phase": "Planning",
+  "spec": "docs/spec-smike-runtime-acceptance.md",
+  "objective": "Validate a representative framework plan contract with parallel planning context.",
+  "scope": "Contract verification coverage for parallel groups, checkpoints, and runtime-safe file boundaries.",
+  "depends_on": [],
+  "allowed_files": [
+    "scripts/smike/**",
+    "docs/**"
+  ],
+  "blocked_files": [
+    ".env*",
+    "secrets/**"
+  ],
+  "write_scope": {
+    "mode": "strict",
+    "allowed_files": [
+      "scripts/smike/**",
+      "docs/**"
+    ],
+    "blocked_files": [
+      ".env*",
+      "secrets/**"
+    ],
+    "reason": "Verifier fixture stays inside framework-owned files."
+  },
+  "preflight": {
+    "require_clean_worktree": false,
+    "required_tools": [
+      "node"
+    ],
+    "required_env_vars": []
+  },
+  "verify_commands": [
+    {
+      "id": "verify-validation",
+      "run": "node --test scripts/smike/lib/validation.test.mjs"
+    },
+    {
+      "id": "verify-contracts",
+      "run": "node scripts/smike/cli.mjs validate --contracts"
+    }
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "description": "The validation suite still passes for the framework contract surface.",
+      "command_ids": [
+        "verify-validation"
+      ],
+      "signals": [
+        {
+          "command_id": "verify-validation",
+          "expected_signal": "exit=0"
+        }
+      ]
+    },
+    {
+      "id": "AC-2",
+      "description": "Contract fixtures and templates stay compatible with the live schemas.",
+      "command_ids": [
+        "verify-contracts"
+      ],
+      "signals": [
+        {
+          "command_id": "verify-contracts",
+          "expected_signal": "exit=0"
+        }
+      ]
+    }
+  ],
+  "postflight": {
+    "commands": []
+  },
+  "planning_context": {
+    "truth_sources": [
+      "scripts/smike/cli.mjs",
+      "scripts/smike/schemas/state.schema.json",
+      "scripts/smike/schemas/plan.schema.json"
+    ],
+    "phase_order_notes": [
+      "Lock the contract surface before expanding operator-path heuristics."
+    ],
+    "parallel_groups": [
+      {
+        "group": 1,
+        "phases": [
+          "01",
+          "02"
+        ],
+        "write_surfaces": {
+          "01": [
+            "scripts/smike/schemas/**"
+          ],
+          "02": [
+            "scripts/smike/lib/**"
+          ]
+        },
+        "note": "Schema and validator slices can move in parallel if the contract boundary stays stable."
+      }
+    ],
+    "operator_checkpoints": [
+      {
+        "phase": "02",
+        "checkpoint": "Re-run contract verification before landing stricter schema rules.",
+        "blocks_final_proof": [
+          "verify-contracts"
+        ]
+      }
+    ],
+    "collision_matrix": [
+      {
+        "shared_paths": [
+          "scripts/smike/cli.mjs"
+        ],
+        "owner_split": {
+          "01": "schema surface",
+          "02": "verifier entrypoint"
+        },
+        "rule": "Do not widen runtime mutations while tightening contract fixtures."
+      }
+    ],
+    "risk_controls": [
+      {
+        "risk": "schema drift",
+        "control": "Gate changes through deterministic contract fixtures."
+      }
+    ],
+    "explicit_deferrals": [
+      "Fixture coverage expands before deeper command-handler refactors."
+    ],
+    "protected_areas": [
+      "docs/**"
+    ]
+  }
+}

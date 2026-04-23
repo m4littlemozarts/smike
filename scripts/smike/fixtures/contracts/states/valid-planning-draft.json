@@ -1,0 +1,108 @@
+{
+  "$schema": "../../scripts/smike/schemas/state.schema.json",
+  "schema_version": "2.1.0",
+  "profile": "codex",
+  "project": "fixture-planning-draft",
+  "created_at": "2026-04-23T00:00:00.000Z",
+  "updated_at": "2026-04-23T00:00:00.000Z",
+  "planning": {
+    "status": "draft",
+    "intake_prompt": "Plan the next framework contract slice.",
+    "clarifying_questions": [],
+    "spec_path": "docs/spec-smike-runtime-acceptance.md",
+    "spec_hash": "fixture-spec-hash",
+    "planning_context_hash": "fixture-context-hash",
+    "draft_correction": {
+      "summary": "Sharpen the first executable phase before promotion.",
+      "blockers": [
+        "Plan 01 still needs explicit proof commands and bounded write scope."
+      ],
+      "action_plan": [
+        "Rewrite Plan 01 with explicit proof commands and bounded write scope."
+      ]
+    },
+    "verification": {
+      "checked_at": null,
+      "stale": false,
+      "reason": null,
+      "source_paths": [
+        "docs/spec-smike-runtime-acceptance.md"
+      ],
+      "verification_paths": [],
+      "stale_outputs": []
+    },
+    "analysis": {
+      "checker_result": null,
+      "auditor_result": null,
+      "blocking_findings": []
+    }
+  },
+  "current_plan": {
+    "plan_id": "01",
+    "plan_json": ".smike/fixture-planning-draft/phases/01/01-PLAN.json",
+    "plan_md": ".smike/fixture-planning-draft/phases/01/01-PLAN.md",
+    "depends_on": [],
+    "status": "pending"
+  },
+  "lifecycle": {
+    "status": "planning_draft",
+    "cycle_count": 0,
+    "last_started_at": null,
+    "last_completed_at": null,
+    "last_result": null,
+    "next_action": "Tighten the planning bundle before promotion."
+  },
+  "workflow": {
+    "auto_continue": true,
+    "stop_on_failure": true,
+    "max_phases_per_run": 10,
+    "plans": [
+      {
+        "plan_id": "01",
+        "plan_json": ".smike/fixture-planning-draft/phases/01/01-PLAN.json",
+        "plan_md": ".smike/fixture-planning-draft/phases/01/01-PLAN.md",
+        "depends_on": [],
+        "status": "pending"
+      }
+    ],
+    "dependency_blockers": [],
+    "actionable_dependency_targets": [],
+    "dependency_next_action": null
+  },
+  "history": [],
+  "gotchas": [],
+  "propagated_discoveries": [],
+  "orchestration": {
+    "stage": "planning",
+    "active_role": null,
+    "last_role": null,
+    "next_role": "strategist",
+    "discovery_propagation": true,
+    "role_history": [],
+    "runtime_dispatches": {
+      "by_id": {}
+    },
+    "runtime_dispatch_view": {
+      "actionable_plan": null,
+      "ready_dispatches": [],
+      "dispatch_counts": {
+        "tracked": 0,
+        "ready": 0,
+        "active": 0,
+        "failed": 0,
+        "completed": 0
+      },
+      "delegation": {
+        "mode": "local_only",
+        "owner": "smike_runner",
+        "result_artifacts": []
+      }
+    },
+    "current_actionable_dispatch": null,
+    "current_actionable_capsule": null,
+    "capsules": {
+      "latest_by_role": {},
+      "by_plan": {}
+    }
+  }
+}

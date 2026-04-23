@@ -1,5 +1,7 @@
 # SMIKE Upgrade Review Notes
 
+> Historical review note. This file captures dated architecture analysis, not the live runtime contract. Use `README.md` and `scripts/smike/RUNTIME_ORCHESTRATOR.md` for current operator/runtime behavior.
+
 Date: 2026-04-18
 Context: second-pass review of the current SMIKE runtime/state-machine design after `spec-codebase-unification-cleanup` stopped at the runtime handoff boundary.
 

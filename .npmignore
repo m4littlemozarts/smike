@@ -1,0 +1,9 @@
+node_modules
+.smike
+.smike-archive
+.smike-snapshots
+.smike-test-tmp
+.smike-unsupported
+memories
+**/*.test.mjs
+scripts/smike/test-cli-*.mjs

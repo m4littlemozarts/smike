@@ -7,6 +7,7 @@ export function createBuildReviewRecord({
   isLikelyTestPath,
   getWorkspaceDirtyCheck,
   looksLikeVerificationCoverageCommand,
+  looksLikeTestVerificationCommand,
   nowIso,
 }) {
   return function buildReviewRecord(contract, cycleRecord, verdictRecord) {
@@ -14,6 +15,7 @@ export function createBuildReviewRecord({
     const findings = [];
     const commandsById = new Map(ensureArray(contract.plan.verify_commands).map((command) => [command.id, command]));
     const changedPaths = ensureArray(cycleRecord.scope?.changed_paths);
+    const acceptanceCriteria = ensureArray(contract.plan.acceptance_criteria);
     const weakEvidenceAcs = ensureArray(contract.plan.acceptance_criteria)
       .filter((ac) => acUsesOnlyExitSignals(ac, commandsById))
       .map((ac) => ac.id);
@@ -22,6 +24,12 @@ export function createBuildReviewRecord({
     const changedTests = changedPaths.filter((filePath) => isLikelyTestPath(filePath));
     const dirtyWorkspaceCheck = getWorkspaceDirtyCheck(cycleRecord.preflight);
     const hasCoverageCommand = ensureArray(contract.plan.verify_commands).some((command) => looksLikeVerificationCoverageCommand(command));
+    const hasTestCommand = ensureArray(contract.plan.verify_commands).some((command) => looksLikeTestVerificationCommand(command));
+    const baselineDirtyPaths = ensureArray(dirtyWorkspaceCheck?.dirty_paths).filter((filePath) => typeof filePath === 'string' && filePath.trim());
+    const baselineDirtySet = new Set(baselineDirtyPaths);
+    const baselineOverlap = changedPaths.filter((filePath) => baselineDirtySet.has(filePath));
+    const dirtyBaselineMayOverlap = dirtyWorkspaceCheck?.dirty_paths_truncated === true;
+    const shouldFlagWeakEvidenceAcs = weakEvidenceAcs.length > 0 && !hasTestCommand && changedTests.length === 0;
 
     if (verdictRecord.result !== 'pass') {
       findings.push({
@@ -32,25 +40,40 @@ export function createBuildReviewRecord({
       });
     }
 
-    for (const acId of weakEvidenceAcs) {
-      findings.push({
-        id: `weak-evidence-${acId}`,
-        severity: 'low',
-        title: `Acceptance evidence is weak for ${acId}`,
-        details: `${acId} relies on exit status only. Add stdout/stderr signals or stronger command expectations so JUDGE can verify behavior, not just process success.`,
-      });
+    if (shouldFlagWeakEvidenceAcs) {
+      for (const acId of weakEvidenceAcs) {
+        findings.push({
+          id: `weak-evidence-${acId}`,
+          severity: 'low',
+          title: `Acceptance evidence is weak for ${acId}`,
+          details: `${acId} relies on exit status only, and this plan has no test command or changed test coverage. Add stdout/stderr signals or stronger command expectations so JUDGE can verify behavior, not just process success.`,
+        });
+      }
     }
 
-    if (dirtyWorkspaceCheck && dirtyWorkspaceCheck.dirty_count > 0) {
+    if (dirtyWorkspaceCheck && dirtyWorkspaceCheck.dirty_count > 0 && (baselineOverlap.length > 0 || dirtyBaselineMayOverlap)) {
+      const overlapSample = baselineOverlap.slice(0, 5);
+      const overlapText = overlapSample.length > 0
+        ? ` Overlap with this cycle: ${baselineOverlap.length} path(s) (${overlapSample.join(', ')}${baselineOverlap.length > overlapSample.length ? ', …' : ''}).`
+        : '';
+      const truncationText = dirtyBaselineMayOverlap
+        ? ' Dirty-path sampling was truncated, so overlap may be higher than reported.'
+        : '';
       findings.push({
         id: 'baseline-dirty-worktree',
         severity: 'low',
-        title: 'Review ran from a dirty baseline',
-        details: `The workspace already had ${dirtyWorkspaceCheck.dirty_count} dirty path(s) before execution. Keep pre-existing changes explicit so new regressions are not hidden in the baseline.`,
+        title: 'Dirty baseline overlapped phase-owned changes',
+        details: `The workspace already had ${dirtyWorkspaceCheck.dirty_count} dirty path(s) before execution, and this cycle changed ${changedPaths.length} path(s).${overlapText}${truncationText} Baseline tracking compares the worktree against the current git HEAD plus untracked files; no commit is required, but commit/stash boundaries can make the delta easier to read.`,
       });
     }
 
-    if (sourceChanges.length > 0 && weakEvidenceAcs.length > 0 && weakEvidenceAcs.length === ensureArray(contract.plan.acceptance_criteria).length) {
+    if (
+      sourceChanges.length > 0
+      && weakEvidenceAcs.length > 0
+      && weakEvidenceAcs.length === acceptanceCriteria.length
+      && !hasTestCommand
+      && changedTests.length === 0
+    ) {
       findings.push({
         id: 'behavioral-coverage-gap',
         severity: 'medium',

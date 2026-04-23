@@ -7,6 +7,44 @@ function sleepMs(ms) {
   Atomics.wait(SLEEP_BUFFER, 0, 0, ms);
 }
 
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'EPERM') {
+      return true;
+    }
+    if (error?.code === 'ESRCH') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function removeStaleLock(lockPath) {
+  let lockContents = '';
+  try {
+    lockContents = fs.readFileSync(lockPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return true;
+    }
+    throw error;
+  }
+
+  const pid = Number.parseInt(lockContents.trim(), 10);
+  if (pidIsAlive(pid)) {
+    return false;
+  }
+
+  fs.rmSync(lockPath, { force: true });
+  return true;
+}
+
 export function acquireCliTestLock(repoRoot, options = {}) {
   const {
     timeoutMs = 30_000,
@@ -25,6 +63,9 @@ export function acquireCliTestLock(repoRoot, options = {}) {
     } catch (error) {
       if (error?.code !== 'EEXIST') {
         throw error;
+      }
+      if (removeStaleLock(lockPath)) {
+        continue;
       }
       if (Date.now() >= deadline) {
         throw new Error(`timed out waiting for CLI test lock: ${lockPath}`);

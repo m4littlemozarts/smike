@@ -1,5 +1,7 @@
 # SMIKE Simplification Plan
 
+> Historical design note. This file is review/planning context, not the live runtime contract. Use `README.md` and `scripts/smike/RUNTIME_ORCHESTRATOR.md` for current operator/runtime behavior.
+
 Date: 2026-04-18
 Scope: recover the thin, fluid feel of the original SMIKE loop without throwing away the durable control-plane machinery added in the last two days.
 Companion doc: `smike-upgrade-review-notes-2026-04-18.md` (review notes — read first).
@@ -158,15 +160,18 @@ Current state: after `./smike cycle` queues a runtime-owned dispatch, `STATE.jso
 
 Add a new lifecycle state: `awaiting_runtime_dispatch`. Semantics:
 - Entered when `./smike cycle` reconciles and finds one or more `ready_dispatches` that the runtime must spawn
-- Contains `next_command` (the exact `./smike dispatch …` invocation to run) as a top-level field on `STATE.json.lifecycle`
+- Contains `next_command: "./smike advance <project>"` as the canonical operator mutation surface for this state
+- Contains `advance_behavior: "spawn_only"` so the runtime can tell that `advance` will only spawn the queued dispatch group
 - Contains `stop_reason: "awaiting_runtime_dispatch"` as a machine-checkable field
 - Exited when the runtime calls `./smike dispatch <project> spawned <dispatch_id>` (or on failure, `./smike dispatch <project> failed <dispatch_id>`)
+
+`dispatch` remains the narrow runtime event primitive for `spawned`, `completed`, `failed`, and `retry`. It is not the steady-state operator control path.
 
 #### 2b. Make the state impossible to ignore
 
 In the runtime doc (the one surviving after Pass 1c): add a single hard rule at the top, before any other instruction:
 
-> If `STATE.json.lifecycle.status == "awaiting_runtime_dispatch"`, you MUST run `STATE.json.lifecycle.next_command` before doing anything else. Exiting without running it is an invariant violation.
+> If `STATE.json.lifecycle.status == "awaiting_runtime_dispatch"`, you MUST run `STATE.json.lifecycle.next_command` before doing anything else. In the live contract that command is `./smike advance <project>`, and `advance_behavior` tells you it is a spawn-only step. Exiting without running it is an invariant violation.
 
 Not "should." Not "is recommended." The one hard rule. Every other instruction in the runtime doc should be explicitly optional or context-dependent, so the hard rule stands out.
 
